@@ -117,3 +117,4 @@ PlanetScale variables from `.env.example`, `CLOUDFLARE_WORKERS_SUBDOMAIN`,
 and a Cloudflare login (`wrangler` OAuth, or `CLOUDFLARE_API_TOKEN` +
 `CLOUDFLARE_ACCOUNT_ID` in CI). Each run costs real deploy/destroy cycles;
 nothing runs unless you invoke it explicitly.
+# parcel
