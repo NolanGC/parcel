@@ -5,6 +5,7 @@ import * as Planetscale from "alchemy/Planetscale";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { Path } from "effect/Path";
+import { adopt } from "alchemy/AdoptPolicy";
 
 import { Hyperdrive, Postgres, PostgresLive } from "./backend/src/Db.ts";
 import TodoServiceLive, { TodoService } from "./backend/src/TodoService.ts";
@@ -17,7 +18,7 @@ export default Alchemy.Stack(
       Drizzle.providers(),
       Planetscale.providers(),
     ),
-    state: Alchemy.localState(),
+    state: Cloudflare.state(),
   },
   Effect.gen(function* () {
     const { branchId } = yield* Postgres;
@@ -25,6 +26,18 @@ export default Alchemy.Stack(
     const path = yield* Path;
     const stage = yield* Alchemy.Stage;
     const { dev } = yield* Alchemy.AlchemyContext;
+
+    const isProduction = stage === "production";
+
+    // Only production serves on the custom domain, so only production manages
+    // the zone. Adopted (created in the Cloudflare dashboard) rather than
+    // created — wrangler's OAuth token can't create zones, and gating it here
+    // also keeps staging/PR deploys from needing zone permissions.
+    const zone = isProduction
+      ? yield* Cloudflare.Zone.Zone("MyZone", {
+          name: "parcelmail.dev",
+        }).pipe(adopt(true))
+      : undefined;
 
     // The account's workers.dev subdomain — fixed for this Cloudflare
     // account (`wrangler whoami` / dashboard), not per-stage. Set in .env
@@ -35,10 +48,10 @@ export default Alchemy.Stack(
     // no circular dependency, no bootstrap-order deploy required. Worker
     // names must be DNS-safe, so stage names like `dev_someone` are
     // sanitized. `alchemy dev` serves both workers locally on the strict
-    // ports below, so dev cross-references point at localhost and don't need
-    // the subdomain.
+    // ports below, and production serves on parcelmail.dev, so only
+    // non-production cloud stages (e.g. deploy:branch) need the subdomain.
     const subdomain = process.env.CLOUDFLARE_WORKERS_SUBDOMAIN;
-    if (!dev && subdomain === undefined) {
+    if (!dev && !isProduction && subdomain === undefined) {
       return yield* Effect.die(
         new Error(
           "CLOUDFLARE_WORKERS_SUBDOMAIN must be set for cloud deploys (see `wrangler whoami`).",
@@ -48,10 +61,14 @@ export default Alchemy.Stack(
     const dnsSafeStage = stage.toLowerCase().replace(/[^a-z0-9-]/g, "-");
     const apiUrl = dev
       ? "http://localhost:1339"
-      : `https://parcel-api-${dnsSafeStage}.${subdomain}.workers.dev`;
+      : isProduction
+        ? "https://api.parcelmail.dev"
+        : `https://parcel-api-${dnsSafeStage}.${subdomain}.workers.dev`;
     const websiteUrl = dev
       ? "http://localhost:1337"
-      : `https://parcel-web-${dnsSafeStage}.${subdomain}.workers.dev`;
+      : isProduction
+        ? "https://parcelmail.dev"
+        : `https://parcel-web-${dnsSafeStage}.${subdomain}.workers.dev`;
 
     const api = yield* TodoService;
 
@@ -65,6 +82,7 @@ export default Alchemy.Stack(
       env: {
         VITE_API_URL: apiUrl,
       },
+      domain: isProduction ? "parcelmail.dev" : undefined,
     });
 
     yield* api.bind("FRONTEND_ORIGIN", {
@@ -78,6 +96,8 @@ export default Alchemy.Stack(
       websiteUrl,
       branchId,
       hyperdriveId: hd.hyperdriveId,
+      nameServers: zone?.nameServers,
+      zoneStatus: zone?.status,
     };
   }).pipe(Effect.provide(TodoServiceLive), Effect.provide(PostgresLive)),
 );

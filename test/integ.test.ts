@@ -43,8 +43,11 @@ const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
     Drizzle.providers(),
     Planetscale.providers(),
   ),
-  // Local state on disk: each run deploys and destroys its own stack.
-  state: Alchemy.localState(),
+  // In CI, all runs share the "test" stage and coordinate through remote
+  // state (serialized by the workflow's concurrency group) so a run stranded
+  // mid-deploy is visible to the next run's adopt/teardown. Locally, disk
+  // state is fine: each run deploys and destroys its own stack.
+  state: process.env.CI ? Cloudflare.state() : Alchemy.localState(),
   // Resource names are deterministic per stage, so anything a past run
   // stranded (failed teardown, lost local state) collides with the next
   // create. Adopt instead of failing: the run takes ownership and the

@@ -32,13 +32,22 @@ export const PlanetscalePostgresLive = Layer.effect(
     const { stage } = yield* Alchemy.Stack;
     const schema = yield* Schema;
 
-    const database = stage.startsWith("pr-")
-      ? yield* Planetscale.PostgresDatabase.ref("app-db", {
-          stage: "staging",
-        })
-      : yield* Planetscale.PostgresDatabase("app-db", {
+    // Two persistent databases total: `production` and `staging` each own
+    // one. Every other stage (local `bun dev`, `pr-*` previews) refs the
+    // staging database and gets its own isolated branch on it — so those
+    // stages require staging to have been deployed at least once (push to
+    // main, or `alchemy deploy --stage staging`). The integ test's `test`
+    // stage is the exception: it stands up its own throwaway database and
+    // destroys it at teardown, so it stays self-contained.
+    const ownsDatabase =
+      stage === "production" || stage === "staging" || stage === "test";
+    const database = ownsDatabase
+      ? yield* Planetscale.PostgresDatabase("app-db", {
           region: { slug: "us-east" },
           clusterSize: "PS_10",
+        })
+      : yield* Planetscale.PostgresDatabase.ref("app-db", {
+          stage: "staging",
         });
 
     const branch = yield* Planetscale.PostgresBranch("app-branch", {

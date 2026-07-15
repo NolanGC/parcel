@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output / caches
+dist/
+.vite/
+*.tsbuildinfo
+
+# Alchemy local state, logs, and build cache
+.alchemy/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Local tooling
+.direnv/
+.DS_Store

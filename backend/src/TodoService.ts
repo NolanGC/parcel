@@ -63,6 +63,10 @@ export default TodoService.make(
       name: `parcel-api-${stage.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
       main: import.meta.url,
       dev: { port: 1339, strictPort: true },
+      // Production serves on the apex's `api.` subdomain (zone adopted in
+      // alchemy.run.ts); other stages stay on workers.dev. Must stay in
+      // lockstep with `apiUrl` in alchemy.run.ts.
+      domain: stage === "production" ? "api.parcelmail.dev" : undefined,
     };
   }),
   Effect.gen(function* () {
