@@ -1,0 +1,12 @@
+{
+  "ignorePatterns": [
+    ".alchemy/**",
+    "repos/**",
+    "dist/**",
+    "frontend/dist/**",
+    "node_modules/**",
+    "packages/create-foldkit-alchemy-app/templates/**",
+    "packages/create-foldkit-alchemy-app/dist/**",
+    "**/*.tsbuildinfo"
+  ]
+}
