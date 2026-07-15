@@ -17,7 +17,6 @@
 // - Sign-in, sign-out, session expiry (only sign-up is exercised).
 // - The Website worker beyond deploying it, and none of the frontend.
 // - Local dev mode (`alchemy dev`); the test always deploys to the cloud.
-import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
 import * as Planetscale from "alchemy/Planetscale";
@@ -43,11 +42,14 @@ const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
     Drizzle.providers(),
     Planetscale.providers(),
   ),
-  // In CI, all runs share the "test" stage and coordinate through remote
-  // state (serialized by the workflow's concurrency group) so a run stranded
-  // mid-deploy is visible to the next run's adopt/teardown. Locally, disk
-  // state is fine: each run deploys and destroys its own stack.
-  state: process.env.CI ? Cloudflare.state() : Alchemy.localState(),
+  // Always the shared remote state store (same as the main stack), local and
+  // CI alike. This is what lets the "test" stage `.ref` the staging database
+  // (see Db.ts) from any machine — local disk state wouldn't know staging
+  // exists. All runs share the "test" stage; CI serializes them via the
+  // workflow's concurrency group, and `adopt` (below) recovers a run stranded
+  // mid-deploy. Don't run local integ while CI's integ job is mid-run — they
+  // race on the same "test" stage.
+  state: Cloudflare.state(),
   // Resource names are deterministic per stage, so anything a past run
   // stranded (failed teardown, lost local state) collides with the next
   // create. Adopt instead of failing: the run takes ownership and the
@@ -55,7 +57,10 @@ const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
   adopt: true,
 });
 
-const stack = beforeAll(deploy(Stack));
+// The `test` stage provisions its own dedicated PlanetScale cluster, which
+// takes longer than the default 120s hook timeout to become ready — give the
+// deploy/teardown hooks the same 5 min budget as the test bodies below.
+const stack = beforeAll(deploy(Stack), { timeout: 300_000 });
 
 // Teardown must not leave paid resources behind, so ride out transient API
 // failures. Destroy plans from state, so a retry only deletes whatever is
@@ -64,6 +69,7 @@ afterAll(
   destroy(Stack).pipe(
     Effect.retry({ times: 3, schedule: Schedule.spaced("10 seconds") }),
   ),
+  { timeout: 300_000 },
 );
 
 const { getWhenReady } = Test;
