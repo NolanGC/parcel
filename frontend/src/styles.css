@@ -1,1 +1,355 @@
 @import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/InterVariable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+/* ============================================================================
+   1. DESIGN TOKENS — ported from Fluid Functionalism
+   ----------------------------------------------------------------------------
+   Every color token is written ONCE, as light-dark(light, dark). Which side
+   renders is driven by `color-scheme`: the root follows the OS, and a `.light`
+   or `.dark` class on <html> pins it.
+
+   The selector is `:root, .light, .dark` — not just `:root` — because
+   light-dark() inside a custom property resolves against the color-scheme of
+   the element the property is *declared on*, not the element that uses it.
+
+   Two exceptions can't ride light-dark(): the --overlay RGB triplet (consumed
+   as rgb(var(--overlay) / α)) and the shadow ladder (light and dark use
+   structurally different recipes).
+============================================================================ */
+
+:root {
+  color-scheme: light dark;
+}
+
+:root,
+.light,
+.dark {
+  /* ── Surfaces (8-level ladder) ──
+     Light: 2 color steps (floor, sunken) then flat #FFFFFF; shadow does the
+     work. Dark: additive white-opacity ladder over #171717. Each surface
+     pairs 1:1 with a shadow recipe (--shadow-1 .. --shadow-8). */
+  --surface-1: light-dark(#FAFAFA, #171717);
+  --surface-2: light-dark(#FCFCFC, #1E1E1E);
+  --surface-3: light-dark(#FFFFFF, #252525);
+  --surface-4: light-dark(#FFFFFF, #2C2C2C);
+  --surface-5: light-dark(#FFFFFF, #333333);
+  --surface-6: light-dark(#FFFFFF, #3A3A3A);
+  --surface-7: light-dark(#FFFFFF, #414141);
+  --surface-8: light-dark(#FFFFFF, #484848);
+
+  /* ── Semantic tokens ── */
+  --background: var(--surface-1);
+  --foreground: light-dark(#171717, #F5F5F5);
+  --muted: light-dark(#F4F4F5, #1E1E1E);
+  --muted-foreground: light-dark(#737373, #A3A3A3);
+
+  /* ── Interactive states ── */
+  --accent: light-dark(#E5E5E5, #525252);
+  --accent-foreground: light-dark(#171717, #F5F5F5);
+  --selected: light-dark(#D4D4D4, #525252);
+
+  /* ── Borders ── */
+  --border: color-mix(in oklab, var(--foreground) 12%, transparent);
+  --ring: light-dark(#E5E5E5, #404040);
+  --input: light-dark(#E5E5E5, #404040);
+
+  /* ── Error / Destructive ── */
+  --destructive: light-dark(#EF4444, #F87171);
+  --destructive-light: light-dark(#FEF2F2, #450A0A);
+
+  /* ── Focus indicator ── */
+  --focus-ring: #6B97FF;
+
+  /* ── Surface-relative interactive overlays (work on any elevation) ──
+     --overlay is the *tint direction* triplet — black for light surfaces,
+     white for dark. --hover and --active are the pre-mixed conveniences. */
+  --overlay: 0 0 0;
+  --hover: light-dark(rgb(0 0 0 / 0.04), rgb(255 255 255 / 0.06));
+  --active: light-dark(rgb(0 0 0 / 0.07), rgb(255 255 255 / 0.1));
+
+  /* ── Motion tokens (spring tiers as CSS durations) ──
+     Enters ride the tier duration with a decisive ease-out; exits are one
+     tier quicker (see motion-guidelines: "exits are faster"). */
+  --motion-fast: 80ms;
+  --motion-fast-exit: 60ms;
+  --motion-moderate: 160ms;
+  --motion-moderate-exit: 120ms;
+  --motion-slow: 240ms;
+  --motion-slow-exit: 160ms;
+
+  /* ── Shadow recipes ──
+     Light: additive stacked drops, halving offsets (1/3/6/12/24/48/96 px).
+     Dark: inset highlight + inset ring + stacked drops. */
+  --shadow-color: rgb(0 0 0 / 0.06);
+  --shadow-light-1: 0 0 0 1px var(--shadow-color);
+  --shadow-light-2: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color);
+  --shadow-light-3: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color);
+  --shadow-light-4: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color), 0 6px 6px -3px var(--shadow-color);
+  --shadow-light-5: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color), 0 6px 6px -3px var(--shadow-color), 0 12px 12px -6px var(--shadow-color);
+  --shadow-light-6: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color), 0 6px 6px -3px var(--shadow-color), 0 12px 12px -6px var(--shadow-color), 0 24px 24px -12px var(--shadow-color);
+  --shadow-light-7: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color), 0 6px 6px -3px var(--shadow-color), 0 12px 12px -6px var(--shadow-color), 0 24px 24px -12px var(--shadow-color), 0 48px 48px -24px var(--shadow-color);
+  --shadow-light-8: 0 0 0 1px var(--shadow-color), 0 1px 1px -0.5px var(--shadow-color), 0 3px 3px -1.5px var(--shadow-color), 0 6px 6px -3px var(--shadow-color), 0 12px 12px -6px var(--shadow-color), 0 24px 24px -12px var(--shadow-color), 0 48px 48px -24px var(--shadow-color), 0 96px 96px -48px var(--shadow-color);
+
+  --dm-hi-base: rgba(255,255,255,0.01);
+  --dm-hi-mid: rgba(255,255,255,0.02);
+  --dm-hi-high: rgba(255,255,255,0.04);
+  --dm-hi-peak: rgba(255,255,255,0.06);
+  --dm-ring-base: rgba(255,255,255,0.02);
+  --dm-ring-mid: rgba(255,255,255,0.04);
+  --dm-ring-high: rgba(255,255,255,0.06);
+  --dm-drop: rgba(0,0,0,0.18);
+  --shadow-dark-1: inset 0 0 0 1px var(--dm-ring-base);
+  --shadow-dark-2: inset 0 1px 0 0 var(--dm-hi-base), inset 0 0 0 1px var(--dm-ring-base), 0 1px 1px -0.5px var(--dm-drop);
+  --shadow-dark-3: inset 0 1px 0 0 var(--dm-hi-mid), inset 0 0 0 1px var(--dm-ring-base), 0 0 0 1px rgba(0,0,0,0.12), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop);
+  --shadow-dark-4: inset 0 1px 0 0 var(--dm-hi-mid), inset 0 0 0 1px var(--dm-ring-mid), 0 0 0 1px rgba(0,0,0,0.14), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop), 0 6px 6px -3px var(--dm-drop);
+  --shadow-dark-5: inset 0 1px 0 0 var(--dm-hi-high), inset 0 0 0 1px var(--dm-ring-mid), 0 0 0 1px rgba(0,0,0,0.16), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop), 0 6px 6px -3px var(--dm-drop), 0 12px 12px -6px var(--dm-drop);
+  --shadow-dark-6: inset 0 1px 0 0 var(--dm-hi-high), inset 0 0 0 1px var(--dm-ring-high), 0 0 0 1px rgba(0,0,0,0.18), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop), 0 6px 6px -3px var(--dm-drop), 0 12px 12px -6px var(--dm-drop), 0 24px 24px -12px var(--dm-drop);
+  --shadow-dark-7: inset 0 1px 0 0 var(--dm-hi-peak), inset 0 0 0 1px var(--dm-ring-high), 0 0 0 1px rgba(0,0,0,0.20), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop), 0 6px 6px -3px var(--dm-drop), 0 12px 12px -6px var(--dm-drop), 0 24px 24px -12px var(--dm-drop), 0 48px 48px -24px var(--dm-drop);
+  --shadow-dark-8: inset 0 1px 0 0 var(--dm-hi-peak), inset 0 0 0 1px var(--dm-ring-high), 0 0 0 1px rgba(0,0,0,0.22), 0 1px 1px -0.5px var(--dm-drop), 0 3px 3px -1.5px var(--dm-drop), 0 6px 6px -3px var(--dm-drop), 0 12px 12px -6px var(--dm-drop), 0 24px 24px -12px var(--dm-drop), 0 48px 48px -24px var(--dm-drop), 0 96px 96px -48px var(--dm-drop);
+
+  --shadow-1: var(--shadow-light-1);
+  --shadow-2: var(--shadow-light-2);
+  --shadow-3: var(--shadow-light-3);
+  --shadow-4: var(--shadow-light-4);
+  --shadow-5: var(--shadow-light-5);
+  --shadow-6: var(--shadow-light-6);
+  --shadow-7: var(--shadow-light-7);
+  --shadow-8: var(--shadow-light-8);
+}
+
+/* ============================================================================
+   2. THEME SWITCHING
+============================================================================ */
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --overlay: 255 255 255;
+    --shadow-1: var(--shadow-dark-1);
+    --shadow-2: var(--shadow-dark-2);
+    --shadow-3: var(--shadow-dark-3);
+    --shadow-4: var(--shadow-dark-4);
+    --shadow-5: var(--shadow-dark-5);
+    --shadow-6: var(--shadow-dark-6);
+    --shadow-7: var(--shadow-dark-7);
+    --shadow-8: var(--shadow-dark-8);
+  }
+}
+
+.light {
+  color-scheme: light;
+  --overlay: 0 0 0;
+  --shadow-1: var(--shadow-light-1);
+  --shadow-2: var(--shadow-light-2);
+  --shadow-3: var(--shadow-light-3);
+  --shadow-4: var(--shadow-light-4);
+  --shadow-5: var(--shadow-light-5);
+  --shadow-6: var(--shadow-light-6);
+  --shadow-7: var(--shadow-light-7);
+  --shadow-8: var(--shadow-light-8);
+}
+
+.dark {
+  color-scheme: dark;
+  --overlay: 255 255 255;
+  --shadow-1: var(--shadow-dark-1);
+  --shadow-2: var(--shadow-dark-2);
+  --shadow-3: var(--shadow-dark-3);
+  --shadow-4: var(--shadow-dark-4);
+  --shadow-5: var(--shadow-dark-5);
+  --shadow-6: var(--shadow-dark-6);
+  --shadow-7: var(--shadow-dark-7);
+  --shadow-8: var(--shadow-dark-8);
+}
+
+/* ============================================================================
+   3. TAILWIND THEME MAPPING
+============================================================================ */
+
+@theme inline {
+  --font-sans: "Inter", system-ui, sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-selected: var(--selected);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-destructive: var(--destructive);
+  --color-destructive-light: var(--destructive-light);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-focus-ring: var(--focus-ring);
+
+  /* Surface ladder — bg-surface-1..8 utilities */
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-4: var(--surface-4);
+  --color-surface-5: var(--surface-5);
+  --color-surface-6: var(--surface-6);
+  --color-surface-7: var(--surface-7);
+  --color-surface-8: var(--surface-8);
+
+  /* Shadow ladder — shadow-surface-1..8 utilities. Monotonic with surfaces. */
+  --shadow-surface-1: var(--shadow-1);
+  --shadow-surface-2: var(--shadow-2);
+  --shadow-surface-3: var(--shadow-3);
+  --shadow-surface-4: var(--shadow-4);
+  --shadow-surface-5: var(--shadow-5);
+  --shadow-surface-6: var(--shadow-6);
+  --shadow-surface-7: var(--shadow-7);
+  --shadow-surface-8: var(--shadow-8);
+}
+
+/* ============================================================================
+   4. BASE STYLES
+============================================================================ */
+
+html {
+  scrollbar-gutter: stable;
+}
+
+html, body {
+  margin: 0;
+  min-height: 100vh;
+  overscroll-behavior-y: none;
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+/* Theme-toggle cross-fade: the ApplyTheme command adds `.transitioning`
+   around the class swap so colors tween instead of snapping. */
+html.transitioning *,
+html.transitioning *::before,
+html.transitioning *::after {
+  transition: border-radius 180ms ease-in-out,
+              background-color 180ms ease-in-out,
+              color 180ms ease-in-out,
+              border-color 180ms ease-in-out,
+              fill 180ms ease-in-out,
+              stroke 180ms ease-in-out !important;
+}
+
+/* Focus fallback — the same token ring as the components instead of the UA
+   default. Lives in @layer base so `outline-none` (utilities layer) wins. */
+@layer base {
+  :focus-visible {
+    outline: 1px solid var(--focus-ring, #6B97FF);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+
+  a:focus-visible {
+    border-radius: 2px;
+  }
+}
+
+/* ============================================================================
+   5. FOLDKITUI COMPONENTS
+   ----------------------------------------------------------------------------
+   fk-hover-overlay — the Table component's traveling hover highlight. One
+   absolutely positioned element glides between row rects (fast tier: 80ms
+   position/fade in, 60ms fade out) instead of per-row background blinks.
+   Retargeted CSS transitions redirect from the in-flight value, so rapid
+   panning glides. @starting-style gives the mount a fade-in; data-hidden is
+   the kept-in-place exit fade.
+============================================================================ */
+
+.fk-hover-overlay {
+  position: absolute;
+  pointer-events: none;
+  background-color: var(--hover);
+  opacity: 1;
+  transition: top 80ms ease-out, left 80ms ease-out, width 80ms ease-out,
+              height 80ms ease-out, opacity 80ms ease-out;
+}
+
+@starting-style {
+  .fk-hover-overlay {
+    opacity: 0;
+  }
+}
+
+.fk-hover-overlay[data-hidden] {
+  opacity: 0;
+  transition-duration: 60ms;
+}
+
+/* Reduced motion: keep the fade (it aids comprehension), drop the travel. */
+@media (prefers-reduced-motion: reduce) {
+  .fk-hover-overlay {
+    transition-property: opacity;
+  }
+}
+
+/* ============================================================================
+   6. NATIVE SCROLLBAR THEME
+   ----------------------------------------------------------------------------
+   Narrow, low-contrast, darkens on hover. Rides the surface-relative overlay
+   ramp (rest 8%, hover 12%, drag 16%) — adapts to dark mode through
+   --overlay. Only on fine pointers.
+============================================================================ */
+
+@media (pointer: fine) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--overlay) / 0.08) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--overlay) / 0.08);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:vertical {
+    border-left-width: 1px;
+    border-right-width: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb:horizontal {
+    border-top-width: 1px;
+    border-bottom-width: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--overlay) / 0.12);
+  }
+
+  ::-webkit-scrollbar-thumb:active {
+    background-color: rgb(var(--overlay) / 0.16);
+  }
+}

@@ -50,6 +50,7 @@
         "alchemy": "2.0.0-beta.59",
         "effect": "4.0.0-beta.88",
         "foldkit": "^0.122.0",
+        "lucide": "^1.24.0",
         "tailwindcss": "^4.3.2",
         "vite": "8.0.10",
       },
@@ -791,6 +792,8 @@
     "long": ["long@5.3.2", "", {}, "sha512-mNAgZ1GmyNhD7AuqnTG3/VQ26o760+ZYBPKjPvugO8+nLbYfX6TVpJPseBvopbdY+qpZ/lKUnmEc1LeZYS3QAA=="],
 
     "lru.min": ["lru.min@1.1.4", "", {}, "sha512-DqC6n3QQ77zdFpCMASA1a3Jlb64Hv2N2DciFGkO/4L9+q/IpIAuRlKOvCXabtRW6cQf8usbmM6BE/TOPysCdIA=="],
+
+    "lucide": ["lucide@1.24.0", "", {}, "sha512-oMAaeuNDc5VCnBb3IjwKYGRT56tqanUm1fyDFT5Tl8hWSZND59gztgjvXje08jKLPVAq0gHJcwZUE8GCQxzBeg=="],
 
     "magic-string": ["magic-string@0.30.21", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.5" } }, "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ=="],
 

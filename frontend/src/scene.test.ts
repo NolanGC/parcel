@@ -19,7 +19,7 @@ import { Scene } from "foldkit";
 import { describe, test } from "vitest";
 
 import { TodosLoaded, update, view, type Model } from "./main";
-import { Login } from "./page";
+import { Inbox, Login } from "./page";
 import { HomeRoute, LoginRoute, TodosRoute } from "./route";
 
 const createdAt = DateTime.makeUnsafe(0);
@@ -50,12 +50,14 @@ const loggedInModel: Model = {
   newTitle: "",
   creating: false,
   actionError: Option.none(),
+  inboxPage: Inbox.init(),
 };
 
 const loggedOutModel: Model = {
   _tag: "LoggedOut",
   route: LoginRoute(),
   loginPage: Login.init(false),
+  inboxPage: Inbox.init(),
 };
 
 describe("view", () => {

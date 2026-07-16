@@ -22,7 +22,7 @@ import {
   readStoredSession,
 } from "./auth";
 import { API_URL } from "./config";
-import { Login } from "./page";
+import { Inbox, Login } from "./page";
 import {
   AppRoute,
   homeRouter,
@@ -49,6 +49,7 @@ type TodosState = typeof TodosState.Type;
 export const LoggedOut = ts("LoggedOut", {
   route: AppRoute,
   loginPage: Login.Model,
+  inboxPage: Inbox.Model,
 });
 export type LoggedOut = typeof LoggedOut.Type;
 
@@ -62,6 +63,7 @@ export const LoggedIn = ts("LoggedIn", {
   creating: S.Boolean,
   // Latest failed mutation (create/toggle/delete); cleared on the next edit.
   actionError: S.Option(S.String),
+  inboxPage: Inbox.Model,
 });
 export type LoggedIn = typeof LoggedIn.Type;
 
@@ -92,6 +94,9 @@ export const FailedMutateTodo = m("FailedMutateTodo", { error: S.String });
 export const GotLoginMessage = m("GotLoginMessage", {
   message: Login.Message,
 });
+export const GotInboxMessage = m("GotInboxMessage", {
+  message: Inbox.Message,
+});
 export const ClickedSignOut = m("ClickedSignOut");
 
 export const Message = S.Union([
@@ -110,6 +115,7 @@ export const Message = S.Union([
   DeletedTodo,
   FailedMutateTodo,
   GotLoginMessage,
+  GotInboxMessage,
   ClickedSignOut,
   GotSession,
   FailedCheckSession,
@@ -138,6 +144,7 @@ const initLoggedOut = (route: AppRoute, checkingSession: boolean): LoggedOut =>
   LoggedOut({
     route,
     loginPage: Login.init(checkingSession),
+    inboxPage: Inbox.init(),
   });
 
 const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
@@ -148,6 +155,7 @@ const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
     newTitle: "",
     creating: false,
     actionError: Option.none(),
+    inboxPage: Inbox.init(),
   });
 
 export const init: Runtime.RoutingApplicationInit<Model, Message, Flags> = (
@@ -455,6 +463,18 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
+      GotInboxMessage: ({ message }) => {
+        const [inboxPage, commands] = Inbox.update(model.inboxPage, message);
+        const mapped = Command.mapMessages(commands, (message) =>
+          GotInboxMessage({ message }),
+        );
+        // The arms are intentionally identical: `evo` needs the union
+        // narrowed to a concrete variant, and both variants carry inboxPage.
+        return model._tag === "LoggedOut"
+          ? [evo(model, { inboxPage: () => inboxPage }), mapped]
+          : [evo(model, { inboxPage: () => inboxPage }), mapped];
+      },
+
       ClickedSignOut: () => [model, [SignOut()]],
       CompletedSignOut: () => leaveLoggedIn(),
 
@@ -636,6 +656,17 @@ const navigationView = (model: LoggedIn): Html => {
 export const view = (model: Model): Document =>
   model._tag === "LoggedOut" ? loggedOutView(model) : loggedInView(model);
 
+const inboxView = (inboxPage: Inbox.Model): Html => {
+  const h = html<Message>();
+
+  return h.submodel({
+    slotId: "inbox",
+    model: inboxPage,
+    view: Inbox.view,
+    toParentMessage: (message) => GotInboxMessage({ message }),
+  });
+};
+
 const loggedOutView = (model: LoggedOut): Document => {
   const h = html<Message>();
 
@@ -645,6 +676,10 @@ const loggedOutView = (model: LoggedOut): Document => {
       Home: () => ({ title: APP_NAME, body: landingView(false) }),
       // Redirect in flight; render the landing rather than a flash of form.
       Todos: () => ({ title: APP_NAME, body: landingView(false) }),
+      Inbox: () => ({
+        title: `Inbox — ${APP_NAME}`,
+        body: inboxView(model.inboxPage),
+      }),
       Login: () => ({
         title:
           model.loginPage.mode._tag === "SignInMode"
@@ -684,7 +719,14 @@ const loggedInView = (model: LoggedIn): Document => {
     return { title: APP_NAME, body: landingView(true) };
   }
 
+  // The inbox sketch is a full-window design; render it without the app
+  // chrome, same as the logged-out variant.
+  if (model.route._tag === "Inbox") {
+    return { title: `Inbox — ${APP_NAME}`, body: inboxView(model.inboxPage) };
+  }
+
   const routeContent = M.value(model.route).pipe(
+    M.withReturnType<Html>(),
     M.tagsExhaustive({
       NotFound: ({ path }) =>
         notFoundView("Page not found", `No route for ${path}.`),
