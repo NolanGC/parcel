@@ -65,7 +65,10 @@ describe("Ui.Menu hover overlay", () => {
   });
 
   test("hover index tracks the base menu's activations", () => {
-    const [next] = update(Menu.init({ id: "m", isAnimated: false }), activated(2));
+    const [next] = update(
+      Menu.init({ id: "m", isAnimated: false }),
+      activated(2),
+    );
     expect(next.maybeHoverIndex).toEqual(Option.some(2));
     expect(next.menu.maybeActiveItemIndex).toEqual(Option.some(2));
   });

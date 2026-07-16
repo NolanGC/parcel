@@ -66,7 +66,8 @@ const clamp = (level: number): SurfaceLevel =>
 export const surface = (
   bgLevel: number,
   shadowLevel: number = bgLevel,
-): string => `${SURFACE_BG[clamp(bgLevel)]} ${SURFACE_SHADOW[clamp(shadowLevel)]}`;
+): string =>
+  `${SURFACE_BG[clamp(bgLevel)]} ${SURFACE_SHADOW[clamp(shadowLevel)]}`;
 
 /** Steps above the current substrate, clamped to the ladder's ceiling. */
 export const elevate = (substrate: number, offset: number): SurfaceLevel =>

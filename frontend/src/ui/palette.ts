@@ -135,11 +135,7 @@ const matchScore = (query: string, text: string): number => {
   if (foundAt === 0) return 4;
   if (foundAt > 0) return t[foundAt - 1] === " " ? 3 : 2;
   let matched = 0;
-  for (
-    let i = 0;
-    i < t.length && matched < query.length;
-    i++
-  ) {
+  for (let i = 0; i < t.length && matched < query.length; i++) {
     if (t[i] === query[matched]) matched += 1;
   }
   return matched === query.length ? 1 : 0;
@@ -240,9 +236,7 @@ export const create = <Item extends string>() => {
     const [dialog, commands] = result;
     return [
       evo(model, { dialog: () => dialog }),
-      Command.mapMessages(commands, (message) =>
-        GotDialogMessage({ message }),
-      ),
+      Command.mapMessages(commands, (message) => GotDialogMessage({ message })),
       Option.none(),
     ];
   };
@@ -274,15 +268,16 @@ export const create = <Item extends string>() => {
         // Rows exist in the DOM once the show command completes; that's the
         // earliest correct moment to measure (same trigger discipline as
         // Menu's CompletedAnchorMenu).
-        const isPanelReady =
-          message.message._tag === "CompletedShowDialog";
+        const isPanelReady = message.message._tag === "CompletedShowDialog";
         return [
           evo(model, { dialog: () => dialog }),
           [
             ...Command.mapMessages(commands, (message) =>
               GotDialogMessage({ message }),
             ),
-            ...(isPanelReady ? [MeasureItemRects({ id: model.dialog.id })] : []),
+            ...(isPanelReady
+              ? [MeasureItemRects({ id: model.dialog.id })]
+              : []),
           ],
           Option.none(),
         ];
@@ -307,11 +302,7 @@ export const create = <Item extends string>() => {
           0,
           Math.min(message.count - 1, model.activeIndex + message.delta),
         );
-        return [
-          evo(model, { activeIndex: () => next }),
-          [],
-          Option.none(),
-        ];
+        return [evo(model, { activeIndex: () => next }), [], Option.none()];
       }
 
       case "PalettePointedItem":
@@ -343,8 +334,12 @@ export const create = <Item extends string>() => {
   const view = Submodel.defineView<Model, Message, ViewInputs<Item>>(
     (model, viewInputs): Html => {
       const h = html<Message>();
-      const { groups, itemSpec, placeholder = "Search…", substrate } =
-        viewInputs;
+      const {
+        groups,
+        itemSpec,
+        placeholder = "Search…",
+        substrate,
+      } = viewInputs;
 
       const filtered = filterGroups(model.query, groups, itemSpec);
       const flat = filtered.flatMap((group) => group.items);
@@ -385,10 +380,7 @@ export const create = <Item extends string>() => {
               return Option.none();
             }),
           ]),
-          kbd([
-            commandIcon("h-3 w-3"),
-            h.span([h.Class("ml-0.5")], ["K"]),
-          ]),
+          kbd([commandIcon("h-3 w-3"), h.span([h.Class("ml-0.5")], ["K"])]),
         ],
       );
 
@@ -414,10 +406,7 @@ export const create = <Item extends string>() => {
         );
       })();
 
-      const itemRow = (
-        item: Item,
-        flatIndex: number,
-      ): Html => {
+      const itemRow = (item: Item, flatIndex: number): Html => {
         const spec = itemSpec(item);
 
         // Leading slot is a constant 24px box so labels align whether the
@@ -483,11 +472,7 @@ export const create = <Item extends string>() => {
       const results =
         count === 0
           ? h.div(
-              [
-                h.Class(
-                  "px-5 py-10 text-center text-muted-foreground",
-                ),
-              ],
+              [h.Class("px-5 py-10 text-center text-muted-foreground")],
               ["No results"],
             )
           : h.div(
@@ -543,10 +528,7 @@ export const create = <Item extends string>() => {
             [h.Class("flex items-center gap-2")],
             [kbd([enterIcon("h-3.5 w-3.5")]), "open"],
           ),
-          h.span(
-            [h.Class("flex items-center gap-2")],
-            [kbd(["esc"]), "close"],
-          ),
+          h.span([h.Class("flex items-center gap-2")], [kbd(["esc"]), "close"]),
           h.span(
             [h.Class("ml-auto")],
             [settingsIcon("h-[18px] w-[18px] text-muted-foreground/70")],

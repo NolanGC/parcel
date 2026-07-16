@@ -249,10 +249,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
           weightLabel({ label: tab.label, isBold: isSelected }),
           tab.detail === undefined
             ? h.empty
-            : h.span(
-                [h.Class("text-muted-foreground/60")],
-                [tab.detail],
-              ),
+            : h.span([h.Class("text-muted-foreground/60")], [tab.detail]),
         ],
       );
     });

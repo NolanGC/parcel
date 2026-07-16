@@ -197,7 +197,8 @@ const SECTIONS: ReadonlyArray<Section> = [
           serif: true,
         },
         subject: "Final hours: Best offer must end. $0.25 a week.",
-        preview: "The New York Times. The Times sales ends in hours in hours b...",
+        preview:
+          "The New York Times. The Times sales ends in hours in hours b...",
         category: "newsletter",
         time: "13:34",
       },
@@ -246,7 +247,8 @@ const SECTIONS: ReadonlyArray<Section> = [
           serif: true,
         },
         subject: "Final hours: Best offer must end. $0.25 a week.",
-        preview: "The New York Times. The Times sales ends in hours in hours b...",
+        preview:
+          "The New York Times. The Times sales ends in hours in hours b...",
         category: "newsletter",
         time: "1/13/25",
       },
@@ -318,14 +320,22 @@ type CategoryConfig = {
 // across themes (like avatar tiles).
 const CATEGORIES: Record<Category, CategoryConfig> = {
   todo: { label: "To-do", icon: Icon.circleCheck, iconClass: "" },
-  newsletter: { label: "Newsletter", icon: Icon.leaf, iconClass: "text-green-500" },
+  newsletter: {
+    label: "Newsletter",
+    icon: Icon.leaf,
+    iconClass: "text-green-500",
+  },
   reminder: { label: "Reminder", icon: Icon.bell, iconClass: "text-amber-400" },
   promotions: {
     label: "Promotions",
     icon: Icon.hand,
     iconClass: "text-orange-400",
   },
-  primary: { label: "Primary", icon: Icon.circleUser, iconClass: "text-blue-400" },
+  primary: {
+    label: "Primary",
+    icon: Icon.circleUser,
+    iconClass: "text-blue-400",
+  },
   vacation: {
     label: "Vacation",
     icon: Icon.palmtree,
@@ -343,9 +353,19 @@ type TabConfig = {
 
 const TABS: ReadonlyArray<TabConfig> = [
   { label: "To-do", icon: Icon.circleCheck, count: 2, iconClass: "" },
-  { label: "Reminders", icon: Icon.bell, count: 8, iconClass: "text-amber-400" },
+  {
+    label: "Reminders",
+    icon: Icon.bell,
+    count: 8,
+    iconClass: "text-amber-400",
+  },
   { label: "Priority", icon: Icon.tag, count: 3, iconClass: "text-indigo-400" },
-  { label: "Newsletters", icon: Icon.leaf, count: 23, iconClass: "text-green-500" },
+  {
+    label: "Newsletters",
+    icon: Icon.leaf,
+    count: 23,
+    iconClass: "text-green-500",
+  },
   { label: "Other", icon: Icon.ellipsis, count: 18, iconClass: "" },
 ];
 
@@ -703,9 +723,10 @@ const toolbarView = (model: Model): Html => {
               ),
             ],
           ),
-          Ui.button({ variant: "ghost", size: "icon-sm", ariaLabel: "Filter" }, [
-            Icon.listFilter("h-[18px] w-[18px]"),
-          ]),
+          Ui.button(
+            { variant: "ghost", size: "icon-sm", ariaLabel: "Filter" },
+            [Icon.listFilter("h-[18px] w-[18px]")],
+          ),
           h.div(
             [
               h.Class(

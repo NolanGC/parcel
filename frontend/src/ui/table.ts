@@ -112,20 +112,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [MeasureRowRects({ id: model.id, count: rowCount })],
       ],
 
-      LeftContainer: () => [
-        evo(model, { isPointerInside: () => false }),
-        [],
-      ],
+      LeftContainer: () => [evo(model, { isPointerInside: () => false }), []],
 
       EnteredRow: ({ index }) => [
         evo(model, { maybeRowIndex: () => Option.some(index) }),
         [],
       ],
 
-      GotRowRects: ({ rects }) => [
-        evo(model, { rects: () => [...rects] }),
-        [],
-      ],
+      GotRowRects: ({ rects }) => [evo(model, { rects: () => [...rects] }), []],
     }),
   );
 

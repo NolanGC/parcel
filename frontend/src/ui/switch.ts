@@ -38,12 +38,15 @@ export type SwitchConfig<Message> = Readonly<{
   className?: string;
 }>;
 
-export const switchToggle = <Message>(
-  config: SwitchConfig<Message>,
-): Html => {
+export const switchToggle = <Message>(config: SwitchConfig<Message>): Html => {
   const h = html<Message>();
-  const { label, isChecked, onToggle, isDisabled = false, className = "" } =
-    config;
+  const {
+    label,
+    isChecked,
+    onToggle,
+    isDisabled = false,
+    className = "",
+  } = config;
 
   return h.button(
     [
@@ -59,12 +62,13 @@ export const switchToggle = <Message>(
     ],
     [
       h.span(
+        [h.Class(`${TRACK_BASE} ${isChecked ? "bg-focus-ring" : "bg-accent"}`)],
         [
-          h.Class(
-            `${TRACK_BASE} ${isChecked ? "bg-focus-ring" : "bg-accent"}`,
+          h.span(
+            [h.Class(`${THUMB_BASE} ${isChecked ? THUMB_ON : THUMB_OFF}`)],
+            [],
           ),
         ],
-        [h.span([h.Class(`${THUMB_BASE} ${isChecked ? THUMB_ON : THUMB_OFF}`)], [])],
       ),
       h.span(
         [

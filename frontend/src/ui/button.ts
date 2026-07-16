@@ -16,7 +16,8 @@ const BASE =
   "inline-flex cursor-pointer items-center justify-center outline-none select-none disabled:pointer-events-none disabled:opacity-50 focus-visible:ring-1 focus-visible:ring-focus-ring rounded-lg";
 
 const VARIANT: Record<ButtonVariant, string> = {
-  primary: "bg-foreground text-background hover:bg-foreground/90 active:bg-foreground/80",
+  primary:
+    "bg-foreground text-background hover:bg-foreground/90 active:bg-foreground/80",
   secondary: "bg-accent text-foreground hover:bg-accent/80 active:bg-accent",
   tertiary:
     "border border-border bg-transparent text-foreground hover:bg-hover active:bg-active",
