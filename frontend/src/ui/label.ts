@@ -1,21 +1,21 @@
 import { html, type Html } from "foldkit/html";
 
 /**
- * FoldkitUI · Typography — Inter variable weight tokens and the ghost-span
+ * FoldkitUI · Typography — Geist variable weight tokens and the ghost-span
  * pattern for animating font weight without reflow.
  *
  * A heavier weight is wider; animating it on a bare text node shifts layout.
  * `weightLabel` stacks two grid spans: an invisible copy at the heaviest
  * weight reserves the width, while the visible copy animates
- * `font-variation-settings`. Each weight pairs a tighter optical size so the
- * advance width barely changes (FF holds the delta to ~±0.5px).
+ * `font-variation-settings`. Geist exposes only the `wght` axis; `normal`
+ * matches the body's Medium base weight.
  */
 
 export const fontWeights = {
-  normal: "'wght' 400, 'opsz' 14",
-  medium: "'wght' 450, 'opsz' 15",
-  semibold: "'wght' 550, 'opsz' 20",
-  bold: "'wght' 700, 'opsz' 25",
+  normal: "'wght' 500",
+  medium: "'wght' 500",
+  semibold: "'wght' 600",
+  bold: "'wght' 700",
 } as const;
 
 /** A label whose weight animates between normal and semibold (80ms) without

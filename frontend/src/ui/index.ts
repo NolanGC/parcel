@@ -14,5 +14,8 @@ export * from "./icon";
 export * from "./label";
 export * from "./motion";
 export * from "./surface";
+export * from "./switch";
 export * as Menu from "./menu";
+export * as Palette from "./palette";
 export * as Table from "./table";
+export * as Tabs from "./tabs";

@@ -6,6 +6,10 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# Rust / Tauri build output (desktop app)
+target/
+packages/desktop/src-tauri/gen/schemas/
+
 # Alchemy local state, logs, and build cache
 .alchemy/
 

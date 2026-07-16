@@ -346,7 +346,22 @@ const TABS: ReadonlyArray<TabConfig> = [
   { label: "Reminders", icon: Icon.bell, count: 8, iconClass: "text-amber-400" },
   { label: "Priority", icon: Icon.tag, count: 3, iconClass: "text-indigo-400" },
   { label: "Newsletters", icon: Icon.leaf, count: 23, iconClass: "text-green-500" },
+  { label: "Other", icon: Icon.ellipsis, count: 18, iconClass: "" },
 ];
+
+const TAB_LABELS: ReadonlyArray<string> = TABS.map((tab) => tab.label);
+
+const tabSpec = (label: string): Ui.Tabs.TabSpec => {
+  const tab = TABS.find((tab) => tab.label === label);
+  return tab === undefined
+    ? { icon: Icon.ellipsis, label }
+    : {
+        icon: tab.icon,
+        label: tab.label,
+        detail: String(tab.count),
+        iconClass: tab.iconClass,
+      };
+};
 
 // FOLDER MENU
 
@@ -371,33 +386,84 @@ const FOLDERS: Record<FolderLabel, { icon: Ui.IconView; count?: number }> = {
 
 const FolderMenu = Ui.Menu.create<FolderLabel>();
 
-// SETTINGS MENU
+// COMMAND PALETTE
+//
+// The palette is the app's primary control surface (⌘K, or the toolbar
+// search button). Its corpus is everything the chrome used to hold:
+// actions, folder navigation, and the emails themselves. Items are plain
+// strings; specs resolve through lookup maps so the viewInputs carry only
+// one top-level function.
 
-const APPEARANCE_ITEMS = ["System", "Light", "Dark"] as const;
+const PALETTE_ACTIONS = [
+  "Compose",
+  "Invite people",
+  "Toggle dark mode",
+] as const;
 
-const APPEARANCE_ICONS: Record<Appearance, Ui.IconView> = {
-  System: Icon.monitor,
-  Light: Icon.sun,
-  Dark: Icon.moon,
+const ACTION_SPECS: Record<string, Ui.Palette.PaletteItemSpec> = {
+  Compose: { icon: Icon.squarePen, label: "Compose" },
+  "Invite people": { icon: Icon.plus, label: "Invite people" },
+  "Toggle dark mode": {
+    icon: Icon.moon,
+    label: "Toggle dark mode",
+    keywords: "theme appearance light",
+  },
 };
 
-const SettingsMenu = Ui.Menu.create<Appearance>();
+// Emails enter the palette as "sender — subject" strings; the map recovers
+// the spec (and would recover the id, once opening an email is real).
+// Image avatars carry over as the leading slot; tile avatars fall back to
+// the mail icon. The category rides as the trailing tag chip.
+const EMAIL_SPECS = new Map<string, Ui.Palette.PaletteItemSpec>(
+  SECTIONS.flatMap((section) =>
+    section.emails.map((email) => [
+      `${email.sender} — ${email.subject}`,
+      {
+        ...(email.avatar.kind === "image"
+          ? { avatarSrc: email.avatar.src }
+          : { icon: Icon.inbox }),
+        label: `${email.sender} — ${email.subject}`,
+        tag: {
+          icon: CATEGORIES[email.category].icon,
+          label: CATEGORIES[email.category].label,
+        },
+        keywords: email.preview,
+      } satisfies Ui.Palette.PaletteItemSpec,
+    ]),
+  ),
+);
+
+const PALETTE_GROUPS: ReadonlyArray<Ui.Palette.Group<string>> = [
+  { label: "Actions", items: PALETTE_ACTIONS },
+  { label: "Folders", items: FOLDER_LABELS },
+  { label: "Emails", items: [...EMAIL_SPECS.keys()] },
+];
+
+const paletteItemSpec = (item: string): Ui.Palette.PaletteItemSpec =>
+  ACTION_SPECS[item] ??
+  (item in FOLDERS
+    ? { icon: FOLDERS[item as FolderLabel].icon, label: item }
+    : (EMAIL_SPECS.get(item) ?? { label: item }));
+
+const InboxPalette = Ui.Palette.create<string>();
 
 // MODEL
 
 export const Model = S.Struct({
   appearance: Appearance,
   folderMenu: Ui.Menu.Model,
-  settingsMenu: Ui.Menu.Model,
+  tabs: Ui.Tabs.Model,
   list: Ui.Table.Model,
+  palette: Ui.Palette.Model,
 });
 export type Model = typeof Model.Type;
 
 export const init = (): Model => ({
   appearance: "System",
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
-  settingsMenu: Ui.Menu.init({ id: "inbox-settings", isAnimated: true }),
+  tabs: Ui.Tabs.init({ id: "inbox-tabs" }),
   list: Ui.Table.init({ id: "inbox-list" }),
+  palette: Ui.Palette.init({ id: "inbox-palette" }),
 });
 
 // MESSAGE
@@ -405,19 +471,27 @@ export const init = (): Model => ({
 export const GotFolderMenuMessage = m("GotFolderMenuMessage", {
   message: Ui.Menu.Message,
 });
-export const GotSettingsMenuMessage = m("GotSettingsMenuMessage", {
-  message: Ui.Menu.Message,
-});
 export const CompletedApplyAppearance = m("CompletedApplyAppearance");
+export const GotTabsMessage = m("GotTabsMessage", {
+  message: Ui.Tabs.Message,
+});
 export const GotListMessage = m("GotListMessage", {
   message: Ui.Table.Message,
+});
+/** Toggles the command palette — from the toolbar button or the global ⌘K
+ *  subscription in main.ts. A second ⌘K while open closes it. */
+export const OpenedPalette = m("OpenedPalette");
+export const GotPaletteMessage = m("GotPaletteMessage", {
+  message: Ui.Palette.Message,
 });
 
 export const Message = S.Union([
   GotFolderMenuMessage,
-  GotSettingsMenuMessage,
   CompletedApplyAppearance,
+  GotTabsMessage,
   GotListMessage,
+  OpenedPalette,
+  GotPaletteMessage,
 ]);
 export type Message = typeof Message.Type;
 
@@ -469,30 +543,17 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
-      GotSettingsMenuMessage: ({ message }) => {
-        const [settingsMenu, commands, maybeSelected] = SettingsMenu.update(
-          model.settingsMenu,
-          message,
-        );
-        const menuCommands = Command.mapMessages(commands, (message) =>
-          GotSettingsMenuMessage({ message }),
-        );
-        return Option.match(maybeSelected, {
-          onNone: (): UpdateReturn => [
-            evo(model, { settingsMenu: () => settingsMenu }),
-            menuCommands,
-          ],
-          onSome: ({ value }): UpdateReturn => [
-            evo(model, {
-              settingsMenu: () => settingsMenu,
-              appearance: () => value,
-            }),
-            [...menuCommands, ApplyAppearance({ appearance: value })],
-          ],
-        });
-      },
-
       CompletedApplyAppearance: () => [model, []],
+
+      GotTabsMessage: ({ message }) => {
+        const [tabs, commands] = Ui.Tabs.update(model.tabs, message);
+        return [
+          evo(model, { tabs: () => tabs }),
+          Command.mapMessages(commands, (message) =>
+            GotTabsMessage({ message }),
+          ),
+        ];
+      },
 
       GotListMessage: ({ message }) => {
         const [list, commands] = Ui.Table.update(model.list, message);
@@ -502,6 +563,48 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             GotListMessage({ message }),
           ),
         ];
+      },
+
+      OpenedPalette: () => {
+        const [palette, commands] = InboxPalette.toggle(model.palette);
+        return [
+          evo(model, { palette: () => palette }),
+          Command.mapMessages(commands, (message) =>
+            GotPaletteMessage({ message }),
+          ),
+        ];
+      },
+
+      GotPaletteMessage: ({ message }) => {
+        const [palette, commands, maybeSelected] = InboxPalette.update(
+          model.palette,
+          message,
+        );
+        const paletteCommands = Command.mapMessages(commands, (message) =>
+          GotPaletteMessage({ message }),
+        );
+        // Only the theme action has a domain effect in the sketch; every
+        // other selection just closes the palette.
+        return Option.match(maybeSelected, {
+          onNone: (): UpdateReturn => [
+            evo(model, { palette: () => palette }),
+            paletteCommands,
+          ],
+          onSome: (item): UpdateReturn => {
+            if (item !== "Toggle dark mode") {
+              return [evo(model, { palette: () => palette }), paletteCommands];
+            }
+            const appearance: Appearance =
+              model.appearance === "Dark" ? "Light" : "Dark";
+            return [
+              evo(model, {
+                palette: () => palette,
+                appearance: () => appearance,
+              }),
+              [...paletteCommands, ApplyAppearance({ appearance })],
+            ];
+          },
+        });
       },
     }),
   );
@@ -517,23 +620,6 @@ const folderButtonContent = (): Html => {
       h.span([], ["All"]),
       h.span([h.Class("text-muted-foreground")], ["199"]),
       Icon.chevronsUpDown("h-4 w-4 text-muted-foreground"),
-    ],
-  );
-};
-
-const tabView = (tab: TabConfig): Html => {
-  const h = html();
-  return h.button(
-    [
-      h.Type("button"),
-      h.Class(
-        `flex items-center gap-2 text-[15px] font-medium text-muted-foreground hover:text-foreground ${Ui.hoverTransition}`,
-      ),
-    ],
-    [
-      tab.icon(`h-[18px] w-[18px] ${tab.iconClass}`),
-      h.span([], [tab.label]),
-      h.span([h.Class("text-muted-foreground/60")], [String(tab.count)]),
     ],
   );
 };
@@ -570,29 +656,22 @@ const toolbarView = (model: Model): Html => {
                 isChecked: item === "All Inbox",
               }),
               buttonContent: folderButtonContent(),
-              buttonClassName: `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 text-[15px] font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`,
+              buttonClassName: `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`,
               ariaLabel: "Mail folders",
               substrate: PAGE_SURFACE,
             },
             toParentMessage: (message) => GotFolderMenuMessage({ message }),
           }),
           h.nav(
-            [h.Class("flex items-center gap-6")],
+            [h.Class("flex items-center gap-2")],
             [
-              ...TABS.map(tabView),
-              h.button(
-                [
-                  h.Type("button"),
-                  h.Class(
-                    `flex items-center gap-2 text-[15px] font-medium text-muted-foreground hover:text-foreground ${Ui.hoverTransition}`,
-                  ),
-                ],
-                [
-                  Icon.ellipsis("h-[18px] w-[18px]"),
-                  h.span([], ["Other"]),
-                  h.span([h.Class("text-muted-foreground/60")], ["18"]),
-                ],
-              ),
+              h.submodel({
+                slotId: "inbox-tabs",
+                model: model.tabs,
+                view: Ui.Tabs.view,
+                viewInputs: { tabs: TAB_LABELS, tabSpec },
+                toParentMessage: (message) => GotTabsMessage({ message }),
+              }),
               Ui.button(
                 { variant: "ghost", size: "icon-sm", ariaLabel: "Add filter" },
                 [Icon.plus("h-[18px] w-[18px]")],
@@ -602,10 +681,28 @@ const toolbarView = (model: Model): Html => {
         ],
       ),
 
-      // Right cluster: filter, accounts, invite, notifications, compose.
+      // Right cluster: search (⌘K), filter, accounts, invite, notifications,
+      // compose.
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
+          h.button(
+            [
+              h.Type("button"),
+              h.AriaLabel("Search"),
+              h.OnClick(OpenedPalette()),
+              h.Class(
+                `flex h-7 cursor-pointer items-center gap-2 rounded-lg bg-hover px-2.5 text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+              ),
+            ],
+            [
+              Icon.search("h-4 w-4"),
+              h.kbd(
+                [h.Class("flex items-center text-[11px]")],
+                [Icon.command("h-3 w-3"), h.span([h.Class("ml-0.5")], ["K"])],
+              ),
+            ],
+          ),
           Ui.button({ variant: "ghost", size: "icon-sm", ariaLabel: "Filter" }, [
             Icon.listFilter("h-[18px] w-[18px]"),
           ]),
@@ -737,7 +834,7 @@ const emailRowView = (email: Email): Html => {
         [
           senderAvatarView(email.avatar, email.sender),
           h.span(
-            [h.Class("flex min-w-0 items-baseline gap-1.5 truncate text-[15px]")],
+            [h.Class("flex min-w-0 items-baseline gap-1.5 truncate")],
             [
               h.span([h.Class(readState.sender)], [email.sender]),
               email.groupCount === undefined
@@ -770,7 +867,7 @@ const emailRowView = (email: Email): Html => {
             ? Icon.cloud("h-4 w-4 shrink-0 text-muted-foreground")
             : h.empty,
           h.span(
-            [h.Class("min-w-0 truncate text-[15px]")],
+            [h.Class("min-w-0 truncate")],
             [
               h.span([h.Class(readState.subject)], [email.subject]),
               h.span([h.Class("mx-2 text-muted-foreground/50")], ["—"]),
@@ -805,14 +902,12 @@ const emailRowView = (email: Email): Html => {
 const sectionHeaderView = (label: string): Html => {
   const h = html();
 
-  // Asymmetric padding that reads as symmetric: the border of the previous
-  // row sits directly above this label, but the row below contributes its
-  // own 12px of top padding — so 14px above + (2px + 12px) below centers
-  // the label between the line and the next row's content.
+  // Symmetric: the previous row's border sits above, this header's own
+  // border closes it below, and the label centers between the two lines.
   return h.div(
     [
       h.Class(
-        "pb-0.5 pt-3.5 text-center text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70",
+        "border-b border-border py-2.5 text-center text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70",
       ),
     ],
     [label],
@@ -835,59 +930,6 @@ const listChildren: ReadonlyArray<Ui.Table.TableChild> = SECTIONS.flatMap(
     })),
   ],
 );
-
-const dockView = (model: Model): Html => {
-  const h = html<Message>();
-
-  return h.div(
-    [
-      h.Class(
-        "pointer-events-none fixed inset-x-0 bottom-5 z-40 flex justify-center",
-      ),
-    ],
-    [
-      h.div(
-        [
-          h.Class(
-            // The dock floats two steps above the page: surface 3, its own
-            // shadow.
-            `pointer-events-auto flex items-center gap-1 rounded-xl p-1 ${Ui.surface(Ui.elevate(PAGE_SURFACE, Ui.POPOUT_OFFSET))}`,
-          ),
-        ],
-        [
-          Ui.button({ variant: "ghost", size: "icon", ariaLabel: "Search" }, [
-            Icon.search("h-[18px] w-[18px]"),
-          ]),
-          Ui.button(
-            { variant: "ghost", size: "icon", ariaLabel: "Toggle layout" },
-            [Icon.panelLeft("h-[18px] w-[18px]")],
-          ),
-          h.submodel({
-            slotId: "inbox-settings-menu",
-            model: model.settingsMenu,
-            view: SettingsMenu.view,
-            viewInputs: {
-              items: APPEARANCE_ITEMS,
-              itemSpec: (item) => ({
-                icon: APPEARANCE_ICONS[item],
-                label: item === "System" ? "System theme" : `${item} theme`,
-                isChecked: item === model.appearance,
-              }),
-              buttonContent: Icon.settings("h-[18px] w-[18px]"),
-              buttonClassName: Ui.buttonClasses("ghost", "icon"),
-              ariaLabel: "Settings",
-              // The menu opens from the dock, which sits at surface 3.
-              substrate: Ui.elevate(PAGE_SURFACE, Ui.POPOUT_OFFSET),
-              opens: "up",
-              widthClassName: "w-56",
-            },
-            toParentMessage: (message) => GotSettingsMenuMessage({ message }),
-          }),
-        ],
-      ),
-    ],
-  );
-};
 
 export const view = Submodel.defineView<Model, Message>((model): Html => {
   const h = html<Message>();
@@ -915,7 +957,18 @@ export const view = Submodel.defineView<Model, Message>((model): Html => {
           ),
         ],
       ),
-      dockView(model),
+      h.submodel({
+        slotId: "inbox-palette",
+        model: model.palette,
+        view: InboxPalette.view,
+        viewInputs: {
+          groups: PALETTE_GROUPS,
+          itemSpec: paletteItemSpec,
+          placeholder: "Type to search or navigate…",
+          substrate: PAGE_SURFACE,
+        },
+        toParentMessage: (message) => GotPaletteMessage({ message }),
+      }),
     ],
   );
 });

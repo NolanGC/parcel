@@ -2,9 +2,14 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Candidate type pairing (both commercial, not adopted yet):
+   headers — NB International Pro (Neubau, ~€99/style + webfont by pageviews)
+   body    — STK Bureau Serif (Smuss Type Kiosk)
+   Free stand-ins if we want the vibe first: Space Grotesk / Source Serif 4.
+   Until licensed, Geist covers both roles. */
 @font-face {
-  font-family: "Inter";
-  src: url("/fonts/InterVariable.ttf") format("truetype");
+  font-family: "Geist";
+  src: url("/fonts/GeistVariable.ttf") format("truetype");
   font-weight: 100 900;
   font-display: swap;
 }
@@ -174,7 +179,7 @@
 ============================================================================ */
 
 @theme inline {
-  --font-sans: "Inter", system-ui, sans-serif;
+  --font-sans: "Geist", system-ui, sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-muted: var(--muted);
@@ -216,10 +221,6 @@
    4. BASE STYLES
 ============================================================================ */
 
-html {
-  scrollbar-gutter: stable;
-}
-
 html, body {
   margin: 0;
   min-height: 100vh;
@@ -231,7 +232,21 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Type spec: body 14px Medium, −2% tracking, 100% leading.
+   font-size lives on body, NOT html: html font-size defines 1rem, and
+   shrinking it rescales every rem-based utility (spacing, w-*, h-*). */
+body {
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+/* Headings: 18px Semibold, 100% leading. */
 h1, h2, h3 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  line-height: 1;
   text-wrap: balance;
 }
 
@@ -305,51 +320,15 @@ html.transitioning *::after {
 }
 
 /* ============================================================================
-   6. NATIVE SCROLLBAR THEME
+   6. HIDDEN SCROLLBARS
    ----------------------------------------------------------------------------
-   Narrow, low-contrast, darkens on hover. Rides the surface-relative overlay
-   ramp (rest 8%, hover 12%, drag 16%) — adapts to dark mode through
-   --overlay. Only on fine pointers.
+   Scrolling still works everywhere; the bars just never paint.
 ============================================================================ */
 
-@media (pointer: fine) {
-  * {
-    scrollbar-width: thin;
-    scrollbar-color: rgb(var(--overlay) / 0.08) transparent;
-  }
+* {
+  scrollbar-width: none;
+}
 
-  ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-  }
-
-  ::-webkit-scrollbar-track,
-  ::-webkit-scrollbar-corner {
-    background: transparent;
-  }
-
-  ::-webkit-scrollbar-thumb {
-    background-color: rgb(var(--overlay) / 0.08);
-    border: 3px solid transparent;
-    background-clip: content-box;
-    border-radius: 9999px;
-  }
-
-  ::-webkit-scrollbar-thumb:vertical {
-    border-left-width: 1px;
-    border-right-width: 5px;
-  }
-
-  ::-webkit-scrollbar-thumb:horizontal {
-    border-top-width: 1px;
-    border-bottom-width: 5px;
-  }
-
-  ::-webkit-scrollbar-thumb:hover {
-    background-color: rgb(var(--overlay) / 0.12);
-  }
-
-  ::-webkit-scrollbar-thumb:active {
-    background-color: rgb(var(--overlay) / 0.16);
-  }
+::-webkit-scrollbar {
+  display: none;
 }

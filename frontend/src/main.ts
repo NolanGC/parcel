@@ -1,7 +1,7 @@
 import { MAX_TODO_TITLE_LENGTH, Todo, TodoId } from "@foldkit/backend";
 import { Input } from "@foldkit/ui";
-import { Array, Effect, Match as M, Option, Schema as S } from "effect";
-import { Command, Runtime } from "foldkit";
+import { Array, Effect, Match as M, Option, Schema as S, Stream } from "effect";
+import { Command, Runtime, Subscription } from "foldkit";
 import { html, type Document, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { UrlRequest, load, pushUrl, replaceUrl } from "foldkit/navigation";
@@ -573,9 +573,37 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
 // SUBSCRIPTIONS
 
-// This app has no sockets or other live resources; exported (as nothing) so
-// entry.ts and scripts/prerender.ts can drive every app the same way.
-export const subscriptions = undefined;
+// ⌘K / Ctrl+K opens the inbox's command palette. The listener only exists
+// while the inbox route is active — the dependency flips the stream on and
+// off as the route changes. `preventDefault` runs synchronously inside the
+// mapper, before the browser's own search shortcut fires.
+export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
+  paletteShortcut: entry(
+    { isInbox: S.Boolean },
+    {
+      modelToDependencies: (model) => ({
+        isInbox: model.route._tag === "Inbox",
+      }),
+      dependenciesToStream: ({ isInbox }) =>
+        Stream.when(
+          Subscription.fromEventFilterMap<KeyboardEvent, Message>({
+            target: window,
+            type: "keydown",
+            toMessage: (event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "k") {
+                event.preventDefault();
+                return Option.some(
+                  GotInboxMessage({ message: Inbox.OpenedPalette() }),
+                );
+              }
+              return Option.none();
+            },
+          }),
+          Effect.sync(() => isInbox),
+        ),
+    },
+  ),
+}));
 export const managedResources = undefined;
 
 // VIEW

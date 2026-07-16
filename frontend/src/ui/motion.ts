@@ -35,6 +35,15 @@ export const popoutDown =
 export const popoutUp =
   "origin-bottom transition duration-80 ease-out data-[closed]:opacity-0 data-[closed]:translate-y-1 data-[closed]:scale-y-[0.96] data-[leave]:duration-60 data-[leave]:ease-in";
 
+/** Command palette panel (moderate tier): a palette is summoned dozens of
+ *  times a session, so it enters a tier quicker than a full dialog. */
+export const palettePanel =
+  "transition duration-160 ease-out data-[closed]:opacity-0 data-[closed]:scale-[0.98] data-[leave]:duration-120 data-[leave]:ease-in";
+
+/** Command palette backdrop (moderate tier). */
+export const paletteBackdrop =
+  "transition-opacity duration-160 ease-out data-[closed]:opacity-0 data-[leave]:duration-120";
+
 /** Dialog panel (slow tier): fade + scale from 0.97. */
 export const dialogPanel =
   "transition duration-240 ease-out data-[closed]:opacity-0 data-[closed]:scale-[0.97] data-[leave]:duration-160 data-[leave]:ease-in";

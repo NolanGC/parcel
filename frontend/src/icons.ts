@@ -22,6 +22,7 @@ export const feather = icon(Lucide.Feather);
 export const shieldAlert = icon(Lucide.ShieldAlert);
 export const archive = icon(Lucide.Archive);
 export const check = icon(Lucide.Check);
+export const command = icon(Lucide.Command);
 export const search = icon(Lucide.Search);
 export const panelLeft = icon(Lucide.PanelLeft);
 export const settings = icon(Lucide.Settings);
