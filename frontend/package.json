@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@effect/sql-sqlite-wasm": "4.0.0-beta.88",
     "@foldkit/backend": "workspace:*",
     "@foldkit/devtools": "0.122.1",
     "@foldkit/ui": "^0.122.0",

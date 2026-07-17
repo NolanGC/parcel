@@ -1,6 +1,7 @@
 import { UserId } from "@foldkit/backend";
 import { createAuthClient } from "better-auth/client";
 import { Context, Effect, Layer, Option, Schema as S } from "effect";
+import { KeyValueStore } from "effect/unstable/persistence";
 import { Command } from "foldkit";
 import { m } from "foldkit/message";
 import { load } from "foldkit/navigation";
@@ -47,12 +48,14 @@ const makeAuthClient = () =>
 export class AuthClient extends Context.Service<
   AuthClient,
   ReturnType<typeof makeAuthClient>
->()("parcel/AuthClient") {}
-
-export const authClientLayer: Layer.Layer<AuthClient> = Layer.sync(
-  AuthClient,
-  () => AuthClient.of(makeAuthClient()),
-);
+>()("parcel/AuthClient", {
+  make: Effect.sync(() => makeAuthClient()),
+}) {
+  static readonly layer: Layer.Layer<AuthClient> = Layer.effect(
+    this,
+    this.make,
+  );
+}
 
 // API
 
@@ -151,39 +154,70 @@ export const SignOut = Command.define(
 )(
   AuthClient.pipe(
     Effect.flatMap((client) => Effect.tryPromise(() => client.signOut())),
+    // Ignored, not handled: the model transitions to logged-out on
+    // CompletedSignOut regardless, so there is no branch to feed an error
+    // into — but log it, or a dead endpoint would be invisible.
+    Effect.tapError((error) =>
+      Effect.logWarning("sign-out request failed", error),
+    ),
     Effect.ignore,
     Effect.as(CompletedSignOut()),
   ),
 );
 
-// SESSION CACHE (localStorage)
+// SESSION CACHE
 
-const encodeSession = S.encodeSync(S.fromJsonString(Session));
-const decodeStoredSession = S.decodeUnknownOption(S.fromJsonString(Session));
+// KeyValueStore abstracts the storage engine: the app provides the
+// localStorage-backed layer below, tests can provide `layerMemory`. The
+// schema store handles the JSON round-trip through `Session`.
+export const sessionStorageLayer: Layer.Layer<KeyValueStore.KeyValueStore> =
+  KeyValueStore.layerStorage(() => localStorage);
 
-export const readStoredSession = Effect.sync(
-  (): Option.Option<Session> =>
-    Option.flatMap(
-      Option.fromNullishOr(localStorage.getItem(SESSION_STORAGE_KEY)),
-      decodeStoredSession,
-    ),
-).pipe(Effect.catch(() => Effect.succeedNone));
+const sessionStore = Effect.map(KeyValueStore.KeyValueStore, (store) =>
+  KeyValueStore.toSchemaStore(store, Session),
+);
+
+// Runs pre-boot as part of `flags`, before the runtime's `resources`
+// exist — so it provides its own layer instead of using the R channel.
+// A corrupt or unreadable cache is the same as no cache.
+export const readStoredSession: Effect.Effect<Option.Option<Session>> =
+  sessionStore.pipe(
+    Effect.flatMap((store) => store.get(SESSION_STORAGE_KEY)),
+    Effect.catch(() => Effect.succeedNone),
+    Effect.provide(sessionStorageLayer),
+  );
 
 export const SaveSession = Command.define(
   "SaveSession",
   { session: Session },
   CompletedSessionPersistence,
 )(({ session }) =>
-  Effect.sync(() =>
-    localStorage.setItem(SESSION_STORAGE_KEY, encodeSession(session)),
-  ).pipe(Effect.ignore, Effect.as(CompletedSessionPersistence())),
+  sessionStore.pipe(
+    Effect.flatMap((store) => store.set(SESSION_STORAGE_KEY, session)),
+    // Best-effort by design: a failed write (quota, blocked storage) only
+    // costs the next visit its instant first paint — CheckSession remains
+    // the authority. Log it so chronically broken storage is diagnosable.
+    Effect.tapError((error) =>
+      Effect.logWarning("session cache write failed", error),
+    ),
+    Effect.ignore,
+    Effect.as(CompletedSessionPersistence()),
+  ),
 );
 
+// Otel, better observability into cache evictions etc
 export const ClearSession = Command.define(
   "ClearSession",
   CompletedSessionPersistence,
 )(
-  Effect.sync(() => localStorage.removeItem(SESSION_STORAGE_KEY)).pipe(
+  Effect.flatMap(KeyValueStore.KeyValueStore, (store) =>
+    store.remove(SESSION_STORAGE_KEY),
+  ).pipe(
+    // Best-effort: if the eviction fails, the next boot paints logged-in
+    // from the stale cache until GotSession(none) corrects it.
+    Effect.tapError((error) =>
+      Effect.logWarning("session cache eviction failed", error),
+    ),
     Effect.ignore,
     Effect.as(CompletedSessionPersistence()),
   ),

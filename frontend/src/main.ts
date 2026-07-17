@@ -1,4 +1,5 @@
 import { Effect, Match as M, Option, Schema as S, Stream } from "effect";
+import { KeyValueStore } from "effect/unstable/persistence";
 import { Command, Runtime, Subscription } from "foldkit";
 import { html, type Document, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
@@ -28,6 +29,7 @@ import {
   loginRouter,
   urlToAppRoute,
 } from "./route";
+import { SyncEngine } from "./sync";
 
 const APP_NAME = "parcel";
 
@@ -131,32 +133,66 @@ const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
     inboxPage: Inbox.init(),
   });
 
+// Everything the app's commands can require; entry.ts provides the
+// matching layers via `resources`.
+export type AppResources =
+  AuthClient | KeyValueStore.KeyValueStore | SyncEngine;
+
+// The inbox page owns the LoadInbox command; wrapping its messages here
+// keeps the parent/child message boundary intact.
+const loadInboxCommands = (): ReadonlyArray<
+  Command.Command<Message, never, AppResources>
+> =>
+  Command.mapMessages([Inbox.LoadInbox()], (message) =>
+    GotInboxMessage({ message }),
+  );
+
 export const init: Runtime.RoutingApplicationInit<
   Model,
   Message,
   Flags,
-  AuthClient
+  AppResources
 > = (flags, url) => {
   const route = urlToAppRoute(url);
 
+  // Pure: returns the starting model plus command *descriptions* — the
+  // runtime executes them after boot. Every branch revalidates with
+  // CheckSession because the cached session is only an optimistic first
+  // paint; the cookie's verdict arrives later as GotSession.
   return Option.match(flags.maybeSession, {
     onNone: () =>
       route._tag === "Inbox"
-        ? ([
+        ? // No cached session but the URL asks for the gated inbox: start
+          // on the login page instead (replaceUrl, so /inbox doesn't
+          // pollute history) while the session check runs.
+          ([
             initLoggedOut(LoginRouteValue, true),
             [RedirectToLogin(), CheckSession()],
           ] as const)
-        : ([
+        : // No cached session on a public route: render it as requested.
+          // This is also where a failed OAuth round-trip lands
+          // (/login?error=...), so surface that error on the login page.
+          ([
             initLoggedOut(route, true, oauthErrorFromUrl(url)),
             [CheckSession()],
           ] as const),
     onSome: (session) =>
       route._tag === "Login"
-        ? ([
+        ? // Cached session but the URL is /login: nothing to sign into —
+          // bounce straight to the inbox.
+          ([
             initLoggedIn(InboxRouteValue, session),
-            [RedirectToInbox(), CheckSession()],
+            [RedirectToInbox(), CheckSession(), ...loadInboxCommands()],
           ] as const)
-        : ([initLoggedIn(route, session), [CheckSession()]] as const),
+        : // Cached session on any other route: paint logged-in
+          // immediately; GotSession later confirms or evicts (the
+          // "cached profile lied" transition in update). The inbox pull
+          // starts on the optimistic session — a stale cookie surfaces as
+          // the pull's own auth error, not a blank list.
+          ([
+            initLoggedIn(route, session),
+            [CheckSession(), ...loadInboxCommands()],
+          ] as const),
   });
 };
 
@@ -197,15 +233,15 @@ const RedirectToHome = Command.define(
 
 type UpdateReturn = readonly [
   Model,
-  ReadonlyArray<Command.Command<Message, never, AuthClient>>,
+  ReadonlyArray<Command.Command<Message, never, AppResources>>,
 ];
 const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
-// Entering the logged-in world from anywhere: land in the inbox and
-// persist the profile cache.
+// Entering the logged-in world from anywhere: land in the inbox, persist
+// the profile cache, and start the first real pull.
 const enterLoggedIn = (session: Session): UpdateReturn => [
   initLoggedIn(InboxRouteValue, session),
-  [SaveSession({ session }), RedirectToInbox()],
+  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands()],
 ];
 
 const leaveLoggedIn = (): UpdateReturn => [

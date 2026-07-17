@@ -52,8 +52,11 @@ describe("init", () => {
 
     expect(model._tag).toBe("LoggedIn");
     expect(model.route._tag).toBe("Inbox");
-    // The boot-time CheckSession revalidation.
-    expect(commands).toHaveLength(1);
+    // The boot-time CheckSession revalidation + the first inbox pull.
+    expect(commands.map((command) => command.name)).toEqual([
+      "CheckSession",
+      "LoadInbox",
+    ]);
   });
 
   test("a cached session bounces the login route to the inbox", () => {
@@ -61,8 +64,12 @@ describe("init", () => {
 
     expect(model._tag).toBe("LoggedIn");
     expect(model.route._tag).toBe("Inbox");
-    // RedirectToInbox + CheckSession.
-    expect(commands).toHaveLength(2);
+    // RedirectToInbox + CheckSession + the first inbox pull.
+    expect(commands.map((command) => command.name)).toEqual([
+      "RedirectToInbox",
+      "CheckSession",
+      "LoadInbox",
+    ]);
   });
 
   test("without a session the inbox route redirects to login", () => {

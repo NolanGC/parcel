@@ -5,13 +5,15 @@ import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
 
 import * as Icon from "../icons";
+import { SyncEngine, ThreadRow, type ThreadCategory } from "../sync";
 import * as Ui from "../ui";
 
-// The inbox UI sketch, built on FoldkitUI (the Fluid Functionalism port).
-// Colors come from the surface ladder + overlay tokens in styles.css, motion
-// from the spring tiers in ui/motion.ts — no view here names a raw color or
-// duration. The emails are static data; the folder dropdown and the settings
-// menu (appearance switcher) carry real interaction.
+// The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors
+// come from the surface ladder + overlay tokens in styles.css, motion
+// from the spring tiers in ui/motion.ts — no view here names a raw color
+// or duration. Rows are real threads pulled through the SyncEngine
+// (Gmail → local SQLite → this list); the folder dropdown, tabs, and
+// palette remain chrome.
 
 // The whole page sits on surface 1; everything that opens from it derives
 // its own level from this substrate.
@@ -27,10 +29,6 @@ export const Appearance = S.Literals(["System", "Light", "Dark"]);
 export type Appearance = typeof Appearance.Type;
 
 // DATA
-
-/** Scalar ID for an email row; also serves as the row's list key. */
-const EmailId = S.String.pipe(S.brand("EmailId"));
-type EmailId = typeof EmailId.Type;
 
 /** Avatar tiles are "content colors" — deliberately outside the surface
  *  token system, like a favicon. The brand marks them as validated raw
@@ -61,7 +59,7 @@ type Avatar =
     };
 
 type Email = {
-  id: EmailId;
+  id: string;
   sender: string;
   groupCount?: number;
   avatar: Avatar;
@@ -77,238 +75,53 @@ type Email = {
   attachment?: boolean;
 };
 
-type Section = {
-  label: string;
-  emails: ReadonlyArray<Email>;
+// Gmail's real category labels mapped onto the chip set the design
+// defines. Categories without an honest counterpart land on "other"
+// rather than pretending.
+const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
+  personal: "primary",
+  promotions: "promotions",
+  social: "other",
+  updates: "other",
+  forums: "other",
+  none: "other",
 };
 
-const SECTIONS: ReadonlyArray<Section> = [
-  {
-    label: "Today",
-    emails: [
-      {
-        id: EmailId.make("1"),
-        sender: "Solomon, Tony & Sade",
-        groupCount: 13,
-        avatar: { kind: "image", src: "/avatars/lego-green.png" },
-        isRead: true,
-        subject: "Re: Progress",
-        preview:
-          "I pushed the new update to git and we haven't finished the proposal for the funding we discussed ove...",
-        category: "todo",
-        time: "22:13",
-      },
-      {
-        id: EmailId.make("2"),
-        sender: "Apple",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#000000"),
-          fg: HexColor.make("#ffffff"),
-          label: "apple",
-        },
-        isRead: true,
-        subject: "Think different",
-        preview:
-          "Here's to the crazy ones. The misfits, the rebels, the troublemakers, the round pegs in the...",
-        category: "newsletter",
-        time: "21:27",
-        attachment: true,
-      },
-      {
-        id: EmailId.make("3"),
-        sender: "Cal.com",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#111111"),
-          fg: HexColor.make("#ffffff"),
-          label: "cal.com",
-        },
-        isRead: true,
-        subject: "Reminder: quick chat - Tue, Jan 21, 2025 1:00pm",
-        preview: "Hi Sanya Koyi, This is a reminder about your upcoming event.",
-        category: "reminder",
-        time: "18:19",
-      },
-      {
-        id: EmailId.make("4"),
-        sender: "mymind",
-        avatar: { kind: "image", src: "/avatars/mymind.png" },
-        unread: true,
-        subjectIcon: "cloud",
-        subject: "On art, Perspective & beautiful chairs",
-        preview:
-          "Hi Adesanya, this our weekly inspiration email, where we share a fe...",
-        category: "promotions",
-        time: "12:13",
-      },
-      {
-        id: EmailId.make("5"),
-        sender: "Tony Allen",
-        avatar: { kind: "image", src: "/avatars/lego-red.png" },
-        unread: true,
-        subject: "Expenses Overview",
-        preview:
-          "You are to complete your contribution before we leave camp for the vacation and see if Helen i...",
-        category: "todo",
-        time: "22:13",
-      },
-      {
-        id: EmailId.make("6"),
-        sender: "Craft Docs",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#f4f4f5"),
-          fg: HexColor.make("#2563eb"),
-          label: "C",
-          rounded: true,
-        },
-        unread: true,
-        subject: "Your tasks for today, Jan 21",
-        preview:
-          "Active tasks Create a roadmap for next version of web app Jan 8 Inbox See all Task...",
-        category: "reminder",
-        time: "12:13",
-      },
-    ],
+// Real senders have no avatar images yet, so every row wears an initial
+// tile in the app accent — same shape the profile chip uses.
+const AVATAR_BG = HexColor.make("#4f46e5");
+const AVATAR_FG = HexColor.make("#ffffff");
+
+// Same-day threads show the clock, older ones the date — matching the
+// format the design used.
+const formatTime = (epochMs: number): string => {
+  const date = new Date(epochMs);
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return `${date.getHours()}:${String(date.getMinutes()).padStart(2, "0")}`;
+  }
+  return `${date.getMonth() + 1}/${date.getDate()}/${String(
+    date.getFullYear(),
+  ).slice(2)}`;
+};
+
+const emailFromThreadRow = (row: ThreadRow): Email => ({
+  id: row.id,
+  sender: row.sender,
+  avatar: {
+    kind: "tile",
+    bg: AVATAR_BG,
+    fg: AVATAR_FG,
+    label: (row.sender.slice(0, 1) || "?").toUpperCase(),
+    rounded: true,
   },
-  {
-    label: "Yesterday",
-    emails: [
-      {
-        id: EmailId.make("7"),
-        sender: "Steve Jobs",
-        avatar: { kind: "image", src: "/avatars/steve-jobs.png" },
-        unread: true,
-        subject: "Don't be a Career",
-        preview:
-          "The enemy of most dreams and intuitions, and one of the most dangerous and stifling concepts...",
-        category: "primary",
-        time: "13:34",
-      },
-      {
-        id: EmailId.make("8"),
-        sender: "The New York Times",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#ffffff"),
-          fg: HexColor.make("#000000"),
-          label: "T",
-          serif: true,
-        },
-        subject: "Final hours: Best offer must end. $0.25 a week.",
-        preview:
-          "The New York Times. The Times sales ends in hours in hours b...",
-        category: "newsletter",
-        time: "13:34",
-      },
-      {
-        id: EmailId.make("9"),
-        sender: "Pinterest",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#e60023"),
-          fg: HexColor.make("#ffffff"),
-          label: "P",
-          rounded: true,
-        },
-        unread: true,
-        subject: "Web and App Design for Adehsanya",
-        preview:
-          "Cloud storage desktop widget...| www... Design images images | www... l...",
-        category: "promotions",
-        time: "13:34",
-      },
-    ],
-  },
-  {
-    label: "This week",
-    emails: [
-      {
-        id: EmailId.make("10"),
-        sender: "Tony, Jacob & Sade",
-        groupCount: 23,
-        avatar: { kind: "image", src: "/avatars/lego-red.png" },
-        unread: true,
-        subject: "Re: Status",
-        preview:
-          "Everything is in order now, we are set to go! Welldone guys, hopefully we get to meet at the office befor...",
-        category: "todo",
-        time: "1/13/25",
-      },
-      {
-        id: EmailId.make("11"),
-        sender: "The New York Times",
-        avatar: {
-          kind: "tile",
-          bg: HexColor.make("#ffffff"),
-          fg: HexColor.make("#000000"),
-          label: "T",
-          serif: true,
-        },
-        subject: "Final hours: Best offer must end. $0.25 a week.",
-        preview:
-          "The New York Times. The Times sales ends in hours in hours b...",
-        category: "newsletter",
-        time: "1/13/25",
-      },
-      {
-        id: EmailId.make("12"),
-        sender: "Product Hunt Weekly",
-        avatar: { kind: "image", src: "/avatars/product-hunt.png" },
-        subject: "Never context-switch again",
-        preview:
-          "Plus, see your Saas through the eyes of a VC Product Hunt Sunday, Jan 19 The Ro...",
-        category: "newsletter",
-        time: "1/11/25",
-      },
-      {
-        id: EmailId.make("13"),
-        sender: "Tony",
-        avatar: { kind: "image", src: "/avatars/tony.png" },
-        unread: true,
-        subject: "Offer letter: Acme Design Team",
-        preview:
-          "We are pleased to offer you the position of [Job Title] at [Company Name]. Followi...",
-        category: "todo",
-        time: "1/9/25",
-      },
-      {
-        id: EmailId.make("14"),
-        sender: "Sade Helen",
-        avatar: { kind: "image", src: "/avatars/sade.png" },
-        unread: true,
-        subject: "Re: Status",
-        preview:
-          "I hope this email finds you well. I'd like to schedule a team planning meeting for next Wednesday, Januar...",
-        category: "todo",
-        time: "1/8/25",
-      },
-      {
-        id: EmailId.make("15"),
-        sender: "Vlad, Ava, Lola and 5 Others",
-        avatar: { kind: "image", src: "/avatars/vlad.png" },
-        subject: "Red Cross Camp Preparation",
-        preview:
-          "I checked the website, I am afraid we are preparing for the wrong batch. I atta...",
-        category: "vacation",
-        time: "1/6/25",
-        attachment: true,
-      },
-      {
-        id: EmailId.make("16"),
-        sender: "Lego Man",
-        avatar: { kind: "image", src: "/avatars/lego-red.png" },
-        unread: true,
-        subject: "Status Confirmation",
-        preview:
-          "The collectible will be available on Opensea by 12 tommorow (WAT). Download any wallet fro...",
-        category: "other",
-        time: "1/6/25",
-      },
-    ],
-  },
-];
+  unread: row.unread,
+  isRead: !row.unread,
+  subject: row.subject,
+  preview: row.snippet,
+  category: CATEGORY_FROM_THREAD[row.category],
+  time: formatTime(row.date),
+});
 
 type CategoryConfig = {
   label: string;
@@ -425,40 +238,19 @@ const ACTION_SPECS: Record<string, Ui.Palette.PaletteItemSpec> = {
   },
 };
 
-// Emails enter the palette as "sender — subject" strings; the map recovers
-// the spec (and would recover the id, once opening an email is real).
-// Image avatars carry over as the leading slot; tile avatars fall back to
-// the mail icon. The category rides as the trailing tag chip.
-const EMAIL_SPECS = new Map<string, Ui.Palette.PaletteItemSpec>(
-  SECTIONS.flatMap((section) =>
-    section.emails.map((email) => [
-      `${email.sender} — ${email.subject}`,
-      {
-        ...(email.avatar.kind === "image"
-          ? { avatarSrc: email.avatar.src }
-          : { icon: Icon.inbox }),
-        label: `${email.sender} — ${email.subject}`,
-        tag: {
-          icon: CATEGORIES[email.category].icon,
-          label: CATEGORIES[email.category].label,
-        },
-        keywords: email.preview,
-      } satisfies Ui.Palette.PaletteItemSpec,
-    ]),
-  ),
-);
-
+// The palette's corpus is actions and folders. Emails will join once the
+// palette can open a real thread — items would come from the model's rows,
+// not a static module-level list.
 const PALETTE_GROUPS: ReadonlyArray<Ui.Palette.Group<string>> = [
   { label: "Actions", items: PALETTE_ACTIONS },
   { label: "Folders", items: FOLDER_LABELS },
-  { label: "Emails", items: [...EMAIL_SPECS.keys()] },
 ];
 
 const paletteItemSpec = (item: string): Ui.Palette.PaletteItemSpec =>
   ACTION_SPECS[item] ??
   (item in FOLDERS
     ? { icon: FOLDERS[item as FolderLabel].icon, label: item }
-    : (EMAIL_SPECS.get(item) ?? { label: item }));
+    : { label: item });
 
 const InboxPalette = Ui.Palette.create<string>();
 
@@ -471,6 +263,10 @@ export const Model = S.Struct({
   list: Ui.Table.Model,
   palette: Ui.Palette.Model,
   accountPopover: Ui.Popover.Model,
+  // None = the first load hasn't completed; Some([]) = a genuinely empty
+  // inbox. loadError keeps the last failure for the list to surface.
+  threads: S.Option(S.Array(ThreadRow)),
+  loadError: S.Option(S.String),
 });
 export type Model = typeof Model.Type;
 
@@ -481,6 +277,8 @@ export const init = (): Model => ({
   list: Ui.Table.init({ id: "inbox-list" }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
+  threads: Option.none(),
+  loadError: Option.none(),
 });
 
 // MESSAGE
@@ -508,6 +306,10 @@ export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
  *  so main.ts watches for this tag inside GotInboxMessage and runs the
  *  actual SignOut command; here it only closes the popover. */
 export const ClickedSignOut = m("InboxClickedSignOut");
+/** The SyncEngine finished a pull: real thread rows, read back from the
+ *  local database. */
+export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
+export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
 
 export const Message = S.Union([
   GotFolderMenuMessage,
@@ -518,6 +320,8 @@ export const Message = S.Union([
   GotPaletteMessage,
   GotAccountPopoverMessage,
   ClickedSignOut,
+  GotThreads,
+  FailedLoadInbox,
 ]);
 export type Message = typeof Message.Type;
 
@@ -546,9 +350,31 @@ const ApplyAppearance = Command.define(
   }),
 );
 
+// Pulls one page of real inbox threads through the SyncEngine
+// (Gmail → SQLite → rows). Triggered by main.ts on entering the
+// logged-in inbox; the runtime's resources provide the SyncEngine.
+export const LoadInbox = Command.define(
+  "LoadInbox",
+  GotThreads,
+  FailedLoadInbox,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.loadInbox.pipe(
+      Effect.map((rows) => GotThreads({ rows })),
+      Effect.catch((error) =>
+        Effect.succeed(FailedLoadInbox({ error: error.message })),
+      ),
+    );
+  }),
+);
+
 // UPDATE
 
-type UpdateReturn = readonly [Model, ReadonlyArray<Command.Command<Message>>];
+type UpdateReturn = readonly [
+  Model,
+  ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
+];
 
 export const update = (model: Model, message: Message): UpdateReturn =>
   M.value(message).pipe(
@@ -645,6 +471,19 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
         ];
       },
+
+      GotThreads: ({ rows }) => [
+        evo(model, {
+          threads: () => Option.some(rows),
+          loadError: () => Option.none<string>(),
+        }),
+        [],
+      ],
+
+      FailedLoadInbox: ({ error }) => [
+        evo(model, { loadError: () => Option.some(error) }),
+        [],
+      ],
 
       // The actual sign-out is main.ts's job (it owns the session); this
       // page just folds the popover shut behind it.
@@ -1022,22 +861,59 @@ const sectionHeaderView = (label: string): Html => {
   );
 };
 
-// The whole list — headers interleaved with rows — is one Table, so the
-// hover overlay travels across section boundaries too.
-const listChildren: ReadonlyArray<Ui.Table.TableChild> = SECTIONS.flatMap(
-  (section) => [
-    {
-      kind: "static" as const,
-      key: `header-${section.label}`,
-      content: sectionHeaderView(section.label),
-    },
-    ...section.emails.map((email) => ({
-      kind: "row" as const,
-      key: email.id,
-      content: emailRowView(email),
-    })),
-  ],
-);
+// A full-width quiet row for the states that aren't a thread: first load,
+// a load failure, an actually-empty inbox.
+const statusRowView = (text: string): Html => {
+  const h = html();
+  return h.div(
+    [
+      h.Class(
+        "border-b border-border px-4 py-8 text-center text-muted-foreground",
+      ),
+    ],
+    [text],
+  );
+};
+
+// The whole list — header interleaved with rows — is one Table, so the
+// hover overlay travels across boundaries. Rows are the model's real
+// threads; until the first pull lands there are no rows to fake.
+const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
+  const header = {
+    kind: "static" as const,
+    key: "header-inbox",
+    content: sectionHeaderView("Inbox"),
+  };
+
+  return Option.match(model.threads, {
+    onNone: () => [
+      header,
+      {
+        kind: "static" as const,
+        key: "inbox-status",
+        content: statusRowView(
+          Option.getOrElse(model.loadError, () => "Loading your inbox…"),
+        ),
+      },
+    ],
+    onSome: (rows) => [
+      header,
+      ...(rows.length === 0
+        ? [
+            {
+              kind: "static" as const,
+              key: "inbox-status",
+              content: statusRowView("Your inbox is empty."),
+            },
+          ]
+        : rows.map((row) => ({
+            kind: "row" as const,
+            key: row.id,
+            content: emailRowView(emailFromThreadRow(row)),
+          }))),
+    ],
+  });
+};
 
 export const view = Submodel.defineView<Model, Message, ViewInputs>(
   (model, { profile }): Html => {
@@ -1059,7 +935,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                   slotId: "inbox-list",
                   model: model.list,
                   view: Ui.Table.view,
-                  viewInputs: { children: listChildren },
+                  viewInputs: { children: listChildren(model) },
                   toParentMessage: (message) => GotListMessage({ message }),
                 }),
               ],

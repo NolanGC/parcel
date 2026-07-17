@@ -69,4 +69,10 @@ const prerenderLanding = (): Plugin => {
 
 export default defineConfig({
   plugins: [tailwindcss(), prerenderLanding()],
+  optimizeDeps: {
+    exclude: ["@effect/wa-sqlite"],
+  },
+  worker: {
+    format: "es",
+  },
 });
