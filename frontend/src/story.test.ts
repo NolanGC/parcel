@@ -1,47 +1,26 @@
 // Pure update-logic tests (Foldkit Story): messages in, model + commands
-// out. No DOM, no network — commands are asserted and resolved by hand, so
-// nothing here proves a fetch actually behaves as modeled.
+// out. No DOM, no network — nothing here proves a fetch actually behaves as
+// modeled.
 //
 // Covers:
-// - init: cached session lands LoggedIn + fetches todos; the todos route
-//   without a session redirects to login.
-// - The fetched todo list is stored.
-// - Adding: trims input, ignores empty submissions, appends the created
-//   todo and clears the input when the request resolves.
-// - Toggling and deleting a todo update the list from the server response.
-// - A failed mutation surfaces an error that clears on the next edit.
+// - init: cached session lands LoggedIn (and the login route bounces to the
+//   inbox); no session gates the inbox route behind login; an OAuth
+//   ?error= callback param surfaces on the login page.
+// - GotSession transitions: cookie confirms → LoggedIn; cookie gone →
+//   LoggedOut.
+// - Sign-out lands back on the marketing page.
 //
 // Does NOT cover:
 // - Rendering (see scene.test.ts) or real command effects (HTTP).
-// - The logged-out form flows: sign-in/sign-up input, pending, auth errors,
-//   sign-out.
-// - Navigation/URL-change messages after init.
-import { TodoId, UserId, type Todo } from "@foldkit/backend";
-import { DateTime, Option } from "effect";
-import { Story } from "foldkit";
+// - The Google OAuth redirect flow itself.
+import { UserId } from "@foldkit/backend";
+import { Option } from "effect";
 import { type Url } from "foldkit/url";
 import { describe, expect, test } from "vitest";
 
-import {
-  ClickedDelete,
-  ClickedToggle,
-  CreateTodo,
-  DeleteTodo,
-  DeletedTodo,
-  CreatedTodo,
-  FailedMutateTodo,
-  GotTodos,
-  SubmittedNewTodo,
-  ToggleTodo,
-  TodosLoaded,
-  UpdatedNewTitle,
-  UpdatedTodo,
-  init,
-  update,
-  type Model,
-} from "./main";
-
-const createdAt = DateTime.makeUnsafe(0);
+import { CompletedSignOut, GotSession } from "./auth";
+import { GotInboxMessage, init, update, type Model } from "./main";
+import { Inbox } from "./page";
 
 const session = {
   userId: UserId.make("user-1"),
@@ -51,56 +30,43 @@ const session = {
 const loggedInFlags = { maybeSession: Option.some(session) };
 const loggedOutFlags = { maybeSession: Option.none<typeof session>() };
 
-const asLoggedIn = (model: Model): Extract<Model, { _tag: "LoggedIn" }> => {
-  if (model._tag !== "LoggedIn") {
-    throw new Error(`Expected LoggedIn model, got ${model._tag}`);
-  }
-  return model;
-};
-
-const milk: Todo = {
-  id: TodoId.make("00000000-0000-4000-8000-000000000001"),
-  title: "Buy milk",
-  completed: false,
-  createdAt,
-};
-
-const bread: Todo = {
-  id: TodoId.make("00000000-0000-4000-8000-000000000002"),
-  title: "Bake bread",
-  completed: true,
-  createdAt,
-};
-
-const url = (pathname: string): Url => ({
+const url = (pathname: string, search?: string): Url => ({
   protocol: "http:",
   host: "localhost",
   port: Option.none(),
   pathname,
-  search: Option.none(),
+  search: Option.fromNullishOr(search),
   hash: Option.none(),
 });
 
-const loadedModel = (
-  todos: ReadonlyArray<Todo>,
-): Extract<Model, { _tag: "LoggedIn" }> => {
-  const [model] = init(loggedInFlags, url("/todos"));
-  return { ...asLoggedIn(model), todos: TodosLoaded({ todos }) };
+const asLoggedOut = (model: Model): Extract<Model, { _tag: "LoggedOut" }> => {
+  if (model._tag !== "LoggedOut") {
+    throw new Error(`Expected LoggedOut model, got ${model._tag}`);
+  }
+  return model;
 };
 
-describe("update", () => {
-  test("init with a cached session lands logged in and fetches todos", () => {
-    const [model, commands] = init(loggedInFlags, url("/todos"));
-    const loggedIn = asLoggedIn(model);
+describe("init", () => {
+  test("a cached session lands logged in on the inbox", () => {
+    const [model, commands] = init(loggedInFlags, url("/inbox"));
 
-    expect(loggedIn.route._tag).toBe("Todos");
-    expect(loggedIn.todos._tag).toBe("TodosLoading");
-    // FetchTodos + the boot-time CheckSession revalidation.
+    expect(model._tag).toBe("LoggedIn");
+    expect(model.route._tag).toBe("Inbox");
+    // The boot-time CheckSession revalidation.
+    expect(commands).toHaveLength(1);
+  });
+
+  test("a cached session bounces the login route to the inbox", () => {
+    const [model, commands] = init(loggedInFlags, url("/login"));
+
+    expect(model._tag).toBe("LoggedIn");
+    expect(model.route._tag).toBe("Inbox");
+    // RedirectToInbox + CheckSession.
     expect(commands).toHaveLength(2);
   });
 
-  test("init without a session redirects the todos route to login", () => {
-    const [model, commands] = init(loggedOutFlags, url("/todos"));
+  test("without a session the inbox route redirects to login", () => {
+    const [model, commands] = init(loggedOutFlags, url("/inbox"));
 
     expect(model._tag).toBe("LoggedOut");
     expect(model.route._tag).toBe("Login");
@@ -108,87 +74,57 @@ describe("update", () => {
     expect(commands).toHaveLength(2);
   });
 
-  test("the fetched todo list is stored", () => {
-    const [model] = init(loggedInFlags, url("/todos"));
-    const [next] = update(model, GotTodos({ todos: [milk, bread] }));
+  test("the landing page is browsable while logged out", () => {
+    const [model] = init(loggedOutFlags, url("/"));
 
-    expect(asLoggedIn(next).todos).toEqual(
-      TodosLoaded({ todos: [milk, bread] }),
-    );
+    expect(model._tag).toBe("LoggedOut");
+    expect(model.route._tag).toBe("Home");
   });
 
-  test("submitting a new todo trims, creates, and clears the input", () => {
-    Story.story(
-      update,
-      Story.with<Model>({ ...loadedModel([]), newTitle: "  Buy milk  " }),
-      Story.message(SubmittedNewTodo()),
-      Story.Command.expectExact(CreateTodo({ title: "Buy milk" })),
-      Story.Command.resolve(CreateTodo, CreatedTodo({ todo: milk })),
-      Story.model((model) => {
-        const loggedIn = asLoggedIn(model);
-        expect(loggedIn.todos).toEqual(TodosLoaded({ todos: [milk] }));
-        expect(loggedIn.newTitle).toBe("");
-        expect(loggedIn.creating).toBe(false);
-      }),
+  test("a declined OAuth round-trip surfaces on the login page", () => {
+    const [model] = init(loggedOutFlags, url("/login", "?error=access_denied"));
+
+    expect(asLoggedOut(model).loginPage.error).toEqual(
+      Option.some("Google sign-in was cancelled."),
     );
   });
+});
 
-  test("empty submissions are ignored", () => {
-    Story.story(
-      update,
-      Story.with<Model>({ ...loadedModel([]), newTitle: "   " }),
-      Story.message(SubmittedNewTodo()),
-      Story.Command.expectNone(),
+describe("update", () => {
+  test("a confirmed cookie moves LoggedOut to LoggedIn on the inbox", () => {
+    const [model] = init(loggedOutFlags, url("/login"));
+    const [next] = update(
+      model,
+      GotSession({ maybeSession: Option.some(session) }),
     );
+
+    expect(next._tag).toBe("LoggedIn");
+    expect(next.route._tag).toBe("Inbox");
   });
 
-  test("toggling a todo applies the server's updated row", () => {
-    Story.story(
-      update,
-      Story.with<Model>(loadedModel([milk])),
-      Story.message(ClickedToggle({ id: milk.id, completed: true })),
-      Story.Command.expectExact(ToggleTodo({ id: milk.id, completed: true })),
-      Story.Command.resolve(
-        ToggleTodo,
-        UpdatedTodo({ todo: { ...milk, completed: true } }),
-      ),
-      Story.model((model) => {
-        expect(asLoggedIn(model).todos).toEqual(
-          TodosLoaded({ todos: [{ ...milk, completed: true }] }),
-        );
-      }),
-    );
+  test("a vanished cookie drops LoggedIn back to the landing page", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next] = update(model, GotSession({ maybeSession: Option.none() }));
+
+    expect(next._tag).toBe("LoggedOut");
+    expect(next.route._tag).toBe("Home");
   });
 
-  test("deleting a todo removes it from the list", () => {
-    Story.story(
-      update,
-      Story.with<Model>(loadedModel([milk, bread])),
-      Story.message(ClickedDelete({ id: milk.id })),
-      Story.Command.expectExact(DeleteTodo({ id: milk.id })),
-      Story.Command.resolve(DeleteTodo, DeletedTodo({ id: milk.id })),
-      Story.model((model) => {
-        expect(asLoggedIn(model).todos).toEqual(
-          TodosLoaded({ todos: [bread] }),
-        );
-      }),
-    );
+  test("sign-out lands on the marketing page", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next] = update(model, CompletedSignOut());
+
+    expect(next._tag).toBe("LoggedOut");
+    expect(next.route._tag).toBe("Home");
   });
 
-  test("a failed mutation surfaces an error that clears on the next edit", () => {
-    Story.story(
-      update,
-      Story.with<Model>(loadedModel([milk])),
-      Story.message(FailedMutateTodo({ error: "Failed to add the todo." })),
-      Story.model((model) => {
-        expect(asLoggedIn(model).actionError).toEqual(
-          Option.some("Failed to add the todo."),
-        );
-      }),
-      Story.message(UpdatedNewTitle({ value: "B" })),
-      Story.model((model) => {
-        expect(asLoggedIn(model).actionError).toEqual(Option.none());
-      }),
+  test("the inbox popover's sign-out runs the SignOut command", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [, commands] = update(
+      model,
+      GotInboxMessage({ message: Inbox.ClickedSignOut() }),
     );
+
+    expect(commands.map((command) => command.name)).toContain("SignOut");
   });
 });

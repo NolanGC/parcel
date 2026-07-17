@@ -2,6 +2,7 @@ import { Runtime } from "foldkit";
 
 import { overlay } from "@foldkit/devtools";
 
+import { authClientLayer } from "./auth";
 import {
   ChangedUrl,
   ClickedLink,
@@ -26,6 +27,7 @@ const application = Runtime.makeApplication({
   view,
   subscriptions,
   managedResources,
+  resources: authClientLayer,
   container: document.getElementById("root"),
   routing: {
     onUrlRequest: (request) => ClickedLink({ request }),

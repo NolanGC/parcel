@@ -1,7 +1,9 @@
 import { UserId } from "@foldkit/backend";
-import { Effect, Option, Schema as S } from "effect";
+import { createAuthClient } from "better-auth/client";
+import { Context, Effect, Layer, Option, Schema as S } from "effect";
 import { Command } from "foldkit";
 import { m } from "foldkit/message";
+import { load } from "foldkit/navigation";
 
 import { API_URL } from "./config";
 
@@ -15,7 +17,7 @@ export const Session = S.Struct({
 });
 export type Session = typeof Session.Type;
 
-const SESSION_STORAGE_KEY = "foldkit-session";
+const SESSION_STORAGE_KEY = "parcel-foldkit-session";
 
 // MESSAGE
 
@@ -23,10 +25,34 @@ export const GotSession = m("GotSession", {
   maybeSession: S.Option(Session),
 });
 export const FailedCheckSession = m("FailedCheckSession", { error: S.String });
-export const SucceededAuth = m("SucceededAuth", { session: Session });
+export const StartedGoogleRedirect = m("StartedGoogleRedirect");
 export const FailedAuth = m("FailedAuth", { error: S.String });
 export const CompletedSignOut = m("CompletedSignOut");
 export const CompletedSessionPersistence = m("CompletedSessionPersistence");
+
+// SERVICE
+
+// The BetterAuth client wraps its REST endpoints (paths, redirect handling,
+// error shapes) so upgrades don't silently change the wire contract under
+// hand-rolled fetches. `credentials: "include"` makes the browser
+// attach/store the session cookie across the frontend/chat-service origin
+// split. As a service, commands stay pure descriptions and tests can
+// provide a stub instead of a network.
+const makeAuthClient = () =>
+  createAuthClient({
+    baseURL: API_URL,
+    fetchOptions: { credentials: "include" },
+  });
+
+export class AuthClient extends Context.Service<
+  AuthClient,
+  ReturnType<typeof makeAuthClient>
+>()("parcel/AuthClient") {}
+
+export const authClientLayer: Layer.Layer<AuthClient> = Layer.sync(
+  AuthClient,
+  () => AuthClient.of(makeAuthClient()),
+);
 
 // API
 
@@ -41,34 +67,10 @@ const toSession = (payload: typeof UserPayload.Type): Session => ({
   name: payload.user.name,
 });
 
-// All BetterAuth endpoints are cookie-authenticated, so every call must be
-// credentialed — that's what makes the browser attach/store the session
-// cookie across the frontend/chat-service origin split.
-const authFetch = (path: string, init?: RequestInit) =>
-  Effect.tryPromise(async () => {
-    const response = await fetch(new URL(path, API_URL), {
-      credentials: "include",
-      ...init,
-    });
-    const body: unknown = await response.json().catch(() => null);
-    return { response, body };
-  });
-
-const decodeErrorPayload = S.decodeUnknownOption(
-  S.Struct({ message: S.String }),
-);
-
-const errorMessage = (body: unknown, fallback: string): string =>
-  Option.match(decodeErrorPayload(body), {
-    onNone: () => fallback,
-    onSome: ({ message }) => message,
-  });
-
-const postJson = (payload: unknown): RequestInit => ({
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify(payload),
-});
+const errorMessage = (
+  error: { message?: string | undefined; statusText: string } | null,
+  fallback: string,
+): string => error?.message ?? error?.statusText ?? fallback;
 
 // COMMAND
 
@@ -79,59 +81,62 @@ export const CheckSession = Command.define(
   GotSession,
   FailedCheckSession,
 )(
-  authFetch("/api/auth/get-session").pipe(
-    Effect.map(({ body }) =>
-      GotSession({
-        maybeSession: Option.map(decodeUserPayload(body), toSession),
-      }),
-    ),
+  Effect.gen(function* () {
+    const client = yield* AuthClient;
+    const { data, error } = yield* Effect.tryPromise(() => client.getSession());
+    if (error !== null) {
+      return FailedCheckSession({
+        error: errorMessage(error, "Could not check the session."),
+      });
+    }
+    return GotSession({
+      maybeSession: Option.map(decodeUserPayload(data), toSession),
+    });
+  }).pipe(
     Effect.catch((error) =>
       Effect.succeed(FailedCheckSession({ error: String(error) })),
     ),
   ),
 );
 
-export const SignIn = Command.define(
-  "SignIn",
-  { email: S.String, password: S.String },
-  SucceededAuth,
+// Sign-in is a full-page OAuth round-trip: BetterAuth answers this POST
+// with Google's authorization URL, and `load` hands the tab over to it.
+// Google sends the user back through the API worker's
+// /api/auth/callback/google, which sets the session cookie and redirects to
+// callbackURL — so success never produces a message here (the page has
+// unloaded); the boot-time CheckSession on the return visit picks the
+// session up. Only failures to *start* the flow report back, and a declined
+// consent screen comes back as ?error= on errorCallbackURL (read in init).
+// `disableRedirect` keeps the client's default auto-redirect plugin out of
+// the way so foldkit's `load` owns the navigation.
+export const SignInWithGoogle = Command.define(
+  "SignInWithGoogle",
+  StartedGoogleRedirect,
   FailedAuth,
-)(({ email, password }) =>
-  authFetch("/api/auth/sign-in/email", postJson({ email, password })).pipe(
-    Effect.map(({ response, body }) =>
-      Option.match(response.ok ? decodeUserPayload(body) : Option.none(), {
-        onNone: () =>
-          FailedAuth({
-            error: errorMessage(body, "Sign in failed."),
-          }),
-        onSome: (payload) => SucceededAuth({ session: toSession(payload) }),
+)(
+  Effect.gen(function* () {
+    const client = yield* AuthClient;
+    const { data, error } = yield* Effect.tryPromise(() =>
+      client.signIn.social({
+        provider: "google",
+        callbackURL: `${window.location.origin}/inbox`,
+        errorCallbackURL: `${window.location.origin}/login`,
+        disableRedirect: true,
       }),
-    ),
-    Effect.catch((error) =>
-      Effect.succeed(FailedAuth({ error: String(error) })),
-    ),
-  ),
-);
-
-export const SignUp = Command.define(
-  "SignUp",
-  { name: S.String, email: S.String, password: S.String },
-  SucceededAuth,
-  FailedAuth,
-)(({ name, email, password }) =>
-  authFetch(
-    "/api/auth/sign-up/email",
-    postJson({ name, email, password }),
-  ).pipe(
-    Effect.map(({ response, body }) =>
-      Option.match(response.ok ? decodeUserPayload(body) : Option.none(), {
+    );
+    return yield* Option.match(
+      Option.fromNullishOr(error === null ? data?.url : null),
+      {
         onNone: () =>
-          FailedAuth({
-            error: errorMessage(body, "Sign up failed."),
-          }),
-        onSome: (payload) => SucceededAuth({ session: toSession(payload) }),
-      }),
-    ),
+          Effect.succeed(
+            FailedAuth({
+              error: errorMessage(error, "Could not start Google sign-in."),
+            }),
+          ),
+        onSome: (url) => load(url).pipe(Effect.as(StartedGoogleRedirect())),
+      },
+    );
+  }).pipe(
     Effect.catch((error) =>
       Effect.succeed(FailedAuth({ error: String(error) })),
     ),
@@ -144,7 +149,8 @@ export const SignOut = Command.define(
   "SignOut",
   CompletedSignOut,
 )(
-  authFetch("/api/auth/sign-out", postJson({})).pipe(
+  AuthClient.pipe(
+    Effect.flatMap((client) => Effect.tryPromise(() => client.signOut())),
     Effect.ignore,
     Effect.as(CompletedSignOut()),
   ),

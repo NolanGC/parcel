@@ -48,6 +48,7 @@
         "@foldkit/ui": "^0.122.0",
         "@tailwindcss/vite": "^4.3.2",
         "alchemy": "2.0.0-beta.59",
+        "better-auth": "1.6.23",
         "effect": "4.0.0-beta.88",
         "foldkit": "^0.122.0",
         "lucide": "^1.24.0",

@@ -414,15 +414,10 @@ const FolderMenu = Ui.Menu.create<FolderLabel>();
 // strings; specs resolve through lookup maps so the viewInputs carry only
 // one top-level function.
 
-const PALETTE_ACTIONS = [
-  "Compose",
-  "Invite people",
-  "Toggle dark mode",
-] as const;
+const PALETTE_ACTIONS = ["Compose", "Toggle dark mode"] as const;
 
 const ACTION_SPECS: Record<string, Ui.Palette.PaletteItemSpec> = {
   Compose: { icon: Icon.squarePen, label: "Compose" },
-  "Invite people": { icon: Icon.plus, label: "Invite people" },
   "Toggle dark mode": {
     icon: Icon.moon,
     label: "Toggle dark mode",
@@ -475,6 +470,7 @@ export const Model = S.Struct({
   tabs: Ui.Tabs.Model,
   list: Ui.Table.Model,
   palette: Ui.Palette.Model,
+  accountPopover: Ui.Popover.Model,
 });
 export type Model = typeof Model.Type;
 
@@ -484,6 +480,7 @@ export const init = (): Model => ({
   tabs: Ui.Tabs.init({ id: "inbox-tabs" }),
   list: Ui.Table.init({ id: "inbox-list" }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
+  accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
 });
 
 // MESSAGE
@@ -504,6 +501,13 @@ export const OpenedPalette = m("OpenedPalette");
 export const GotPaletteMessage = m("GotPaletteMessage", {
   message: Ui.Palette.Message,
 });
+export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
+  message: Ui.Popover.Message,
+});
+/** The popover's sign-out action. The session lives on the top-level model,
+ *  so main.ts watches for this tag inside GotInboxMessage and runs the
+ *  actual SignOut command; here it only closes the popover. */
+export const ClickedSignOut = m("InboxClickedSignOut");
 
 export const Message = S.Union([
   GotFolderMenuMessage,
@@ -512,6 +516,8 @@ export const Message = S.Union([
   GotListMessage,
   OpenedPalette,
   GotPaletteMessage,
+  GotAccountPopoverMessage,
+  ClickedSignOut,
 ]);
 export type Message = typeof Message.Type;
 
@@ -626,6 +632,33 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           },
         });
       },
+
+      GotAccountPopoverMessage: ({ message }) => {
+        const [accountPopover, commands] = Ui.Popover.update(
+          model.accountPopover,
+          message,
+        );
+        return [
+          evo(model, { accountPopover: () => accountPopover }),
+          Command.mapMessages(commands, (message) =>
+            GotAccountPopoverMessage({ message }),
+          ),
+        ];
+      },
+
+      // The actual sign-out is main.ts's job (it owns the session); this
+      // page just folds the popover shut behind it.
+      InboxClickedSignOut: () => {
+        const [accountPopover, commands] = Ui.Popover.close(
+          model.accountPopover,
+        );
+        return [
+          evo(model, { accountPopover: () => accountPopover }),
+          Command.mapMessages(commands, (message) =>
+            GotAccountPopoverMessage({ message }),
+          ),
+        ];
+      },
     }),
   );
 
@@ -644,13 +677,90 @@ const folderButtonContent = (): Html => {
   );
 };
 
-const accountAvatars = [
-  "/avatars/tony.png",
-  "/avatars/sade.png",
-  "/avatars/steve-jobs.png",
-];
+// The signed-in Google account, passed down from main.ts (the session
+// lives on the top-level model, not in this submodel).
+export type Profile = {
+  readonly name: string;
+  readonly email: string;
+};
 
-const toolbarView = (model: Model): Html => {
+export type ViewInputs = {
+  readonly profile: Profile;
+};
+
+// The session carries no picture (see auth.ts Session), so the chip wears
+// an initial tile in the same shape as the sender avatars.
+const profileInitial = (profile: Profile, sizeClassName: string): Html => {
+  const h = html();
+  return h.span(
+    [
+      h.Class(
+        `flex shrink-0 items-center justify-center rounded-full bg-active font-semibold uppercase text-foreground ${sizeClassName}`,
+      ),
+    ],
+    [profile.name.slice(0, 1)],
+  );
+};
+
+// Static trigger content — the popover renders the button around it.
+const profileChipContent = (profile: Profile): Html => {
+  const h = html();
+
+  return h.span(
+    [h.Class("flex items-center gap-2")],
+    [
+      profileInitial(profile, "h-6 w-6 text-[11px]"),
+      h.span(
+        [h.Class("text-[13px] font-medium text-foreground")],
+        [profile.name],
+      ),
+    ],
+  );
+};
+
+// The account popover: full identity up top, sign-out below — the same
+// panel anatomy as a menu (p-1 shell, item-shaped rows, hairline divider).
+const accountPanelView = (profile: Profile): Html => {
+  const h = html<Message>();
+
+  return h.div(
+    [],
+    [
+      h.div(
+        [h.Class("flex items-center gap-3 px-2 py-2")],
+        [
+          profileInitial(profile, "h-8 w-8 text-[13px]"),
+          h.div(
+            [h.Class("min-w-0")],
+            [
+              h.div(
+                [h.Class("truncate text-[13px] font-medium text-foreground")],
+                [profile.name],
+              ),
+              h.div(
+                [h.Class("break-all text-[12px] text-muted-foreground")],
+                [profile.email],
+              ),
+            ],
+          ),
+        ],
+      ),
+      h.div([h.Class("mx-2 my-1 border-t border-border")], []),
+      h.button(
+        [
+          h.Type("button"),
+          h.OnClick(ClickedSignOut()),
+          h.Class(
+            `flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+          ),
+        ],
+        [Icon.logOut("h-4 w-4 shrink-0"), "Sign out"],
+      ),
+    ],
+  );
+};
+
+const toolbarView = (model: Model, profile: Profile): Html => {
   const h = html<Message>();
 
   return h.header(
@@ -701,7 +811,7 @@ const toolbarView = (model: Model): Html => {
         ],
       ),
 
-      // Right cluster: search (⌘K), filter, accounts, invite, notifications,
+      // Right cluster: search (⌘K), the signed-in profile, notifications,
       // compose.
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
@@ -723,36 +833,19 @@ const toolbarView = (model: Model): Html => {
               ),
             ],
           ),
-          Ui.button(
-            { variant: "ghost", size: "icon-sm", ariaLabel: "Filter" },
-            [Icon.listFilter("h-[18px] w-[18px]")],
-          ),
-          h.div(
-            [
-              h.Class(
-                "flex items-center gap-2 rounded-lg bg-hover py-1 pl-1.5 pr-2.5",
-              ),
-            ],
-            [
-              h.div(
-                [h.Class("flex -space-x-2")],
-                accountAvatars.map((src) =>
-                  h.img([
-                    h.Src(src),
-                    h.Alt(""),
-                    h.Class(
-                      "h-6 w-6 rounded-full border-2 border-background object-cover",
-                    ),
-                  ]),
-                ),
-              ),
-              h.span(
-                [h.Class("text-[13px] font-medium text-foreground")],
-                ["3 accounts"],
-              ),
-            ],
-          ),
-          Ui.button({ variant: "secondary", size: "sm" }, ["Invite"]),
+          h.submodel({
+            slotId: "inbox-account-popover",
+            model: model.accountPopover,
+            view: Ui.Popover.view,
+            viewInputs: {
+              buttonContent: profileChipContent(profile),
+              buttonClassName: `flex cursor-pointer items-center rounded-lg bg-hover py-1 pl-1.5 pr-2.5 outline-none hover:bg-active focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+              ariaLabel: "Account",
+              substrate: PAGE_SURFACE,
+              toPanelContent: () => accountPanelView(profile),
+            },
+            toParentMessage: (message) => GotAccountPopoverMessage({ message }),
+          }),
           Ui.button(
             { variant: "ghost", size: "icon-sm", ariaLabel: "Notifications" },
             [Icon.bell("h-[18px] w-[18px]")],
@@ -876,14 +969,8 @@ const emailRowView = (email: Email): Html => {
           // The dot's slot is always reserved so the subject column lines up
           // across read and unread rows; only the dot itself hides.
           email.unread && !email.isRead
-            ? h.span(
-                [
-                  h.Class("h-2 w-2 shrink-0 rounded-full bg-focus-ring"),
-                  h.AriaLabel("Unread"),
-                ],
-                [],
-              )
-            : h.span([h.Class("invisible h-2 w-2 shrink-0")], []),
+            ? Ui.badgeDot({ color: "indigo", ariaLabel: "Unread" })
+            : h.span([h.Class("invisible h-[7px] w-[7px] shrink-0")], []),
           email.subjectIcon === "cloud"
             ? Icon.cloud("h-4 w-4 shrink-0 text-muted-foreground")
             : h.empty,
@@ -952,44 +1039,46 @@ const listChildren: ReadonlyArray<Ui.Table.TableChild> = SECTIONS.flatMap(
   ],
 );
 
-export const view = Submodel.defineView<Model, Message>((model): Html => {
-  const h = html<Message>();
+export const view = Submodel.defineView<Model, Message, ViewInputs>(
+  (model, { profile }): Html => {
+    const h = html<Message>();
 
-  return h.div(
-    [h.Class("flex h-screen flex-col bg-background text-foreground")],
-    [
-      toolbarView(model),
-      // The list sits in a centered column narrower than the page, so the
-      // rows breathe with clear space on both sides.
-      h.div(
-        [h.Class("flex-1 overflow-y-auto pb-24")],
-        [
-          h.div(
-            [h.Class("mx-auto w-full max-w-7xl px-6")],
-            [
-              h.submodel({
-                slotId: "inbox-list",
-                model: model.list,
-                view: Ui.Table.view,
-                viewInputs: { children: listChildren },
-                toParentMessage: (message) => GotListMessage({ message }),
-              }),
-            ],
-          ),
-        ],
-      ),
-      h.submodel({
-        slotId: "inbox-palette",
-        model: model.palette,
-        view: InboxPalette.view,
-        viewInputs: {
-          groups: PALETTE_GROUPS,
-          itemSpec: paletteItemSpec,
-          placeholder: "Type to search or navigate…",
-          substrate: PAGE_SURFACE,
-        },
-        toParentMessage: (message) => GotPaletteMessage({ message }),
-      }),
-    ],
-  );
-});
+    return h.div(
+      [h.Class("flex h-screen flex-col bg-background text-foreground")],
+      [
+        toolbarView(model, profile),
+        // The list sits in a centered column narrower than the page, so the
+        // rows breathe with clear space on both sides.
+        h.div(
+          [h.Class("flex-1 overflow-y-auto pb-24")],
+          [
+            h.div(
+              [h.Class("mx-auto w-full max-w-7xl px-6")],
+              [
+                h.submodel({
+                  slotId: "inbox-list",
+                  model: model.list,
+                  view: Ui.Table.view,
+                  viewInputs: { children: listChildren },
+                  toParentMessage: (message) => GotListMessage({ message }),
+                }),
+              ],
+            ),
+          ],
+        ),
+        h.submodel({
+          slotId: "inbox-palette",
+          model: model.palette,
+          view: InboxPalette.view,
+          viewInputs: {
+            groups: PALETTE_GROUPS,
+            itemSpec: paletteItemSpec,
+            placeholder: "Type to search or navigate…",
+            substrate: PAGE_SURFACE,
+          },
+          toParentMessage: (message) => GotPaletteMessage({ message }),
+        }),
+      ],
+    );
+  },
+);
