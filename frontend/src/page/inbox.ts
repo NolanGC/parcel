@@ -483,7 +483,7 @@ const StartDwell = Command.define(
   DwellElapsed,
 )(({ id }) =>
   Effect.gen(function* () {
-    yield* Effect.sleep("150 millis");
+    yield* Effect.sleep("100 millis");
     return DwellElapsed({ id });
   }),
 );
