@@ -172,9 +172,14 @@ const phasesOf = (raw: RawResult): { phases: Phases; htmlBodies: number } => {
     measures.length === 0
       ? undefined
       : rel(Math.max(...measures.map((m) => m.at)));
-  // A negative mark means the work ran before the click (hover prefetch):
-  // no post-click phase to attribute, the whole open is the swap.
-  const prefetched = dataEnd !== undefined && dataEnd < 0;
+  // A negative mark means the work ran before the click (hover prefetch);
+  // no marks at all means a standby hit (no load, measures pre-click and
+  // cleared). Either way there's no post-click phase to attribute — the
+  // whole open is the swap.
+  const prefetched =
+    (dataEnd !== undefined && dataEnd < 0) ||
+    (lastMeasure !== undefined && lastMeasure < 0) ||
+    (dataEnd === undefined && measures.length === 0);
   return {
     phases: prefetched
       ? { data: 0, iframe: 0, swap: round1(raw.content) }
@@ -243,15 +248,20 @@ const runScenario = async (
   page: Page,
   name: string,
   threads: ReadonlyArray<string>,
-  options: { hoverMs?: number; evict?: boolean },
+  options: { hoverMs?: number; evict?: boolean; reverse?: boolean },
 ) => {
   console.log(`\n${name}`);
   const samples: Array<Sample> = [];
-  for (let i = 0; i < threads.length; i++) {
+  // Reverse order defeats the app's adjacent-thread standby prefetch
+  // (which always holds the *next* row): without it, opening sample i
+  // caches sample i+1 in memory before the evict, and "cold" isn't.
+  const order = threads.map((_, i) => i);
+  if (options.reverse === true) order.reverse();
+  for (const i of order) {
     const sample = await runSample(page, i, threads[i]!, options);
     samples.push(sample);
     console.log(
-      `  [${i + 1}/${threads.length}] content ${sample.content}ms  settled ${sample.settled}ms` +
+      `  [${samples.length}/${threads.length}] content ${sample.content}ms  settled ${sample.settled}ms` +
         `  (data ${sample.phases.data ?? "—"} / iframe ${sample.phases.iframe ?? "—"} / swap ${sample.phases.swap ?? "—"})` +
         `  ${sample.subject.slice(0, 48)}`,
     );
@@ -338,6 +348,7 @@ const main = async () => {
     const scenarios = {
       "cold-open": await runScenario(page, "cold-open", threads, {
         evict: true,
+        reverse: true,
       }),
       "warm-open": await runScenario(page, "warm-open", threads, {}),
       "warm-open-hover": await runScenario(page, "warm-open-hover", threads, {
