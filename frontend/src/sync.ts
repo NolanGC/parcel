@@ -13,6 +13,7 @@ import { SqlClient } from "effect/unstable/sql";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { Compression, type CompressionError } from "./compression";
+import { API_URL } from "./config";
 import {
   Gmail,
   LabelId,
@@ -24,6 +25,21 @@ import {
   type Thread as GmailThread,
 } from "./Gmail";
 import { SqlLive } from "./sql";
+
+// How much of a thread the sync pass caches locally:
+//   "text"        — headers + the displayable body only
+//   "attachments" — + inline cid: images (Gmail attachment parts)
+//   "full"        — + remote html assets (<img src="https://...">),
+//                   fetched once through the API image proxy and stored
+//                   like any other blob, so rendering a thread touches no
+//                   third-party server (tracking pixels included).
+export const CacheTier = S.Literals(["text", "attachments", "full"]);
+export type CacheTier = typeof CacheTier.Type;
+
+// Hardcoded to the deepest tier for now: we only pull PULL_LIMIT (15)
+// threads, so caching everything locally is cheap. How tiers get assigned
+// (per-category, per-sender, a setting) is a decision for later.
+export const CACHE_TIER: CacheTier = "full";
 
 // Gmail's inbox tab categories, as they appear in system label ids
 // (CATEGORY_PERSONAL etc.). "none" = the message carries no category
@@ -53,8 +69,8 @@ export const ThreadRow = S.Struct({
 export type ThreadRow = typeof ThreadRow.Type;
 
 // The open-thread payload: bodies arrive decompressed with inline images
-// already rewritten to data: URLs, so the view renders them with zero
-// further work (and zero network).
+// already rewritten to blob: urls over locally stored bytes, so the view
+// renders them with zero further work (and zero network).
 export const BodyKind = S.Literals(["html", "plain"]);
 export type BodyKind = typeof BodyKind.Type;
 
@@ -113,6 +129,22 @@ const DbImageRow = S.Struct({
 });
 const decodeDbImages = S.decodeUnknownEffect(S.Array(DbImageRow));
 
+const DbRemoteAssetRow = S.Struct({
+  message_id: MessageId,
+  url: S.String,
+  mime_type: S.String,
+  bytes: S.instanceOf(Uint8Array),
+});
+const decodeDbRemoteAssets = S.decodeUnknownEffect(S.Array(DbRemoteAssetRow));
+
+const DbRemoteAssetKey = S.Struct({ message_id: MessageId, url: S.String });
+const decodeDbRemoteAssetKeys = S.decodeUnknownEffect(
+  S.Array(DbRemoteAssetKey),
+);
+
+const DbFailedUrlRow = S.Struct({ url: S.String });
+const decodeDbFailedUrls = S.decodeUnknownEffect(S.Array(DbFailedUrlRow));
+
 const DbSubjectRow = S.Struct({ subject: S.String });
 const decodeDbSubjects = S.decodeUnknownEffect(S.Array(DbSubjectRow));
 
@@ -130,14 +162,31 @@ const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> => {
 
 const utf8 = new TextDecoder();
 
-// Chunked so large images don't blow the argument-count limit of apply.
-const bytesToBase64 = (bytes: Uint8Array): string => {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// All needle→replacement swaps in ONE pass over the html. The naive
+// per-asset replaceAll reduce copies the entire body string once per
+// asset — on a multi-MB marketing email that's the difference between one
+// allocation and dozens.
+const rewriteAll = (
+  text: string,
+  replacements: ReadonlyMap<string, string>,
+): string => {
+  if (replacements.size === 0) return text;
+  const pattern = new RegExp(
+    [...replacements.keys()].map(escapeRegExp).join("|"),
+    "g",
+  );
+  return text.replace(pattern, (match) => replacements.get(match) ?? match);
 };
+
+// Obvious impression beacons are skipped before any fetch: impression
+// endpoints and explicit NxN pixel-size params. Deliberately conservative
+// — a real photo url wrongly skipped just renders broken, but the common
+// patterns are unmistakable.
+const looksLikeTrackerPixel = (url: string): boolean =>
+  /\/imp\?|[?&]sz=\d+x\d+/.test(url);
 
 // MIME TREE WALKING (runs once at sync time; the database stores results)
 
@@ -192,6 +241,41 @@ const inlineImages = (message: GmailMessage): ReadonlyArray<InlineImage> => {
     ];
   });
 };
+
+// Remote images referenced by the html body (plain src="https://..."
+// attributes). Matched raw, exactly as written in the html — the raw
+// string is both the storage key and the replaceAll needle at read time;
+// only the wire fetch entity-decodes it (&amp; → &).
+const REMOTE_IMG_SRC =
+  /<img\b[^>]*?\bsrc\s*=\s*(?:"(https?:\/\/[^"]+)"|'(https?:\/\/[^']+)'|(https?:\/\/[^\s>"']+))/gi;
+
+const remoteImageUrls = (html: string): ReadonlyArray<string> => {
+  const urls = new Set<string>();
+  for (const match of html.matchAll(REMOTE_IMG_SRC)) {
+    const url = match[1] ?? match[2] ?? match[3];
+    if (url !== undefined) urls.add(url);
+  }
+  return [...urls];
+};
+
+// One remote asset through the API image proxy (mail CDNs don't serve
+// CORS, so the client can't read their bytes directly). Failures yield
+// undefined and the asset is simply skipped: at the full tier the frame
+// CSP blocks its live load too, so a skipped asset renders as a broken
+// image rather than a tracking beacon.
+const fetchRemoteAsset = (url: string) =>
+  Effect.tryPromise(async () => {
+    const response = await fetch(
+      `${API_URL}/api/proxy/image?url=${encodeURIComponent(url.replaceAll("&amp;", "&"))}`,
+      { credentials: "include" },
+    );
+    if (!response.ok) return undefined;
+    return {
+      mimeType:
+        response.headers.get("content-type") ?? "application/octet-stream",
+      bytes: new Uint8Array(await response.arrayBuffer()),
+    };
+  }).pipe(Effect.catch(() => Effect.succeed(undefined)));
 
 // `"Ada Lovelace" <ada@example.com>` → { name: "Ada Lovelace",
 // email: "ada@example.com" }; bare addresses use the address as both.
@@ -342,6 +426,69 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           { concurrency: 2 },
         );
 
+      // Every url in remote_asset_failures — the "don't retry" set shared
+      // by the sync-time upsert and the backfill.
+      const failedUrls = Effect.gen(function* () {
+        const raw = yield* sql`SELECT url FROM remote_asset_failures`;
+        return new Set(
+          (yield* decodeDbFailedUrls(raw).pipe(Effect.orDie)).map(
+            (row) => row.url,
+          ),
+        );
+      });
+
+      // One remote asset: fetch through the proxy, store on success,
+      // negative-cache on failure so the url is never attempted again.
+      const fetchAndStoreAsset = (messageId: MessageId, url: string) =>
+        Effect.gen(function* () {
+          const fetched = yield* fetchRemoteAsset(url);
+          if (fetched === undefined) {
+            yield* sql`INSERT OR REPLACE INTO remote_asset_failures ${sql.insert(
+              [{ url, failed_at: Date.now() }],
+            )}`;
+            return;
+          }
+          yield* sql`INSERT OR REPLACE INTO remote_assets ${sql.insert([
+            {
+              message_id: messageId,
+              url,
+              mime_type: fetched.mimeType,
+              bytes: fetched.bytes,
+            },
+          ])}`;
+        });
+
+      // Remote html assets, fetched through the API proxy and stored like
+      // inline images. Idempotent per (message, url); already-stored,
+      // already-failed, and obvious-tracker urls are all skipped.
+      const upsertRemoteAssets = (message: GmailMessage) =>
+        Effect.gen(function* () {
+          const part = displayPart(message);
+          const data = part?.body?.data;
+          if (part?.mimeType !== "text/html" || data === undefined) return;
+          const urls = remoteImageUrls(
+            utf8.decode(base64UrlToBytes(data)),
+          ).filter((url) => !looksLikeTrackerPixel(url));
+          if (urls.length === 0) return;
+
+          const storedRaw = yield* sql`
+            SELECT message_id, url FROM remote_assets
+            WHERE message_id = ${message.id}
+          `;
+          const stored = new Set(
+            (yield* decodeDbRemoteAssetKeys(storedRaw).pipe(Effect.orDie)).map(
+              (row) => row.url,
+            ),
+          );
+          const failed = yield* failedUrls;
+
+          yield* Effect.forEach(
+            urls.filter((url) => !stored.has(url) && !failed.has(url)),
+            (url) => fetchAndStoreAsset(message.id, url),
+            { concurrency: 4 },
+          );
+        });
+
       const syncThread = (id: ThreadId) =>
         Effect.gen(function* () {
           const thread = yield* gmail.getThread(id, "full");
@@ -350,7 +497,12 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             Effect.all([
               upsertMessage(thread.id, message),
               upsertBody(message),
-              upsertInlineImages(message),
+              ...((CACHE_TIER as CacheTier) === "text"
+                ? []
+                : [upsertInlineImages(message)]),
+              ...((CACHE_TIER as CacheTier) === "full"
+                ? [upsertRemoteAssets(message)]
+                : []),
             ]),
           );
         });
@@ -404,6 +556,50 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // (rows from a metadata-only sync, or stubs) get their full content
       // now, so first opens hit SQLite instead of the network. Runs after
       // the list has painted — it must never delay the initial render.
+      // Stores synced before the full tier existed have html bodies but no
+      // remote_assets rows — syncThread never re-runs for them (local-first
+      // reads skip the network once rows exist), so the backfill walks the
+      // stored bodies directly. Idempotent: already-fetched urls are
+      // skipped, so steady-state runs do no network at all.
+      const backfillRemoteAssets = Effect.gen(function* () {
+        if ((CACHE_TIER as CacheTier) !== "full") return;
+        const bodiesRaw = yield* sql`
+          SELECT message_id, mime_type, codec, body
+          FROM message_bodies
+          WHERE mime_type = 'text/html'
+        `;
+        const bodies = yield* decodeDbBodies(bodiesRaw).pipe(Effect.orDie);
+        const storedRaw = yield* sql`SELECT message_id, url FROM remote_assets`;
+        const stored = new Set(
+          (yield* decodeDbRemoteAssetKeys(storedRaw).pipe(Effect.orDie)).map(
+            (row) => `${row.message_id}\n${row.url}`,
+          ),
+        );
+        const failed = yield* failedUrls;
+
+        yield* Effect.forEach(
+          bodies,
+          (row) =>
+            Effect.gen(function* () {
+              const html = yield* compression.decompress({
+                codec: row.codec,
+                data: new Uint8Array(row.body),
+              });
+              yield* Effect.forEach(
+                remoteImageUrls(html).filter(
+                  (url) =>
+                    !looksLikeTrackerPixel(url) &&
+                    !failed.has(url) &&
+                    !stored.has(`${row.message_id}\n${url}`),
+                ),
+                (url) => fetchAndStoreAsset(row.message_id, url),
+                { concurrency: 4 },
+              );
+            }),
+          { concurrency: 2 },
+        );
+      });
+
       const hydrateMissing = Effect.gen(function* () {
         const raw = yield* sql`
           SELECT t.id AS id
@@ -417,6 +613,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         yield* Effect.forEach(rows, (row) => syncThread(row.id), {
           concurrency: 3,
         });
+        yield* backfillRemoteAssets;
         return yield* selectInbox;
       });
 
@@ -430,6 +627,25 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           `;
           return yield* decodeDbMessages(messagesRaw).pipe(Effect.orDie);
         });
+
+      // Local image bytes reach the html as short-lived blob: urls, not
+      // base64 data: URIs — inlining megabytes of base64 into the body
+      // string was measurably janky (main-thread encode + a giant srcdoc
+      // for the vdom) and could OOM the tab. Each thread's urls are
+      // revoked on its next load; at most PULL_LIMIT threads' worth stays
+      // registered, and the bytes live in SQLite either way.
+      const threadObjectUrls = new Map<ThreadId, Array<string>>();
+      const registerObjectUrl = (
+        registry: Array<string>,
+        mimeType: string,
+        bytes: Uint8Array,
+      ): string => {
+        const url = URL.createObjectURL(
+          new Blob([bytes as Uint8Array<ArrayBuffer>], { type: mimeType }),
+        );
+        registry.push(url);
+        return url;
+      };
 
       // Opening a thread: normally SQLite only. A thread with no local
       // messages (a store synced before bodies were pulled, or a row that
@@ -478,6 +694,27 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   WHERE ${sql.in("message_id", ids)}
                 `;
           const allImages = yield* decodeDbImages(imagesRaw).pipe(Effect.orDie);
+          const remoteRaw =
+            ids.length === 0
+              ? []
+              : yield* sql`
+                  SELECT message_id, url, mime_type, bytes
+                  FROM remote_assets
+                  WHERE ${sql.in("message_id", ids)}
+                `;
+          const allRemote = yield* decodeDbRemoteAssets(remoteRaw).pipe(
+            Effect.orDie,
+          );
+
+          // This load owns the thread's object urls from here on: the
+          // previous load's urls (if any) are stale — nothing displayed
+          // still references them, since a thread re-load only happens
+          // after its old detail left the model.
+          for (const url of threadObjectUrls.get(id) ?? []) {
+            URL.revokeObjectURL(url);
+          }
+          const objectUrls: Array<string> = [];
+          threadObjectUrls.set(id, objectUrls);
 
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {
@@ -490,17 +727,33 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                       data: new Uint8Array(stored.body),
                     });
 
-              const images = allImages.filter(
-                (image) => image.message_id === row.id,
-              );
-              const body = images.reduce(
-                (html, image) =>
-                  html.replaceAll(
-                    `cid:${image.content_id}`,
-                    `data:${image.mime_type};base64,${bytesToBase64(image.bytes)}`,
-                  ),
-                text,
-              );
+              // cid: inline images and cached remote urls both swap to
+              // blob: urls in one rewrite pass.
+              const replacements = new Map<string, string>();
+              for (const image of allImages) {
+                if (image.message_id !== row.id) continue;
+                replacements.set(
+                  `cid:${image.content_id}`,
+                  registerObjectUrl(objectUrls, image.mime_type, image.bytes),
+                );
+              }
+              for (const asset of allRemote) {
+                if (asset.message_id !== row.id) continue;
+                replacements.set(
+                  asset.url,
+                  registerObjectUrl(objectUrls, asset.mime_type, asset.bytes),
+                );
+              }
+              const rewritten = rewriteAll(text, replacements);
+              // Full tier: srcset comes off — its resolution variants
+              // aren't cached, and the frame CSP (no-network, see
+              // inbox.ts) would block them while overriding the rewritten
+              // src.
+              const body =
+                (CACHE_TIER as CacheTier) === "full" &&
+                stored?.mime_type === "text/html"
+                  ? rewritten.replace(/\s+srcset\s*=\s*("[^"]*"|'[^']*')/gi, "")
+                  : rewritten;
 
               return {
                 id: row.id,
@@ -532,6 +785,10 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             `;
             yield* sql`
               DELETE FROM message_attachments
+              WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ${id})
+            `;
+            yield* sql`
+              DELETE FROM remote_assets
               WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ${id})
             `;
             yield* sql`

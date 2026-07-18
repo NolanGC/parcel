@@ -7,9 +7,11 @@ import { evo } from "foldkit/struct";
 import * as Icon from "../icons";
 import { MessageId, ThreadId } from "../Gmail";
 import {
+  CACHE_TIER,
   SyncEngine,
   ThreadDetail,
   ThreadRow,
+  type CacheTier,
   type MessageDetail,
   type ThreadCategory,
 } from "../sync";
@@ -957,11 +959,23 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           key === "j"
             ? Math.min(current + 1, rowCount - 1)
             : Math.max(current - 1, 0);
-        const next = evo(model, { selected: () => Option.some(index) });
+        // j/k claims the Table's traveling overlay too, so the keyboard
+        // cursor and the hover highlight are the same mark (see emailRowView).
+        const [list, listCommands] = Ui.Table.update(
+          model.list,
+          Ui.Table.KeyboardMoved({ index, rowCount }),
+        );
+        const next = evo(model, {
+          selected: () => Option.some(index),
+          list: () => list,
+        });
         const id = selectedThreadId(next);
         return [
           next,
           [
+            ...Command.mapMessages(listCommands, (message) =>
+              GotListMessage({ message }),
+            ),
             ScrollRowIntoView({ index }),
             ...(id === undefined ? [] : [StartDwell({ id })]),
           ],
@@ -1298,13 +1312,11 @@ const READ_STATE = {
   },
 } as const;
 
-// No hover style on the row itself: the Table's traveling overlay carries
-// the hover state, so panning glides instead of blinking per row. The
-// cursor (mouse and j/k move the same one) is marked by a thin accent
-// bar — deliberately not the overlay's wash, so on the one occasion both
-// are visible (mouse parked on the list while keyboarding) they read as
-// different things, not two hovers.
-const emailRowView = (email: Email, isSelected: boolean): Html => {
+// No hover style on the row itself: the Table's traveling overlay is the
+// one highlight for both inputs. Mouse hover drives it directly; j/k
+// drives it too, via Ui.Table.KeyboardMoved (see PressedListKey) — moving
+// the mouse for real always hands it back (Ui.Table.EnteredRow).
+const emailRowView = (email: Email): Html => {
   const h = html();
   const readState = READ_STATE[email.isRead ? "read" : "unread"];
 
@@ -1313,9 +1325,6 @@ const emailRowView = (email: Email, isSelected: boolean): Html => {
       h.Class(
         "flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3",
       ),
-      ...(isSelected
-        ? [h.Style({ boxShadow: `inset 2px 0 0 0 ${AVATAR_BG}` })]
-        : []),
     ],
     [
       // Sender
@@ -1460,13 +1469,10 @@ const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
               content: statusRowView("Your inbox is empty."),
             },
           ]
-        : rows.map((row, index) => ({
+        : rows.map((row) => ({
             kind: "row" as const,
             key: row.id,
-            content: emailRowView(
-              emailFromThreadRow(row),
-              Option.exists(model.selected, (selected) => selected === index),
-            ),
+            content: emailRowView(emailFromThreadRow(row)),
           }))),
     ],
   });
@@ -1480,11 +1486,16 @@ const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
 // allow-same-origin exists solely so the measure command can read the
 // content height). Plain bodies skip the iframe entirely.
 
-// default-src 'none' keeps the frame network-silent except images:
-// data: for the locally cached cid: images, https: for remote ones
-// (blocking those behind a "show images" toggle is a follow-up).
+// default-src 'none' keeps the frame network-silent. At the full cache
+// tier every image — inline cid: and remote alike — arrives as a blob:
+// url over locally stored bytes (see CACHE_TIER in sync.ts), so img-src
+// can drop the network entirely: nothing in a message body can phone
+// home, tracking pixels included. data: stays allowed for emails that
+// natively embed data: images. Lower tiers let remote images load live.
 const FRAME_CSP =
-  "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'";
+  (CACHE_TIER as CacheTier) === "full"
+    ? "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'"
+    : "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
 
 // Email html expects a white canvas regardless of app theme; the reset
 // only fills gaps for fragment bodies that bring no styling of their own.

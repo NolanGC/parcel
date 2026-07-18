@@ -25,6 +25,12 @@ import { measureRect, Rect, ZERO_RECT } from "./rect";
  *   tier faster (`data-hidden`); re-entering starts a fresh session so the
  *   overlay snaps to the new row and fades in (`@starting-style`).
  *
+ * There is only one overlay, not one per input device. A caller can drive
+ * it without a real pointer event via `KeyboardMoved` (j/k navigation) —
+ * that claims the overlay and keeps it visible regardless of the pointer.
+ * Only a genuine `EnteredRow` (actual mouse motion) hands control back, so
+ * moving the mouse always wins over a stale keyboard position.
+ *
  * The overlay visuals live in styles.css under `.fk-hover-overlay`.
  */
 
@@ -39,6 +45,10 @@ export const Model = S.Struct({
   /** The row under (or last under) the pointer. Kept on leave so the
    *  overlay can fade out in place. */
   maybeRowIndex: S.Option(S.Number),
+  /** True once a keyboard move has claimed the overlay: it then stays
+   *  visible at maybeRowIndex regardless of the pointer, until a real
+   *  mouse-entered-row event reclaims it (see EnteredRow). */
+  keyboardControlled: S.Boolean,
   rects: S.Array(Rect),
 });
 export type Model = typeof Model.Type;
@@ -50,6 +60,7 @@ export const init = (config: InitConfig): Model => ({
   session: 0,
   isPointerInside: false,
   maybeRowIndex: Option.none(),
+  keyboardControlled: false,
   rects: [],
 });
 
@@ -60,6 +71,13 @@ const rowId = (id: string, index: number): string => `${id}-row-${index}`;
 export const EnteredContainer = m("EnteredContainer", { rowCount: S.Number });
 export const LeftContainer = m("LeftContainer");
 export const EnteredRow = m("EnteredRow", { index: S.Number });
+/** A caller-driven move — j/k navigation, not a real pointer event. Claims
+ *  the overlay for the keyboard; only an actual EnteredRow (real mouse
+ *  motion) hands it back (see the module doc). */
+export const KeyboardMoved = m("TableKeyboardMoved", {
+  index: S.Number,
+  rowCount: S.Number,
+});
 export const GotRowRects = m("GotRowRects", { rects: S.Array(Rect) });
 /** A row was clicked, identified by its TableChild key. The Table itself
  *  has no opinion about what a click means — parents watch for this tag
@@ -71,6 +89,7 @@ export const Message = S.Union([
   EnteredContainer,
   LeftContainer,
   EnteredRow,
+  KeyboardMoved,
   GotRowRects,
   ClickedRow,
 ]);
@@ -112,17 +131,34 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           isPointerInside: () => true,
           // Cleared so the overlay stays unmounted until the first row is
           // entered — it then mounts at that row (snap + fade-in) instead
-          // of sliding from wherever the last session ended.
-          maybeRowIndex: () => Option.none(),
+          // of sliding from wherever the last session ended. Skipped while
+          // the keyboard holds the overlay: the pointer merely entering the
+          // container's padding shouldn't blank a cursor it hasn't reclaimed.
+          maybeRowIndex: () =>
+            model.keyboardControlled ? model.maybeRowIndex : Option.none(),
         }),
         [MeasureRowRects({ id: model.id, count: rowCount })],
       ],
 
       LeftContainer: () => [evo(model, { isPointerInside: () => false }), []],
 
+      // Real pointer motion always reclaims the overlay from the keyboard.
       EnteredRow: ({ index }) => [
-        evo(model, { maybeRowIndex: () => Option.some(index) }),
+        evo(model, {
+          maybeRowIndex: () => Option.some(index),
+          keyboardControlled: () => false,
+        }),
         [],
+      ],
+
+      KeyboardMoved: ({ index, rowCount }) => [
+        evo(model, {
+          maybeRowIndex: () => Option.some(index),
+          keyboardControlled: () => true,
+        }),
+        model.rects.length === rowCount
+          ? []
+          : [MeasureRowRects({ id: model.id, count: rowCount })],
       ],
 
       GotRowRects: ({ rects }) => [evo(model, { rects: () => [...rects] }), []],
@@ -182,7 +218,9 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
           `overlay-${model.session}`,
           [
             h.Class(`fk-hover-overlay ${overlayClassName}`),
-            ...(model.isPointerInside ? [] : [h.DataAttribute("hidden", "")]),
+            ...(model.isPointerInside || model.keyboardControlled
+              ? []
+              : [h.DataAttribute("hidden", "")]),
             h.Style({
               top: `${rect.top}px`,
               left: `${rect.left}px`,

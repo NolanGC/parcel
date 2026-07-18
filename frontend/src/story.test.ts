@@ -266,8 +266,11 @@ describe("update", () => {
       withThreads,
       inboxMessage(Inbox.PressedListKey({ key: "j" })),
     );
-    // Moving the cursor scrolls it into view and starts the prefetch dwell.
+    // Moving the cursor claims the Table overlay (measuring rects, since
+    // this session never hovered), scrolls the row into view, and starts
+    // the prefetch dwell.
     expect(moveCommands.map((command) => command.name)).toEqual([
+      "MeasureRowRects",
       "ScrollRowIntoView",
       "StartDwell",
     ]);

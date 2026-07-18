@@ -154,5 +154,39 @@ export const SqlLive = SqliteMigrator.layer({
         )
       `;
     }),
+
+    // Remote html assets (plain <img src="https://..."> in message bodies)
+    // fetched through the API image proxy at sync time, for the deepest
+    // cache tier (see CACHE_TIER in sync.ts). url is stored exactly as it
+    // appears in the html — it's the replaceAll key at read time. bytes
+    // raw, same reasoning as message_attachments.
+    "0003_remote_assets": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        CREATE TABLE remote_assets (
+          message_id TEXT NOT NULL REFERENCES messages (id),
+          url TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          bytes BLOB NOT NULL,
+          PRIMARY KEY (message_id, url)
+        )
+      `;
+    }),
+
+    // Negative cache for the remote-asset fetch: urls that failed through
+    // the proxy (dead tracker endpoints, hotlink-protected CDNs) land here
+    // and are never retried — without this every sync/backfill pass
+    // re-fires every failing url. Keyed by url alone: a url that fails for
+    // one message fails for all. No TTL yet; clearing the table is the
+    // retry mechanism.
+    "0004_remote_asset_failures": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        CREATE TABLE remote_asset_failures (
+          url TEXT PRIMARY KEY,
+          failed_at INTEGER NOT NULL
+        )
+      `;
+    }),
   } satisfies Record<`${number}_${string}`, any>),
 }).pipe(Layer.provideMerge(ClientLive));

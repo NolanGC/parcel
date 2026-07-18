@@ -2,8 +2,10 @@ import { Stage } from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
+import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import { BetterAuth, BetterAuthPg, makeAuthGate } from "./Auth.ts";
@@ -57,6 +59,57 @@ export default ApiService.make(
     const auth = yield* BetterAuth;
     const gate = makeAuthGate(auth);
 
+    // Image proxy for the sync engine's deepest cache tier: the client
+    // can't read cross-origin image bytes itself (no CORS on mail CDNs),
+    // so it fetches them through here at sync time and stores them
+    // locally. Gated on the session — this must not be an open relay.
+    // Only the content-type crosses back; upstream cookies/headers don't.
+    // SSRF surface is slim on Workers (no private-network reach), but the
+    // scheme check keeps file:/data:/gopher: out regardless.
+    const proxyImage = Effect.gen(function* () {
+      const user = yield* gate.sessionUser;
+      if (Option.isNone(user)) return gate.unauthorized;
+
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const raw = new URL((request.source as Request).url).searchParams.get(
+        "url",
+      );
+      const target = Option.fromNullishOr(raw).pipe(
+        Option.flatMap((value) => {
+          try {
+            return Option.some(new URL(value));
+          } catch {
+            return Option.none<URL>();
+          }
+        }),
+        Option.filter(
+          (url) => url.protocol === "https:" || url.protocol === "http:",
+        ),
+      );
+      if (Option.isNone(target)) {
+        return HttpServerResponse.text("Bad url", { status: 400 });
+      }
+
+      const upstream = yield* Effect.tryPromise(() =>
+        fetch(target.value, { redirect: "follow" }),
+      ).pipe(Effect.catch(() => Effect.succeed(undefined)));
+      const contentType = upstream?.headers.get("content-type") ?? "";
+      if (upstream === undefined || !upstream.ok) {
+        return HttpServerResponse.text("Upstream fetch failed", {
+          status: 502,
+        });
+      }
+      if (!contentType.startsWith("image/")) {
+        return HttpServerResponse.text("Not an image", { status: 415 });
+      }
+      return HttpServerResponse.fromWeb(
+        new Response(upstream.body, {
+          status: 200,
+          headers: { "content-type": contentType },
+        }),
+      );
+    }).pipe(Effect.catchTag("AuthError", gate.authUnavailable));
+
     return {
       fetch: yield* HttpRouter.toHttpEffect(
         Layer.mergeAll(
@@ -65,6 +118,7 @@ export default ApiService.make(
           HttpRouter.middleware(gate.cors, { global: true }),
           HttpRouter.add("GET", "/", HttpServerResponse.text("ok")),
           HttpRouter.add("*", "/api/auth/*", gate.handleAuthApi),
+          HttpRouter.add("GET", "/api/proxy/image", proxyImage),
         ).pipe(Layer.provide(HttpPlatform.layer)),
       ),
     };
