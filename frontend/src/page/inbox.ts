@@ -274,13 +274,24 @@ export const Model = S.Struct({
   // inbox. loadError keeps the last failure for the list to surface.
   threads: S.Option(S.Array(ThreadRow)),
   loadError: S.Option(S.String),
-  // The open thread, or None for the list. Bodies live in the model only
-  // while their thread is open — closing it (or opening another) evicts
-  // them; the local database remains the working set.
+  // The mounted thread detail — visible once committed and measured, or
+  // an invisible hover-prefetch pre-mount until then. Bodies live in the
+  // model only while mounted — closing (or mounting another thread)
+  // evicts them; the local database remains the working set.
   open: S.Option(ThreadDetail),
   // Measured srcdoc-iframe content heights by message id, set once per
   // body after its load event so the frame fits its content exactly.
   bodyHeights: S.Record(S.String, S.Number),
+  // True only after a real click: the pane swap requires it, so a hover
+  // prefetch can mount and measure without ever changing the screen.
+  openCommitted: S.Boolean,
+  // The thread a LoadThread is in flight for. A GotThread that doesn't
+  // match is stale (the cursor moved on) and gets dropped — the load is
+  // read-only, so discarding the result is the whole cancellation story.
+  pendingLoad: S.Option(ThreadId),
+  // The row currently under the cursor; the dwell timer checks it hasn't
+  // changed before prefetching, so sweeping the list starts nothing.
+  hovered: S.Option(ThreadId),
 });
 export type Model = typeof Model.Type;
 
@@ -295,6 +306,9 @@ export const init = (): Model => ({
   loadError: Option.none(),
   open: Option.none(),
   bodyHeights: {},
+  openCommitted: false,
+  pendingLoad: Option.none(),
+  hovered: Option.none(),
 });
 
 // MESSAGE
@@ -333,6 +347,9 @@ export const GotHydratedThreads = m("GotHydratedThreads", {
   rows: S.Array(ThreadRow),
 });
 export const GotThread = m("GotThread", { detail: ThreadDetail });
+/** The hover dwell elapsed for a row: if the cursor is still there, its
+ *  thread gets prefetched and pre-mounted invisibly. */
+export const DwellElapsed = m("DwellElapsed", { id: ThreadId });
 export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
 /** An html body's iframe finished loading — time to measure it. */
@@ -356,6 +373,7 @@ export const Message = S.Union([
   FailedLoadInbox,
   GotHydratedThreads,
   GotThread,
+  DwellElapsed,
   FailedLoadThread,
   ClickedBack,
   LoadedBodyFrame,
@@ -455,6 +473,21 @@ export const LoadThread = Command.define(
   }),
 );
 
+// The hover→prefetch debounce: entering a row starts this timer, and the
+// DwellElapsed handler checks the cursor is still on the same row before
+// loading anything — so sweeping the cursor across the whole list starts
+// timers, not loads.
+const StartDwell = Command.define(
+  "StartDwell",
+  { id: ThreadId },
+  DwellElapsed,
+)(({ id }) =>
+  Effect.gen(function* () {
+    yield* Effect.sleep("150 millis");
+    return DwellElapsed({ id });
+  }),
+);
+
 const frameId = (messageId: string): string => `body-frame-${messageId}`;
 const SCROLL_ID = "inbox-scroll";
 
@@ -472,6 +505,11 @@ const detailIsReady = (model: Model): boolean =>
           (model.bodyHeights[message.id] ?? 0) > 0,
       ),
   });
+
+// Ready alone isn't enough to change the screen: a hover prefetch mounts
+// and measures without a click, so the swap also requires the commit.
+const detailIsShown = (model: Model): boolean =>
+  model.openCommitted && detailIsReady(model);
 
 // The scroll container survives the pane swap (both panes live inside
 // it), so entering and leaving a thread resets it explicitly — otherwise
@@ -550,20 +588,78 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const listCommands = Command.mapMessages(commands, (message) =>
           GotListMessage({ message }),
         );
+
         // Row keys are thread ids, so a Table click is an open request —
         // the click lives on the Table (submodel viewInputs can't carry
         // event handlers), and this page gives it meaning.
-        const openCommands =
-          message._tag === "TableClickedRow"
-            ? Option.match(S.decodeUnknownOption(ThreadId)(message.key), {
+        if (message._tag === "TableClickedRow") {
+          const decoded = S.decodeUnknownOption(ThreadId)(message.key);
+          if (Option.isNone(decoded)) {
+            return [evo(model, { list: () => list }), listCommands];
+          }
+          const id = decoded.value;
+
+          // Already pre-mounted by a hover prefetch: committing is the
+          // whole open — if every body is measured, the swap is this
+          // frame's class flip.
+          if (Option.exists(model.open, (detail) => detail.id === id)) {
+            const next = evo(model, {
+              list: () => list,
+              openCommitted: () => true,
+            });
+            return [
+              next,
+              [
+                ...listCommands,
+                ...(detailIsShown(next) && !detailIsShown(model)
+                  ? [ResetScroll()]
+                  : []),
+              ],
+            ];
+          }
+
+          // A prefetch for this thread is in flight: commit and let its
+          // GotThread continue the normal mount → measure → swap flow.
+          if (Option.exists(model.pendingLoad, (pending) => pending === id)) {
+            return [
+              evo(model, { list: () => list, openCommitted: () => true }),
+              listCommands,
+            ];
+          }
+
+          return [
+            evo(model, {
+              list: () => list,
+              open: () => Option.none<ThreadDetail>(),
+              bodyHeights: () => ({}),
+              openCommitted: () => true,
+              pendingLoad: () => Option.some(id),
+            }),
+            [...listCommands, LoadThread({ id })],
+          ];
+        }
+
+        // Entering a row tracks it as hovered and starts the prefetch
+        // dwell timer for its thread.
+        if (message._tag === "EnteredRow") {
+          const id = Option.flatMap(
+            model.threads,
+            (rows): Option.Option<ThreadId> =>
+              Option.fromUndefinedOr(rows[message.index]?.id),
+          );
+          return [
+            evo(model, { list: () => list, hovered: () => id }),
+            [
+              ...listCommands,
+              ...Option.match(id, {
                 onNone: () => [],
-                onSome: (id) => [LoadThread({ id })],
-              })
-            : [];
-        return [
-          evo(model, { list: () => list }),
-          [...listCommands, ...openCommands],
-        ];
+                onSome: (id) => [StartDwell({ id })],
+              }),
+            ],
+          ];
+        }
+
+        return [evo(model, { list: () => list }), listCommands];
       },
 
       OpenedPalette: () => {
@@ -640,18 +736,65 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       ],
 
       GotThread: ({ detail }) => {
+        // Only the load we're still waiting for counts — anything else is
+        // a superseded prefetch whose row the cursor left.
+        if (!Option.exists(model.pendingLoad, (id) => id === detail.id)) {
+          return [model, []];
+        }
         const next = evo(model, {
           open: () => Option.some(detail),
           bodyHeights: () => ({}),
+          pendingLoad: () => Option.none<ThreadId>(),
           loadError: () => Option.none<string>(),
         });
-        // All-plain threads have nothing to measure: they're ready now,
-        // so the pane swap (and its scroll reset) happens immediately.
-        return [next, detailIsReady(next) ? [ResetScroll()] : []];
+        // All-plain committed threads have nothing to measure: they're
+        // shown now, so the pane swap (and its scroll reset) is immediate.
+        return [
+          next,
+          detailIsShown(next) && !detailIsShown(model) ? [ResetScroll()] : [],
+        ];
+      },
+
+      DwellElapsed: ({ id }) => {
+        const stillHovered = Option.exists(
+          model.hovered,
+          (hovered) => hovered === id,
+        );
+        const alreadyMounted = Option.exists(
+          model.open,
+          (detail) => detail.id === id,
+        );
+        const alreadyLoading = Option.exists(
+          model.pendingLoad,
+          (pending) => pending === id,
+        );
+        // Prefetch only an idle, still-hovered, uncommitted row; a newer
+        // dwell supersedes an older in-flight load (its result is dropped
+        // by the pendingLoad check in GotThread).
+        if (
+          !stillHovered ||
+          alreadyMounted ||
+          alreadyLoading ||
+          model.openCommitted
+        ) {
+          return [model, []];
+        }
+        return [
+          evo(model, { pendingLoad: () => Option.some(id) }),
+          [LoadThread({ id })],
+        ];
       },
 
       FailedLoadThread: ({ error }) => [
-        evo(model, { loadError: () => Option.some(error) }),
+        evo(model, {
+          pendingLoad: () => Option.none<ThreadId>(),
+          // A failed prefetch stays silent (nobody asked for that thread);
+          // a failed committed open surfaces and un-commits, so the list
+          // stays interactive and a re-click retries.
+          openCommitted: () => false,
+          loadError: () =>
+            model.openCommitted ? Option.some(error) : model.loadError,
+        }),
         [],
       ],
 
@@ -659,6 +802,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         evo(model, {
           open: () => Option.none<ThreadDetail>(),
           bodyHeights: () => ({}),
+          openCommitted: () => false,
+          pendingLoad: () => Option.none<ThreadId>(),
         }),
         [ResetScroll()],
       ],
@@ -672,11 +817,12 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const next = evo(model, {
           bodyHeights: () => ({ ...model.bodyHeights, [messageId]: height }),
         });
-        // The measurement that completes the set flips the pane swap;
-        // reset the shared scroll container in the same frame.
+        // The measurement that completes a committed set flips the pane
+        // swap; reset the shared scroll container in the same frame. A
+        // prefetch's measurements change nothing on screen.
         return [
           next,
-          !detailIsReady(model) && detailIsReady(next) ? [ResetScroll()] : [],
+          !detailIsShown(model) && detailIsShown(next) ? [ResetScroll()] : [],
         ];
       },
 
@@ -1318,7 +1464,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                   [
                     h.keyed("div")(
                       "inbox-list-pane",
-                      [h.Class(detailIsReady(model) ? "hidden" : "")],
+                      [h.Class(detailIsShown(model) ? "hidden" : "")],
                       [
                         h.submodel({
                           slotId: "inbox-list",
@@ -1338,7 +1484,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                           [
                             h.Id("inbox-detail-pane"),
                             h.Class(
-                              detailIsReady(model)
+                              detailIsShown(model)
                                 ? ""
                                 : "invisible absolute inset-x-0 top-0",
                             ),

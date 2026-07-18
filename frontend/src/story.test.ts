@@ -19,6 +19,7 @@ import { type Url } from "foldkit/url";
 import { describe, expect, test } from "vitest";
 
 import { CompletedSignOut, GotSession } from "./auth";
+import { MessageId, ThreadId } from "./Gmail";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox } from "./page";
 import * as Ui from "./ui";
@@ -138,6 +139,109 @@ describe("update", () => {
     );
 
     expect(commands.map((command) => command.name)).toContain("LoadThread");
+  });
+
+  test("hovering a row starts the dwell timer; dwell prefetches it", () => {
+    const threadRow = {
+      id: ThreadId.make("thread-1"),
+      subject: "Hi",
+      sender: "Ada",
+      snippet: "hello",
+      date: 1,
+      unread: false,
+      category: "none" as const,
+    };
+    const inboxMessage = (message: Inbox.Message) =>
+      GotInboxMessage({ message });
+
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [withThreads] = update(
+      model,
+      inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
+    );
+    const [hovered, hoverCommands] = update(
+      withThreads,
+      inboxMessage(
+        Inbox.GotListMessage({ message: Ui.Table.EnteredRow({ index: 0 }) }),
+      ),
+    );
+    expect(hoverCommands.map((command) => command.name)).toContain(
+      "StartDwell",
+    );
+
+    const [, dwellCommands] = update(
+      hovered,
+      inboxMessage(Inbox.DwellElapsed({ id: threadRow.id })),
+    );
+    expect(dwellCommands.map((command) => command.name)).toContain(
+      "LoadThread",
+    );
+  });
+
+  test("a prefetched thread mounts silently and swaps on click", () => {
+    const threadRow = {
+      id: ThreadId.make("thread-1"),
+      subject: "Hi",
+      sender: "Ada",
+      snippet: "hello",
+      date: 1,
+      unread: false,
+      category: "none" as const,
+    };
+    const detail = {
+      id: threadRow.id,
+      subject: "Hi",
+      messages: [
+        {
+          id: MessageId.make("m1"),
+          fromName: "Ada",
+          fromEmail: "ada@example.com",
+          date: 1,
+          bodyKind: "plain" as const,
+          body: "hello",
+        },
+      ],
+    };
+    const inboxMessage = (message: Inbox.Message) =>
+      GotInboxMessage({ message });
+
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [withThreads] = update(
+      model,
+      inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
+    );
+    const [hovered] = update(
+      withThreads,
+      inboxMessage(
+        Inbox.GotListMessage({ message: Ui.Table.EnteredRow({ index: 0 }) }),
+      ),
+    );
+    const [loading] = update(
+      hovered,
+      inboxMessage(Inbox.DwellElapsed({ id: threadRow.id })),
+    );
+
+    // The prefetch result mounts invisibly: no scroll reset, no swap.
+    const [mounted, mountCommands] = update(
+      loading,
+      inboxMessage(Inbox.GotThread({ detail })),
+    );
+    expect(mountCommands.map((command) => command.name)).not.toContain(
+      "ResetScroll",
+    );
+
+    // The click commits; an all-plain (already-ready) thread swaps now.
+    const [, clickCommands] = update(
+      mounted,
+      inboxMessage(
+        Inbox.GotListMessage({
+          message: Ui.Table.ClickedRow({ key: "thread-1" }),
+        }),
+      ),
+    );
+    expect(clickCommands.map((command) => command.name)).toContain(
+      "ResetScroll",
+    );
   });
 
   test("the inbox popover's sign-out runs the SignOut command", () => {
