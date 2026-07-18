@@ -292,6 +292,13 @@ export const Model = S.Struct({
   // The row currently under the cursor; the dwell timer checks it hasn't
   // changed before prefetching, so sweeping the list starts nothing.
   hovered: S.Option(ThreadId),
+  // Keyboard cursor: the j/k-selected row index. Resting on a row
+  // prefetches it exactly like a mouse hover; Enter opens it.
+  selected: S.Option(S.Number),
+  // The adjacent-thread prefetch: while a thread is open, the next one
+  // down is loaded here so back→next triage skips the data phase. One
+  // slot, silently replaced — never shown directly.
+  standby: S.Option(ThreadDetail),
 });
 export type Model = typeof Model.Type;
 
@@ -309,6 +316,8 @@ export const init = (): Model => ({
   openCommitted: false,
   pendingLoad: Option.none(),
   hovered: Option.none(),
+  selected: Option.none(),
+  standby: Option.none(),
 });
 
 // MESSAGE
@@ -350,6 +359,14 @@ export const GotThread = m("GotThread", { detail: ThreadDetail });
 /** The hover dwell elapsed for a row: if the cursor is still there, its
  *  thread gets prefetched and pre-mounted invisibly. */
 export const DwellElapsed = m("DwellElapsed", { id: ThreadId });
+/** The adjacent-thread prefetch landed (or silently didn't). */
+export const GotStandbyThread = m("GotStandbyThread", { detail: ThreadDetail });
+export const StandbyFailed = m("StandbyFailed");
+/** List keyboard nav from the global subscription in main.ts: j/k move
+ *  the selection, Enter opens it, Escape leaves an open thread. */
+export const PressedListKey = m("PressedListKey", {
+  key: S.Literals(["j", "k", "Enter", "Escape"]),
+});
 export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
 /** An html body's iframe finished loading — time to measure it. */
@@ -374,6 +391,9 @@ export const Message = S.Union([
   GotHydratedThreads,
   GotThread,
   DwellElapsed,
+  GotStandbyThread,
+  StandbyFailed,
+  PressedListKey,
   FailedLoadThread,
   ClickedBack,
   LoadedBodyFrame,
@@ -473,10 +493,10 @@ export const LoadThread = Command.define(
   }),
 );
 
-// The hover→prefetch debounce: entering a row starts this timer, and the
-// DwellElapsed handler checks the cursor is still on the same row before
-// loading anything — so sweeping the cursor across the whole list starts
-// timers, not loads.
+// The hover→prefetch debounce: entering a row (by mouse or by j/k) starts
+// this timer, and the DwellElapsed handler checks the cursor is still on
+// the same row before loading anything — so sweeping across the whole
+// list starts timers, not loads.
 const StartDwell = Command.define(
   "StartDwell",
   { id: ThreadId },
@@ -485,6 +505,39 @@ const StartDwell = Command.define(
   Effect.gen(function* () {
     yield* Effect.sleep("100 millis");
     return DwellElapsed({ id });
+  }),
+);
+
+// The adjacent-thread prefetch: same read as LoadThread, but the result
+// parks in the standby slot and failure is silent — nobody asked for
+// this thread yet, and a real open of it would retry the load anyway.
+const PrefetchStandby = Command.define(
+  "PrefetchStandby",
+  { id: ThreadId },
+  GotStandbyThread,
+  StandbyFailed,
+)(({ id }) =>
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.loadThread(id).pipe(
+      Effect.map((detail) => GotStandbyThread({ detail })),
+      Effect.catchCause(() => Effect.succeed(StandbyFailed())),
+    );
+  }),
+);
+
+// Keeps the keyboard selection on screen. The DOM id mirrors the Table's
+// row-id scheme (`<table id>-row-<index>`) for the "inbox-list" table.
+const ScrollRowIntoView = Command.define(
+  "ScrollRowIntoView",
+  { index: S.Number },
+  CompletedScrollReset,
+)(({ index }) =>
+  Effect.sync(() => {
+    document
+      .getElementById(`inbox-list-row-${index}`)
+      ?.scrollIntoView({ block: "nearest" });
+    return CompletedScrollReset();
   }),
 );
 
@@ -531,15 +584,24 @@ const ResetScroll = Command.define(
 // scrolls as one surface.
 const MeasureBodyFrame = Command.define(
   "MeasureBodyFrame",
-  { messageId: MessageId },
+  { messageId: MessageId, finalize: S.Boolean },
   MeasuredBodyFrame,
-)(({ messageId }) =>
+)(({ messageId, finalize }) =>
   Effect.sync(() => {
     const frame = document.getElementById(frameId(messageId));
     const height =
       frame instanceof HTMLIFrameElement
         ? (frame.contentDocument?.documentElement.scrollHeight ?? 0)
         : 0;
+    // When this is the last measurement a committed open waits on, the
+    // swap renders on the next dispatch — resetting the scroll here, in
+    // the same task, guarantees the detail's first painted frame is
+    // already at the top instead of one command-hop (a frame) later. The
+    // ResetScroll issued by the update stays as an idempotent fallback.
+    if (finalize && height > 0) {
+      const container = document.getElementById(SCROLL_ID);
+      if (container !== null) container.scrollTop = 0;
+    }
     performance.mark(`parcel:measure:${messageId}`);
     return MeasuredBodyFrame({ messageId, height });
   }),
@@ -550,6 +612,108 @@ const MeasureBodyFrame = Command.define(
 type UpdateReturn = readonly [
   Model,
   ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
+];
+
+const selectedThreadId = (model: Model): ThreadId | undefined =>
+  Option.match(model.selected, {
+    onNone: () => undefined,
+    onSome: (index) =>
+      Option.match(model.threads, {
+        onNone: () => undefined,
+        onSome: (rows) => rows[index]?.id,
+      }),
+  });
+
+// While a thread is open, quietly load the next listed one into standby —
+// read-back-then-next is the dominant triage motion, and this removes its
+// data phase entirely.
+const adjacentPrefetch = (
+  model: Model,
+  id: ThreadId,
+): ReadonlyArray<Command.Command<Message, never, SyncEngine>> =>
+  Option.match(model.threads, {
+    onNone: () => [],
+    onSome: (rows) => {
+      const index = rows.findIndex((row) => row.id === id);
+      const next = index === -1 ? undefined : rows[index + 1];
+      return next === undefined ||
+        Option.exists(model.standby, (detail) => detail.id === next.id)
+        ? []
+        : [PrefetchStandby({ id: next.id })];
+    },
+  });
+
+// The one open path — row clicks and the Enter key both funnel here. It
+// commits the thread and reuses whatever the prefetch machinery already
+// built: a pre-mounted pane just flips, an in-flight load just commits, a
+// standby detail mounts without touching SQLite, and only a completely
+// unknown thread issues a fresh LoadThread.
+const openThread = (model: Model, id: ThreadId): UpdateReturn => {
+  const prefetch = adjacentPrefetch(model, id);
+  // Opening by any means moves the keyboard cursor with it.
+  const rowIndex = Option.flatMap(model.threads, (rows) => {
+    const index = rows.findIndex((row) => row.id === id);
+    return index === -1 ? Option.none<number>() : Option.some(index);
+  });
+  const base = evo(model, {
+    selected: () => Option.orElse(rowIndex, () => model.selected),
+  });
+
+  if (Option.exists(base.open, (detail) => detail.id === id)) {
+    const next = evo(base, { openCommitted: () => true });
+    return [
+      next,
+      [
+        ...(detailIsShown(next) && !detailIsShown(base) ? [ResetScroll()] : []),
+        ...prefetch,
+      ],
+    ];
+  }
+
+  const standbyHit = Option.flatMap(base.standby, (detail) =>
+    detail.id === id ? Option.some(detail) : Option.none<ThreadDetail>(),
+  );
+  if (Option.isSome(standbyHit)) {
+    const next = evo(base, {
+      open: () => Option.some(standbyHit.value),
+      bodyHeights: () => ({}),
+      openCommitted: () => true,
+      pendingLoad: () => Option.none<ThreadId>(),
+      standby: () => Option.none<ThreadDetail>(),
+    });
+    // An all-plain standby thread has nothing to measure: shown now.
+    return [
+      next,
+      [...(detailIsShown(next) ? [ResetScroll()] : []), ...prefetch],
+    ];
+  }
+
+  if (Option.exists(base.pendingLoad, (pending) => pending === id)) {
+    return [evo(base, { openCommitted: () => true }), prefetch];
+  }
+
+  return [
+    evo(base, {
+      open: () => Option.none<ThreadDetail>(),
+      bodyHeights: () => ({}),
+      openCommitted: () => true,
+      pendingLoad: () => Option.some(id),
+    }),
+    [LoadThread({ id }), ...prefetch],
+  ];
+};
+
+// Leaving a thread (back button or Escape): evict the mounted detail and
+// forget any in-flight load; standby survives — it's what makes opening
+// the next thread instant.
+const closeThread = (model: Model): UpdateReturn => [
+  evo(model, {
+    open: () => Option.none<ThreadDetail>(),
+    bodyHeights: () => ({}),
+    openCommitted: () => false,
+    pendingLoad: () => Option.none<ThreadId>(),
+  }),
+  [ResetScroll()],
 ];
 
 export const update = (model: Model, message: Message): UpdateReturn =>
@@ -594,49 +758,10 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         // event handlers), and this page gives it meaning.
         if (message._tag === "TableClickedRow") {
           const decoded = S.decodeUnknownOption(ThreadId)(message.key);
-          if (Option.isNone(decoded)) {
-            return [evo(model, { list: () => list }), listCommands];
-          }
-          const id = decoded.value;
-
-          // Already pre-mounted by a hover prefetch: committing is the
-          // whole open — if every body is measured, the swap is this
-          // frame's class flip.
-          if (Option.exists(model.open, (detail) => detail.id === id)) {
-            const next = evo(model, {
-              list: () => list,
-              openCommitted: () => true,
-            });
-            return [
-              next,
-              [
-                ...listCommands,
-                ...(detailIsShown(next) && !detailIsShown(model)
-                  ? [ResetScroll()]
-                  : []),
-              ],
-            ];
-          }
-
-          // A prefetch for this thread is in flight: commit and let its
-          // GotThread continue the normal mount → measure → swap flow.
-          if (Option.exists(model.pendingLoad, (pending) => pending === id)) {
-            return [
-              evo(model, { list: () => list, openCommitted: () => true }),
-              listCommands,
-            ];
-          }
-
-          return [
-            evo(model, {
-              list: () => list,
-              open: () => Option.none<ThreadDetail>(),
-              bodyHeights: () => ({}),
-              openCommitted: () => true,
-              pendingLoad: () => Option.some(id),
-            }),
-            [...listCommands, LoadThread({ id })],
-          ];
+          const base = evo(model, { list: () => list });
+          if (Option.isNone(decoded)) return [base, listCommands];
+          const [next, openCommands] = openThread(base, decoded.value);
+          return [next, [...listCommands, ...openCommands]];
         }
 
         // Entering a row tracks it as hovered and starts the prefetch
@@ -756,32 +881,90 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       },
 
       DwellElapsed: ({ id }) => {
-        const stillHovered = Option.exists(
-          model.hovered,
-          (hovered) => hovered === id,
-        );
+        // Mouse hover and the keyboard cursor are both "resting on" a row.
+        const stillIntended =
+          Option.exists(model.hovered, (hovered) => hovered === id) ||
+          selectedThreadId(model) === id;
         const alreadyMounted = Option.exists(
           model.open,
           (detail) => detail.id === id,
         );
-        const alreadyLoading = Option.exists(
-          model.pendingLoad,
-          (pending) => pending === id,
+        if (!stillIntended || alreadyMounted || model.openCommitted) {
+          return [model, []];
+        }
+
+        // A standby hit pre-mounts without touching SQLite at all.
+        const standbyHit = Option.flatMap(model.standby, (detail) =>
+          detail.id === id ? Option.some(detail) : Option.none<ThreadDetail>(),
         );
-        // Prefetch only an idle, still-hovered, uncommitted row; a newer
-        // dwell supersedes an older in-flight load (its result is dropped
-        // by the pendingLoad check in GotThread).
-        if (
-          !stillHovered ||
-          alreadyMounted ||
-          alreadyLoading ||
-          model.openCommitted
-        ) {
+        if (Option.isSome(standbyHit)) {
+          return [
+            evo(model, {
+              open: () => Option.some(standbyHit.value),
+              bodyHeights: () => ({}),
+              pendingLoad: () => Option.none<ThreadId>(),
+              standby: () => Option.none<ThreadDetail>(),
+            }),
+            [],
+          ];
+        }
+
+        // Prefetch only an idle row; a newer dwell supersedes an older
+        // in-flight load (its result is dropped by the pendingLoad check
+        // in GotThread).
+        if (Option.exists(model.pendingLoad, (pending) => pending === id)) {
           return [model, []];
         }
         return [
           evo(model, { pendingLoad: () => Option.some(id) }),
           [LoadThread({ id })],
+        ];
+      },
+
+      GotStandbyThread: ({ detail }) => [
+        // Don't clobber the slot if the user meanwhile opened this very
+        // thread — the mounted copy is the live one.
+        Option.exists(model.open, (open) => open.id === detail.id)
+          ? model
+          : evo(model, { standby: () => Option.some(detail) }),
+        [],
+      ],
+
+      StandbyFailed: () => [model, []],
+
+      PressedListKey: ({ key }) => {
+        // The palette owns the keyboard while it's open.
+        if (model.palette.dialog.isOpen) return [model, []];
+
+        if (key === "Escape") {
+          return detailIsShown(model) ? closeThread(model) : [model, []];
+        }
+        // Inside a thread, j/k/Enter are reserved for future in-thread nav.
+        if (detailIsShown(model)) return [model, []];
+
+        if (key === "Enter") {
+          const id = selectedThreadId(model);
+          return id === undefined ? [model, []] : openThread(model, id);
+        }
+
+        const rowCount = Option.match(model.threads, {
+          onNone: () => 0,
+          onSome: (rows) => rows.length,
+        });
+        if (rowCount === 0) return [model, []];
+        const current = Option.getOrElse(model.selected, () => -1);
+        const index =
+          key === "j"
+            ? Math.min(current + 1, rowCount - 1)
+            : Math.max(current - 1, 0);
+        const next = evo(model, { selected: () => Option.some(index) });
+        const id = selectedThreadId(next);
+        return [
+          next,
+          [
+            ScrollRowIntoView({ index }),
+            ...(id === undefined ? [] : [StartDwell({ id })]),
+          ],
         ];
       },
 
@@ -798,20 +981,24 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [],
       ],
 
-      ClickedBack: () => [
-        evo(model, {
-          open: () => Option.none<ThreadDetail>(),
-          bodyHeights: () => ({}),
-          openCommitted: () => false,
-          pendingLoad: () => Option.none<ThreadId>(),
-        }),
-        [ResetScroll()],
-      ],
+      ClickedBack: () => closeThread(model),
 
-      LoadedBodyFrame: ({ messageId }) => [
-        model,
-        [MeasureBodyFrame({ messageId })],
-      ],
+      LoadedBodyFrame: ({ messageId }) => {
+        // finalize: this is the only html body a committed open still
+        // lacks a height for, so its measure command can reset the scroll
+        // in the same task the swap renders in.
+        const finalize =
+          model.openCommitted &&
+          Option.exists(model.open, (detail) =>
+            detail.messages.every(
+              (message) =>
+                message.bodyKind !== "html" ||
+                message.id === messageId ||
+                (model.bodyHeights[message.id] ?? 0) > 0,
+            ),
+          );
+        return [model, [MeasureBodyFrame({ messageId, finalize })]];
+      },
 
       MeasuredBodyFrame: ({ messageId, height }) => {
         const next = evo(model, {
@@ -1112,15 +1299,19 @@ const READ_STATE = {
 } as const;
 
 // No hover style on the row itself: the Table's traveling overlay carries
-// the hover state, so panning glides instead of blinking per row.
-const emailRowView = (email: Email): Html => {
+// the hover state, so panning glides instead of blinking per row. The
+// keyboard selection is persistent (not transient like hover), so it does
+// live on the row.
+const emailRowView = (email: Email, isSelected: boolean): Html => {
   const h = html();
   const readState = READ_STATE[email.isRead ? "read" : "unread"];
 
   return h.div(
     [
       h.Class(
-        "flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3",
+        `flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3 ${
+          isSelected ? "bg-active" : ""
+        }`,
       ),
     ],
     [
@@ -1261,10 +1452,13 @@ const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
               content: statusRowView("Your inbox is empty."),
             },
           ]
-        : rows.map((row) => ({
+        : rows.map((row, index) => ({
             kind: "row" as const,
             key: row.id,
-            content: emailRowView(emailFromThreadRow(row)),
+            content: emailRowView(
+              emailFromThreadRow(row),
+              Option.exists(model.selected, (selected) => selected === index),
+            ),
           }))),
     ],
   });

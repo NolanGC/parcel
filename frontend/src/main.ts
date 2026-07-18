@@ -397,6 +397,50 @@ export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
         ),
     },
   ),
+  // j/k/Enter/Escape drive the inbox list (selection, open, close). Bare
+  // keys only, and never while typing — the palette's input (or any
+  // editable target) keeps its keystrokes.
+  listKeys: entry(
+    { isInbox: S.Boolean },
+    {
+      modelToDependencies: (model) => ({
+        isInbox: model.route._tag === "Inbox",
+      }),
+      dependenciesToStream: ({ isInbox }) =>
+        Stream.when(
+          Subscription.fromEventFilterMap<KeyboardEvent, Message>({
+            target: window,
+            type: "keydown",
+            toMessage: (event) => {
+              if (event.metaKey || event.ctrlKey || event.altKey) {
+                return Option.none();
+              }
+              const target = event.target;
+              if (
+                target instanceof HTMLElement &&
+                (target.tagName === "INPUT" ||
+                  target.tagName === "TEXTAREA" ||
+                  target.isContentEditable)
+              ) {
+                return Option.none();
+              }
+              const key = event.key;
+              return key === "j" ||
+                key === "k" ||
+                key === "Enter" ||
+                key === "Escape"
+                ? Option.some(
+                    GotInboxMessage({
+                      message: Inbox.PressedListKey({ key }),
+                    }),
+                  )
+                : Option.none();
+            },
+          }),
+          Effect.sync(() => isInbox),
+        ),
+    },
+  ),
 }));
 export const managedResources = undefined;
 

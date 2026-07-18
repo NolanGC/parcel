@@ -98,6 +98,7 @@ const DbMessageRow = S.Struct({
 const decodeDbMessages = S.decodeUnknownEffect(S.Array(DbMessageRow));
 
 const DbBodyRow = S.Struct({
+  message_id: MessageId,
   mime_type: S.String,
   codec: S.Literals(["gzip", "none"]),
   body: S.instanceOf(Uint8Array),
@@ -105,6 +106,7 @@ const DbBodyRow = S.Struct({
 const decodeDbBodies = S.decodeUnknownEffect(S.Array(DbBodyRow));
 
 const DbImageRow = S.Struct({
+  message_id: MessageId,
   content_id: S.String,
   mime_type: S.String,
   bytes: S.instanceOf(Uint8Array),
@@ -450,16 +452,36 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   Effect.andThen(selectThreadMessages(id)),
                 );
 
+          // One query per table for the whole thread (not two per
+          // message): every worker round trip is a postMessage hop, so a
+          // six-message thread is 2 statements instead of 12.
+          const ids = rows.map((row) => row.id);
+          const bodiesRaw =
+            ids.length === 0
+              ? []
+              : yield* sql`
+                  SELECT message_id, mime_type, codec, body
+                  FROM message_bodies
+                  WHERE ${sql.in("message_id", ids)}
+                `;
+          const bodyByMessage = new Map(
+            (yield* decodeDbBodies(bodiesRaw).pipe(Effect.orDie)).map(
+              (body) => [body.message_id, body] as const,
+            ),
+          );
+          const imagesRaw =
+            ids.length === 0
+              ? []
+              : yield* sql`
+                  SELECT message_id, content_id, mime_type, bytes
+                  FROM message_attachments
+                  WHERE ${sql.in("message_id", ids)}
+                `;
+          const allImages = yield* decodeDbImages(imagesRaw).pipe(Effect.orDie);
+
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {
-              const bodiesRaw = yield* sql`
-                SELECT mime_type, codec, body
-                FROM message_bodies
-                WHERE message_id = ${row.id}
-              `;
-              const stored = (yield* decodeDbBodies(bodiesRaw).pipe(
-                Effect.orDie,
-              ))[0];
+              const stored = bodyByMessage.get(row.id);
               const text =
                 stored === undefined
                   ? ""
@@ -468,13 +490,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                       data: new Uint8Array(stored.body),
                     });
 
-              const imagesRaw = yield* sql`
-                SELECT content_id, mime_type, bytes
-                FROM message_attachments
-                WHERE message_id = ${row.id}
-              `;
-              const images = yield* decodeDbImages(imagesRaw).pipe(
-                Effect.orDie,
+              const images = allImages.filter(
+                (image) => image.message_id === row.id,
               );
               const body = images.reduce(
                 (html, image) =>

@@ -244,6 +244,72 @@ describe("update", () => {
     );
   });
 
+  test("j selects the first row and Enter opens it", () => {
+    const threadRow = {
+      id: ThreadId.make("thread-1"),
+      subject: "Hi",
+      sender: "Ada",
+      snippet: "hello",
+      date: 1,
+      unread: false,
+      category: "none" as const,
+    };
+    const inboxMessage = (message: Inbox.Message) =>
+      GotInboxMessage({ message });
+
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [withThreads] = update(
+      model,
+      inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
+    );
+    const [selected, moveCommands] = update(
+      withThreads,
+      inboxMessage(Inbox.PressedListKey({ key: "j" })),
+    );
+    // Moving the cursor scrolls it into view and starts the prefetch dwell.
+    expect(moveCommands.map((command) => command.name)).toEqual([
+      "ScrollRowIntoView",
+      "StartDwell",
+    ]);
+
+    const [, openCommands] = update(
+      selected,
+      inboxMessage(Inbox.PressedListKey({ key: "Enter" })),
+    );
+    expect(openCommands.map((command) => command.name)).toContain("LoadThread");
+  });
+
+  test("an open prefetches the adjacent thread into standby", () => {
+    const row = (n: number) => ({
+      id: ThreadId.make(`thread-${n}`),
+      subject: `S${n}`,
+      sender: "Ada",
+      snippet: "hello",
+      date: n,
+      unread: false,
+      category: "none" as const,
+    });
+    const inboxMessage = (message: Inbox.Message) =>
+      GotInboxMessage({ message });
+
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [withThreads] = update(
+      model,
+      inboxMessage(Inbox.GotThreads({ rows: [row(1), row(2)] })),
+    );
+    const [, openCommands] = update(
+      withThreads,
+      inboxMessage(
+        Inbox.GotListMessage({
+          message: Ui.Table.ClickedRow({ key: "thread-1" }),
+        }),
+      ),
+    );
+    expect(openCommands.map((command) => command.name)).toContain(
+      "PrefetchStandby",
+    );
+  });
+
   test("the inbox popover's sign-out runs the SignOut command", () => {
     const [model] = init(loggedInFlags, url("/inbox"));
     const [, commands] = update(
