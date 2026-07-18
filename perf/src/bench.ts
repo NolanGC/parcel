@@ -172,15 +172,20 @@ const phasesOf = (raw: RawResult): { phases: Phases; htmlBodies: number } => {
     measures.length === 0
       ? undefined
       : rel(Math.max(...measures.map((m) => m.at)));
+  // A negative mark means the work ran before the click (hover prefetch):
+  // no post-click phase to attribute, the whole open is the swap.
+  const prefetched = dataEnd !== undefined && dataEnd < 0;
   return {
-    phases: {
-      data: dataEnd === undefined ? undefined : round1(dataEnd),
-      iframe:
-        lastMeasure === undefined || dataEnd === undefined
-          ? undefined
-          : round1(lastMeasure - dataEnd),
-      swap: round1(raw.content - (lastMeasure ?? dataEnd ?? 0)),
-    },
+    phases: prefetched
+      ? { data: 0, iframe: 0, swap: round1(raw.content) }
+      : {
+          data: dataEnd === undefined ? undefined : round1(dataEnd),
+          iframe:
+            lastMeasure === undefined || dataEnd === undefined
+              ? undefined
+              : round1(lastMeasure - dataEnd),
+          swap: round1(raw.content - (lastMeasure ?? dataEnd ?? 0)),
+        },
     htmlBodies: measures.length,
   };
 };
