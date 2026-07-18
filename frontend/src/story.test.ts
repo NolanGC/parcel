@@ -21,6 +21,7 @@ import { describe, expect, test } from "vitest";
 import { CompletedSignOut, GotSession } from "./auth";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox } from "./page";
+import * as Ui from "./ui";
 
 const session = {
   userId: UserId.make("user-1"),
@@ -123,6 +124,20 @@ describe("update", () => {
 
     expect(next._tag).toBe("LoggedOut");
     expect(next.route._tag).toBe("Home");
+  });
+
+  test("clicking a list row issues LoadThread for that thread", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [, commands] = update(
+      model,
+      GotInboxMessage({
+        message: Inbox.GotListMessage({
+          message: Ui.Table.ClickedRow({ key: "thread-1" }),
+        }),
+      }),
+    );
+
+    expect(commands.map((command) => command.name)).toContain("LoadThread");
   });
 
   test("the inbox popover's sign-out runs the SignOut command", () => {

@@ -61,12 +61,18 @@ export const EnteredContainer = m("EnteredContainer", { rowCount: S.Number });
 export const LeftContainer = m("LeftContainer");
 export const EnteredRow = m("EnteredRow", { index: S.Number });
 export const GotRowRects = m("GotRowRects", { rects: S.Array(Rect) });
+/** A row was clicked, identified by its TableChild key. The Table itself
+ *  has no opinion about what a click means — parents watch for this tag
+ *  in their wrapper message (row content passed through viewInputs must
+ *  stay inert: submodel inputs may not carry nested event handlers). */
+export const ClickedRow = m("TableClickedRow", { key: S.String });
 
 export const Message = S.Union([
   EnteredContainer,
   LeftContainer,
   EnteredRow,
   GotRowRects,
+  ClickedRow,
 ]);
 export type Message = typeof Message.Type;
 
@@ -120,6 +126,10 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       ],
 
       GotRowRects: ({ rects }) => [evo(model, { rects: () => [...rects] }), []],
+
+      // Meaningful only to the parent (which intercepts it); the Table's
+      // own hover state is untouched by a click.
+      TableClickedRow: () => [model, []],
     }),
   );
 
@@ -154,7 +164,11 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
       const index = rowIndex;
       return h.keyed("div")(
         child.key,
-        [h.Id(rowId(model.id, index)), h.OnMouseEnter(EnteredRow({ index }))],
+        [
+          h.Id(rowId(model.id, index)),
+          h.OnMouseEnter(EnteredRow({ index })),
+          h.OnClick(ClickedRow({ key: child.key })),
+        ],
         [child.content],
       );
     });

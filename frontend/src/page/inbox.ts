@@ -1,11 +1,18 @@
-import { Effect, Match as M, Option, Schema as S } from "effect";
+import { Cause, Effect, Match as M, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
 
 import * as Icon from "../icons";
-import { SyncEngine, ThreadRow, type ThreadCategory } from "../sync";
+import { MessageId, ThreadId } from "../Gmail";
+import {
+  SyncEngine,
+  ThreadDetail,
+  ThreadRow,
+  type MessageDetail,
+  type ThreadCategory,
+} from "../sync";
 import * as Ui from "../ui";
 
 // The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors
@@ -267,6 +274,13 @@ export const Model = S.Struct({
   // inbox. loadError keeps the last failure for the list to surface.
   threads: S.Option(S.Array(ThreadRow)),
   loadError: S.Option(S.String),
+  // The open thread, or None for the list. Bodies live in the model only
+  // while their thread is open — closing it (or opening another) evicts
+  // them; the local database remains the working set.
+  open: S.Option(ThreadDetail),
+  // Measured srcdoc-iframe content heights by message id, set once per
+  // body after its load event so the frame fits its content exactly.
+  bodyHeights: S.Record(S.String, S.Number),
 });
 export type Model = typeof Model.Type;
 
@@ -279,6 +293,8 @@ export const init = (): Model => ({
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
   threads: Option.none(),
   loadError: Option.none(),
+  open: Option.none(),
+  bodyHeights: {},
 });
 
 // MESSAGE
@@ -310,6 +326,22 @@ export const ClickedSignOut = m("InboxClickedSignOut");
  *  local database. */
 export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
 export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
+/** Background hydration finished: rows re-read after threads missing
+ *  local content were fully synced. Terminal — issues no further
+ *  commands, so GotThreads → hydrate can't loop. */
+export const GotHydratedThreads = m("GotHydratedThreads", {
+  rows: S.Array(ThreadRow),
+});
+export const GotThread = m("GotThread", { detail: ThreadDetail });
+export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
+export const ClickedBack = m("ClickedBack");
+/** An html body's iframe finished loading — time to measure it. */
+export const LoadedBodyFrame = m("LoadedBodyFrame", { messageId: MessageId });
+export const CompletedScrollReset = m("CompletedScrollReset");
+export const MeasuredBodyFrame = m("MeasuredBodyFrame", {
+  messageId: MessageId,
+  height: S.Number,
+});
 
 export const Message = S.Union([
   GotFolderMenuMessage,
@@ -322,6 +354,13 @@ export const Message = S.Union([
   ClickedSignOut,
   GotThreads,
   FailedLoadInbox,
+  GotHydratedThreads,
+  GotThread,
+  FailedLoadThread,
+  ClickedBack,
+  LoadedBodyFrame,
+  MeasuredBodyFrame,
+  CompletedScrollReset,
 ]);
 export type Message = typeof Message.Type;
 
@@ -362,10 +401,102 @@ export const LoadInbox = Command.define(
     const engine = yield* SyncEngine;
     return yield* engine.loadInbox.pipe(
       Effect.map((rows) => GotThreads({ rows })),
-      Effect.catch((error) =>
-        Effect.succeed(FailedLoadInbox({ error: error.message })),
+      // catchCause, not catch: a defect (e.g. an orDie'd own-schema decode)
+      // must surface as a visible failure, not kill the fiber silently.
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
       ),
     );
+  }),
+);
+
+// Pulls full content for any listed thread that has none locally, then
+// re-reads the rows. Issued right after GotThreads so the list is already
+// painted; once this lands, every listed thread opens without a fetch.
+const HydrateInbox = Command.define(
+  "HydrateInbox",
+  GotHydratedThreads,
+  FailedLoadInbox,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.hydrateMissing.pipe(
+      Effect.map((rows) => GotHydratedThreads({ rows })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+// Opens a thread from the local store only: SQLite rows, bodies gunzipped
+// on the fly, cid: images rewritten from locally cached bytes — no
+// network on this path, which is what makes opening instant post-sync.
+export const LoadThread = Command.define(
+  "LoadThread",
+  { id: ThreadId },
+  GotThread,
+  FailedLoadThread,
+)(({ id }) =>
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.loadThread(id).pipe(
+      Effect.map((detail) => GotThread({ detail })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedLoadThread({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+const frameId = (messageId: string): string => `body-frame-${messageId}`;
+const SCROLL_ID = "inbox-scroll";
+
+// The list ↔ detail pane swap happens on this flag: the detail pane stays
+// invisible (loading and measuring its iframes at final geometry behind
+// the list) until every html body has a real height — so when the screen
+// changes, the whole email is already painted.
+const detailIsReady = (model: Model): boolean =>
+  Option.match(model.open, {
+    onNone: () => false,
+    onSome: (detail) =>
+      detail.messages.every(
+        (message) =>
+          message.bodyKind !== "html" ||
+          (model.bodyHeights[message.id] ?? 0) > 0,
+      ),
+  });
+
+// The scroll container survives the pane swap (both panes live inside
+// it), so entering and leaving a thread resets it explicitly — otherwise
+// the detail opens at the list's scroll offset.
+const ResetScroll = Command.define(
+  "ResetScroll",
+  CompletedScrollReset,
+)(
+  Effect.sync(() => {
+    const container = document.getElementById(SCROLL_ID);
+    if (container !== null) container.scrollTop = 0;
+    return CompletedScrollReset();
+  }),
+);
+
+// Reads the loaded iframe's content height (a DOM read is a side effect,
+// so it lives in a command). The height lands in the model and the frame
+// is sized once — content never scrolls inside the frame, the column
+// scrolls as one surface.
+const MeasureBodyFrame = Command.define(
+  "MeasureBodyFrame",
+  { messageId: MessageId },
+  MeasuredBodyFrame,
+)(({ messageId }) =>
+  Effect.sync(() => {
+    const frame = document.getElementById(frameId(messageId));
+    const height =
+      frame instanceof HTMLIFrameElement
+        ? (frame.contentDocument?.documentElement.scrollHeight ?? 0)
+        : 0;
+    return MeasuredBodyFrame({ messageId, height });
   }),
 );
 
@@ -409,11 +540,22 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       GotListMessage: ({ message }) => {
         const [list, commands] = Ui.Table.update(model.list, message);
+        const listCommands = Command.mapMessages(commands, (message) =>
+          GotListMessage({ message }),
+        );
+        // Row keys are thread ids, so a Table click is an open request —
+        // the click lives on the Table (submodel viewInputs can't carry
+        // event handlers), and this page gives it meaning.
+        const openCommands =
+          message._tag === "TableClickedRow"
+            ? Option.match(S.decodeUnknownOption(ThreadId)(message.key), {
+                onNone: () => [],
+                onSome: (id) => [LoadThread({ id })],
+              })
+            : [];
         return [
           evo(model, { list: () => list }),
-          Command.mapMessages(commands, (message) =>
-            GotListMessage({ message }),
-          ),
+          [...listCommands, ...openCommands],
         ];
       },
 
@@ -477,6 +619,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           threads: () => Option.some(rows),
           loadError: () => Option.none<string>(),
         }),
+        [HydrateInbox()],
+      ],
+
+      GotHydratedThreads: ({ rows }) => [
+        evo(model, { threads: () => Option.some(rows) }),
         [],
       ],
 
@@ -484,6 +631,49 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         evo(model, { loadError: () => Option.some(error) }),
         [],
       ],
+
+      GotThread: ({ detail }) => {
+        const next = evo(model, {
+          open: () => Option.some(detail),
+          bodyHeights: () => ({}),
+          loadError: () => Option.none<string>(),
+        });
+        // All-plain threads have nothing to measure: they're ready now,
+        // so the pane swap (and its scroll reset) happens immediately.
+        return [next, detailIsReady(next) ? [ResetScroll()] : []];
+      },
+
+      FailedLoadThread: ({ error }) => [
+        evo(model, { loadError: () => Option.some(error) }),
+        [],
+      ],
+
+      ClickedBack: () => [
+        evo(model, {
+          open: () => Option.none<ThreadDetail>(),
+          bodyHeights: () => ({}),
+        }),
+        [ResetScroll()],
+      ],
+
+      LoadedBodyFrame: ({ messageId }) => [
+        model,
+        [MeasureBodyFrame({ messageId })],
+      ],
+
+      MeasuredBodyFrame: ({ messageId, height }) => {
+        const next = evo(model, {
+          bodyHeights: () => ({ ...model.bodyHeights, [messageId]: height }),
+        });
+        // The measurement that completes the set flips the pane swap;
+        // reset the shared scroll container in the same frame.
+        return [
+          next,
+          !detailIsReady(model) && detailIsReady(next) ? [ResetScroll()] : [],
+        ];
+      },
+
+      CompletedScrollReset: () => [model, []],
 
       // The actual sign-out is main.ts's job (it owns the session); this
       // page just folds the popover shut behind it.
@@ -777,7 +967,7 @@ const emailRowView = (email: Email): Html => {
   return h.div(
     [
       h.Class(
-        "flex cursor-default items-center gap-4 border-b border-border px-4 py-3",
+        "flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3",
       ),
     ],
     [
@@ -898,6 +1088,18 @@ const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
     ],
     onSome: (rows) => [
       header,
+      // A failure after the list is up (e.g. a thread open) still needs a
+      // face — without this row it would die into invisible model state.
+      ...Option.match(model.loadError, {
+        onNone: () => [],
+        onSome: (error) => [
+          {
+            kind: "static" as const,
+            key: "inbox-error",
+            content: statusRowView(error),
+          },
+        ],
+      }),
       ...(rows.length === 0
         ? [
             {
@@ -915,6 +1117,171 @@ const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
   });
 };
 
+// THREAD DETAIL
+//
+// Renders in the exact container the list uses, so switching between the
+// two never moves the column. Html bodies render in a sandboxed srcdoc
+// iframe (email css can't leak out, ours can't leak in; no scripts run —
+// allow-same-origin exists solely so the measure command can read the
+// content height). Plain bodies skip the iframe entirely.
+
+// default-src 'none' keeps the frame network-silent except images:
+// data: for the locally cached cid: images, https: for remote ones
+// (blocking those behind a "show images" toggle is a follow-up).
+const FRAME_CSP =
+  "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'";
+
+// Email html expects a white canvas regardless of app theme; the reset
+// only fills gaps for fragment bodies that bring no styling of their own.
+const srcdocFor = (body: string): string =>
+  `<!doctype html><html><head><meta charset="utf-8">` +
+  `<meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">` +
+  `<base target="_blank">` +
+  `<style>body{margin:16px;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;background:#fff;overflow-wrap:break-word}img{max-width:100%;height:auto}</style>` +
+  `</head><body>${body}</body></html>`;
+
+const formatDetailTime = (epochMs: number): string =>
+  new Date(epochMs).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+// Pre-measure the frame renders at a fixed placeholder height; the
+// measured height replaces it in one style patch (srcdoc unchanged, so
+// snabbdom never reloads the frame).
+const PLACEHOLDER_HEIGHT = 160;
+
+const messageBodyView = (
+  message: MessageDetail,
+  measuredHeight: number | undefined,
+): Html => {
+  const h = html<Message>();
+
+  if (message.bodyKind === "plain") {
+    return h.pre(
+      [
+        h.Class(
+          "mt-3 whitespace-pre-wrap break-words font-sans text-[14px] leading-relaxed text-foreground",
+        ),
+      ],
+      [message.body],
+    );
+  }
+
+  // A 0 measurement (frame unreadable) keeps the placeholder rather than
+  // collapsing the body to invisible.
+  const isMeasured = measuredHeight !== undefined && measuredHeight > 0;
+
+  return h.iframe(
+    [
+      h.Id(frameId(message.id)),
+      h.Sandbox(
+        "allow-same-origin allow-popups allow-popups-to-escape-sandbox",
+      ),
+      h.Srcdoc(srcdocFor(message.body)),
+      h.OnLoad(LoadedBodyFrame({ messageId: message.id })),
+      h.Class("mt-3 w-full rounded-lg bg-white"),
+      h.Style({
+        height: `${isMeasured ? measuredHeight : PLACEHOLDER_HEIGHT}px`,
+        border: "0",
+        // Browsers paint srcdoc progressively as it parses; staying
+        // hidden until the post-load measurement means the body appears
+        // fully laid out at final height in a single frame.
+        visibility: isMeasured ? "visible" : "hidden",
+      }),
+    ],
+    [],
+  );
+};
+
+const messageCardView = (
+  message: MessageDetail,
+  measuredHeight: number | undefined,
+): Html => {
+  const h = html<Message>();
+
+  return h.div(
+    [h.Class("border-b border-border px-4 py-4")],
+    [
+      h.div(
+        [h.Class("flex items-center gap-3")],
+        [
+          h.span(
+            [
+              h.Class(
+                "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold leading-none",
+              ),
+              h.Style({ backgroundColor: AVATAR_BG, color: AVATAR_FG }),
+            ],
+            [(message.fromName.slice(0, 1) || "?").toUpperCase()],
+          ),
+          h.div(
+            [h.Class("min-w-0 flex-1")],
+            [
+              h.div(
+                [h.Class("truncate text-[13px] font-semibold text-foreground")],
+                [message.fromName],
+              ),
+              h.div(
+                [h.Class("truncate text-[12px] text-muted-foreground")],
+                [message.fromEmail],
+              ),
+            ],
+          ),
+          h.span(
+            [
+              h.Class(
+                "shrink-0 text-[12px] tabular-nums text-muted-foreground",
+              ),
+            ],
+            [formatDetailTime(message.date)],
+          ),
+        ],
+      ),
+      messageBodyView(message, measuredHeight),
+    ],
+  );
+};
+
+const threadDetailView = (model: Model, detail: ThreadDetail): Html => {
+  const h = html<Message>();
+
+  return h.div(
+    [],
+    [
+      h.div(
+        [h.Class("flex items-center gap-3 border-b border-border px-2 py-2.5")],
+        [
+          h.button(
+            [
+              h.Type("button"),
+              h.OnClick(ClickedBack()),
+              h.AriaLabel("Back to inbox"),
+              h.Class(
+                `flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1.5 text-[13px] font-medium text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+              ),
+            ],
+            [Icon.arrowLeft("h-4 w-4"), "Inbox"],
+          ),
+          h.h1(
+            [
+              h.Class(
+                "min-w-0 flex-1 truncate text-[15px] font-semibold text-foreground",
+              ),
+            ],
+            [detail.subject === "" ? "(no subject)" : detail.subject],
+          ),
+        ],
+      ),
+      ...detail.messages.map((message) =>
+        messageCardView(message, model.bodyHeights[message.id]),
+      ),
+    ],
+  );
+};
+
 export const view = Submodel.defineView<Model, Message, ViewInputs>(
   (model, { profile }): Html => {
     const h = html<Message>();
@@ -926,18 +1293,54 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
         // The list sits in a centered column narrower than the page, so the
         // rows breathe with clear space on both sides.
         h.div(
-          [h.Class("flex-1 overflow-y-auto pb-24")],
+          [h.Id(SCROLL_ID), h.Class("flex-1 overflow-y-auto pb-24")],
           [
             h.div(
               [h.Class("mx-auto w-full max-w-7xl px-6")],
               [
-                h.submodel({
-                  slotId: "inbox-list",
-                  model: model.list,
-                  view: Ui.Table.view,
-                  viewInputs: { children: listChildren(model) },
-                  toParentMessage: (message) => GotListMessage({ message }),
-                }),
+                // List and detail share this exact container, so opening a
+                // thread never changes the column's width or position. Both
+                // panes stay mounted while a detail is loading: the detail
+                // renders invisible-absolute underneath (same width, so
+                // iframes load and measure at final geometry) and the swap
+                // is a pure class flip once every body is ready — keyed
+                // wrappers keep the loaded iframes' element identity, and
+                // the screen never changes until the content is paintable.
+                h.div(
+                  [h.Class("relative")],
+                  [
+                    h.keyed("div")(
+                      "inbox-list-pane",
+                      [h.Class(detailIsReady(model) ? "hidden" : "")],
+                      [
+                        h.submodel({
+                          slotId: "inbox-list",
+                          model: model.list,
+                          view: Ui.Table.view,
+                          viewInputs: { children: listChildren(model) },
+                          toParentMessage: (message) =>
+                            GotListMessage({ message }),
+                        }),
+                      ],
+                    ),
+                    ...Option.match(model.open, {
+                      onNone: () => [],
+                      onSome: (detail) => [
+                        h.keyed("div")(
+                          "inbox-detail-pane",
+                          [
+                            h.Class(
+                              detailIsReady(model)
+                                ? ""
+                                : "invisible absolute inset-x-0 top-0",
+                            ),
+                          ],
+                          [threadDetailView(model, detail)],
+                        ),
+                      ],
+                    }),
+                  ],
+                ),
               ],
             ),
           ],

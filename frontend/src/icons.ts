@@ -7,6 +7,7 @@ import { icon, iconFilled } from "./ui/icon";
 // resting, 2 active/checked.
 
 export const inbox = icon(Lucide.Inbox);
+export const arrowLeft = icon(Lucide.ArrowLeft);
 export const chevronsUpDown = icon(Lucide.ChevronsUpDown);
 export const circleCheck = icon(Lucide.CircleCheck);
 export const bell = icon(Lucide.Bell);

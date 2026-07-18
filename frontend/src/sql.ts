@@ -128,5 +128,23 @@ export const SqlLive = SqliteMigrator.layer({
         )
       `;
     }),
+
+    // Inline images (multipart/related parts with a Content-ID) fetched
+    // at sync time so opening a thread touches no network. content_id is
+    // stored without its RFC angle brackets — exactly what the html
+    // references as cid:<content_id>. bytes stay raw: image formats are
+    // already compressed, gzip buys nothing.
+    "0002_message_attachments": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        CREATE TABLE message_attachments (
+          message_id TEXT NOT NULL REFERENCES messages (id),
+          content_id TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          bytes BLOB NOT NULL,
+          PRIMARY KEY (message_id, content_id)
+        )
+      `;
+    }),
   } satisfies Record<`${number}_${string}`, any>),
 }).pipe(Layer.provideMerge(ClientLive));

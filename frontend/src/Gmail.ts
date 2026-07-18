@@ -428,14 +428,12 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       // them ("No 'Access-Control-Allow-Origin' header is present") even
       // though its OPTIONS response claims to allow them. The Gmail.request
       // span itself is unaffected — only the outgoing headers are dropped.
-      const response = yield* http
-        .execute(req)
-        .pipe(
-          Effect.provideService(HttpClient.TracerPropagationEnabled, false),
-          Effect.mapError(
-            (cause) => new GmailNetworkError({ message: String(cause) }),
-          ),
-        );
+      const response = yield* http.execute(req).pipe(
+        Effect.provideService(HttpClient.TracerPropagationEnabled, false),
+        Effect.mapError(
+          (cause) => new GmailNetworkError({ message: String(cause) }),
+        ),
+      );
 
       if (response.status < 200 || response.status >= 300) {
         const errorBody = yield* response.json.pipe(

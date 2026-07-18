@@ -136,7 +136,9 @@ const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
 // Everything the app's commands can require; entry.ts provides the
 // matching layers via `resources`.
 export type AppResources =
-  AuthClient | KeyValueStore.KeyValueStore | SyncEngine;
+  | AuthClient
+  | KeyValueStore.KeyValueStore
+  | SyncEngine;
 
 // The inbox page owns the LoadInbox command; wrapping its messages here
 // keeps the parent/child message boundary intact.
