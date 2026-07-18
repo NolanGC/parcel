@@ -1272,9 +1272,6 @@ const senderAvatarView = (avatar: Avatar, name: string): Html => {
 
 const categoryTagView = (category: Category): Html => {
   const h = html();
-  // "Other" is the absence of a category — a chip saying so (with its
-  // ellipsis icon on nearly every row) is noise, not information.
-  if (category === "other") return h.empty;
   const { label, icon, iconClass } = CATEGORIES[category];
 
   return h.span(
@@ -1353,8 +1350,13 @@ const emailRowView = (email: Email, isSelected: boolean): Html => {
           email.subjectIcon === "cloud"
             ? Icon.cloud("h-4 w-4 shrink-0 text-muted-foreground")
             : h.empty,
+          // The truncation ellipsis draws in the truncating element's own
+          // color — left unset it inherits full-contrast foreground and
+          // glows at the end of every clipped row. Muted here matches the
+          // preview text it's actually eliding; the subject's explicit
+          // color classes are unaffected.
           h.span(
-            [h.Class("min-w-0 truncate")],
+            [h.Class("min-w-0 truncate text-muted-foreground")],
             [
               h.span([h.Class(readState.subject)], [email.subject]),
               h.span([h.Class("mx-2 text-muted-foreground/50")], ["—"]),
