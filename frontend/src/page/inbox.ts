@@ -1341,8 +1341,11 @@ const messageBodyView = (
         border: "0",
         // Browsers paint srcdoc progressively as it parses; staying
         // hidden until the post-load measurement means the body appears
-        // fully laid out at final height in a single frame.
-        visibility: isMeasured ? "visible" : "hidden",
+        // fully laid out at final height in a single frame. "inherit",
+        // not "visible": visibility lets a child override a hidden
+        // ancestor, and a measured frame must not paint through the
+        // still-invisible prefetch pane.
+        visibility: isMeasured ? "inherit" : "hidden",
       }),
     ],
     [],
@@ -1486,7 +1489,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                             h.Class(
                               detailIsShown(model)
                                 ? ""
-                                : "invisible absolute inset-x-0 top-0",
+                                : "pointer-events-none invisible absolute inset-x-0 top-0",
                             ),
                           ],
                           [threadDetailView(model, detail)],
