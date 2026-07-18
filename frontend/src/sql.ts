@@ -3,12 +3,20 @@ import * as SqliteMigrator from "@effect/sql-sqlite-wasm/SqliteMigrator";
 import { Effect, Layer } from "effect";
 import { Migrator, SqlClient } from "effect/unstable/sql";
 
-// `?worker` to import as a module (`vite`)
-import SqlWorker from "./worker?worker";
-
+// The standards-based worker form (not `?worker` imports): Vite detects
+// this exact `new Worker(new URL(...), import.meta.url)` pattern and
+// bundles the worker, while bun — which imports this module tree directly
+// for the landing-page prerender — parses it as plain code instead of
+// choking on a `?worker` specifier. The worker is only constructed when
+// the layer builds, which the prerender never does.
 const ClientLive = SqliteClient.layer({
   worker: Effect.acquireRelease(
-    Effect.sync(() => new SqlWorker()),
+    Effect.sync(
+      () =>
+        new Worker(new URL("./worker.ts", import.meta.url), {
+          type: "module",
+        }),
+    ),
     (worker) => Effect.sync(() => worker.terminate()),
   ),
 });

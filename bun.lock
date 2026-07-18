@@ -71,6 +71,13 @@
         "@tauri-apps/cli": "^2",
       },
     },
+    "perf": {
+      "name": "@foldkit/perf",
+      "version": "0.0.0",
+      "dependencies": {
+        "playwright-core": "^1.50.0",
+      },
+    },
   },
   "patchedDependencies": {
     "alchemy@2.0.0-beta.59": "patches/alchemy@2.0.0-beta.59.patch",
@@ -272,6 +279,8 @@
     "@foldkit/devtools": ["@foldkit/devtools@0.122.1", "", { "dependencies": { "clsx": "^2.1.1" }, "peerDependencies": { "@foldkit/ui": "^0", "effect": "4.0.0-beta.88", "foldkit": "^0" } }, "sha512-o7bqwJEcOyKGH6ZJVzU84MDJthTfnGOyVHpvK2GpMFHhd4m6w+TQnkaBiI32n7oqQ7In4Y0Nfs6gNyuBzjp76A=="],
 
     "@foldkit/frontend": ["@foldkit/frontend@workspace:frontend"],
+
+    "@foldkit/perf": ["@foldkit/perf@workspace:perf"],
 
     "@foldkit/ui": ["@foldkit/ui@0.122.1", "", { "dependencies": { "@floating-ui/dom": "^1.7.6" }, "peerDependencies": { "effect": "4.0.0-beta.88", "foldkit": "^0" } }, "sha512-D8jQCp6LwGg2Pq3gCaXfGWIHyhbe0yzWBTkRYA/0DZXFY6cLLBQz+YvaFdeTVPw/NL0JKFyUKP79dSEkx0JgWg=="],
 
@@ -878,6 +887,8 @@
     "picocolors": ["picocolors@1.1.1", "", {}, "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA=="],
 
     "picomatch": ["picomatch@4.0.5", "", {}, "sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A=="],
+
+    "playwright-core": ["playwright-core@1.61.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-h7Qlt6m4REp25qvIdvbDtVmD4LqVXfpRxhORv9L0jzETM05p4fuPJ3dKyuSXQxDSbXnmS79HAgi9589lGSpLkg=="],
 
     "postcss": ["postcss@8.5.19", "", { "dependencies": { "nanoid": "^3.3.12", "picocolors": "^1.1.1", "source-map-js": "^1.2.1" } }, "sha512-Mz8SaolMd8nB+G13WkORcxQKHZ/NE4xXevtkJHVuG+guo9/wYKlIMTKAqGdEmYOXR2ijPjTYNHssizdaVSUNdQ=="],
 

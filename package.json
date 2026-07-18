@@ -6,7 +6,8 @@
   "workspaces": [
     "backend",
     "frontend",
-    "packages/desktop"
+    "packages/desktop",
+    "perf"
   ],
   "scripts": {
     "build": "tsc --noEmit",
@@ -20,6 +21,7 @@
     "destroy:branch": "alchemy destroy --stage pr-$(git branch --show-current | tr '[:upper:]/_' '[:lower:]--' | tr -cd 'a-z0-9-')",
     "clear": "pkill -f 'workerd serve' || true",
     "destroy": "alchemy destroy",
+    "perf": "bun perf/src/bench.ts",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --disable-nested-config .",

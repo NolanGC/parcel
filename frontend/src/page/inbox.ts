@@ -440,7 +440,13 @@ export const LoadThread = Command.define(
 )(({ id }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
+    // Timeline marks bracket the data phase (SQLite + decompress + cid
+    // rewrite; on a cold thread, the self-heal fetch too). The perf
+    // harness (perf/) reads them to split click→paint into phases; they
+    // also show up in the DevTools Performance panel.
+    yield* Effect.sync(() => performance.mark("parcel:data:start"));
     return yield* engine.loadThread(id).pipe(
+      Effect.tap(() => Effect.sync(() => performance.mark("parcel:data:end"))),
       Effect.map((detail) => GotThread({ detail })),
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadThread({ error: Cause.pretty(cause) })),
@@ -496,6 +502,7 @@ const MeasureBodyFrame = Command.define(
       frame instanceof HTMLIFrameElement
         ? (frame.contentDocument?.documentElement.scrollHeight ?? 0)
         : 0;
+    performance.mark(`parcel:measure:${messageId}`);
     return MeasuredBodyFrame({ messageId, height });
   }),
 );
@@ -1329,6 +1336,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                         h.keyed("div")(
                           "inbox-detail-pane",
                           [
+                            h.Id("inbox-detail-pane"),
                             h.Class(
                               detailIsReady(model)
                                 ? ""

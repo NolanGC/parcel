@@ -501,6 +501,40 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           return { id, subject, messages } satisfies ThreadDetail;
         });
 
+      // Dev-only hook for the perf harness (perf/src/bench.ts): read the
+      // listed thread ids in list order, and delete a thread's local
+      // content so the next open takes loadThread's self-heal (cold)
+      // path. Dead code in production builds — Vite replaces
+      // `import.meta.env.DEV` with false and drops the block.
+      if (import.meta.env.DEV) {
+        const makeThreadCold = (id: string) =>
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM message_bodies
+              WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ${id})
+            `;
+            yield* sql`
+              DELETE FROM message_attachments
+              WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ${id})
+            `;
+            yield* sql`
+              DELETE FROM message_labels
+              WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ${id})
+            `;
+            yield* sql`DELETE FROM messages WHERE thread_id = ${id}`;
+          });
+        const topThreads = Effect.gen(function* () {
+          const rows = yield* sql`
+            SELECT id FROM threads ORDER BY latest_date DESC LIMIT ${PULL_LIMIT}
+          `;
+          return rows.map((row) => String(row.id));
+        });
+        (globalThis as { __parcelPerf?: unknown }).__parcelPerf = {
+          topThreads: () => Effect.runPromise(topThreads),
+          makeThreadCold: (id: string) => Effect.runPromise(makeThreadCold(id)),
+        };
+      }
+
       return { loadInbox, loadThread, hydrateMissing, syncInbox } as const;
     }),
   },
