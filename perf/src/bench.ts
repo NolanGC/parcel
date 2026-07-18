@@ -352,7 +352,7 @@ const main = async () => {
       }),
       "warm-open": await runScenario(page, "warm-open", threads, {}),
       "warm-open-hover": await runScenario(page, "warm-open-hover", threads, {
-        hoverMs: 600,
+        hoverMs: 200,
       }),
     };
 

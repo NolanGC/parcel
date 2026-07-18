@@ -289,11 +289,11 @@ export const Model = S.Struct({
   // match is stale (the cursor moved on) and gets dropped — the load is
   // read-only, so discarding the result is the whole cancellation story.
   pendingLoad: S.Option(ThreadId),
-  // The row currently under the cursor; the dwell timer checks it hasn't
-  // changed before prefetching, so sweeping the list starts nothing.
-  hovered: S.Option(ThreadId),
-  // Keyboard cursor: the j/k-selected row index. Resting on a row
-  // prefetches it exactly like a mouse hover; Enter opens it.
+  // The single list cursor: mouse hover and j/k both move it (one row is
+  // "current" at a time — hover is not a second selection). Resting on a
+  // row prefetches it; Enter (or a click) opens it. The dwell timer
+  // checks the cursor hasn't moved before loading, so sweeping the list
+  // starts nothing.
   selected: S.Option(S.Number),
   // The adjacent-thread prefetch: while a thread is open, the next one
   // down is loaded here so back→next triage skips the data phase. One
@@ -315,7 +315,6 @@ export const init = (): Model => ({
   bodyHeights: {},
   openCommitted: false,
   pendingLoad: Option.none(),
-  hovered: Option.none(),
   selected: Option.none(),
   standby: Option.none(),
 });
@@ -764,8 +763,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           return [next, [...listCommands, ...openCommands]];
         }
 
-        // Entering a row tracks it as hovered and starts the prefetch
-        // dwell timer for its thread.
+        // Entering a row moves the cursor there (hover and j/k drive the
+        // same cursor) and starts the prefetch dwell timer.
         if (message._tag === "EnteredRow") {
           const id = Option.flatMap(
             model.threads,
@@ -773,7 +772,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
               Option.fromUndefinedOr(rows[message.index]?.id),
           );
           return [
-            evo(model, { list: () => list, hovered: () => id }),
+            evo(model, {
+              list: () => list,
+              selected: () =>
+                Option.isSome(id) ? Option.some(message.index) : model.selected,
+            }),
             [
               ...listCommands,
               ...Option.match(id, {
@@ -881,10 +884,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       },
 
       DwellElapsed: ({ id }) => {
-        // Mouse hover and the keyboard cursor are both "resting on" a row.
-        const stillIntended =
-          Option.exists(model.hovered, (hovered) => hovered === id) ||
-          selectedThreadId(model) === id;
+        const stillIntended = selectedThreadId(model) === id;
         const alreadyMounted = Option.exists(
           model.open,
           (detail) => detail.id === id,
@@ -1272,6 +1272,9 @@ const senderAvatarView = (avatar: Avatar, name: string): Html => {
 
 const categoryTagView = (category: Category): Html => {
   const h = html();
+  // "Other" is the absence of a category — a chip saying so (with its
+  // ellipsis icon on nearly every row) is noise, not information.
+  if (category === "other") return h.empty;
   const { label, icon, iconClass } = CATEGORIES[category];
 
   return h.span(
@@ -1300,8 +1303,10 @@ const READ_STATE = {
 
 // No hover style on the row itself: the Table's traveling overlay carries
 // the hover state, so panning glides instead of blinking per row. The
-// keyboard selection is persistent (not transient like hover), so it does
-// live on the row.
+// cursor (mouse and j/k move the same one) is marked by a thin accent
+// bar — deliberately not the overlay's wash, so on the one occasion both
+// are visible (mouse parked on the list while keyboarding) they read as
+// different things, not two hovers.
 const emailRowView = (email: Email, isSelected: boolean): Html => {
   const h = html();
   const readState = READ_STATE[email.isRead ? "read" : "unread"];
@@ -1309,10 +1314,11 @@ const emailRowView = (email: Email, isSelected: boolean): Html => {
   return h.div(
     [
       h.Class(
-        `flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3 ${
-          isSelected ? "bg-active" : ""
-        }`,
+        "flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3",
       ),
+      ...(isSelected
+        ? [h.Style({ boxShadow: `inset 2px 0 0 0 ${AVATAR_BG}` })]
+        : []),
     ],
     [
       // Sender
