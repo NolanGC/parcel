@@ -15,9 +15,10 @@ import { Option } from "effect";
 import { Scene } from "foldkit";
 import { describe, test } from "vitest";
 
+import { ThreadId } from "./Gmail";
 import { update, view, type Model } from "./main";
 import { Inbox, Login } from "./page";
-import { HomeRoute, LoginRoute } from "./route";
+import { HomeRoute, InboxRoute, LoginRoute } from "./route";
 
 const loggedInModel: Model = {
   _tag: "LoggedIn",
@@ -77,6 +78,43 @@ describe("view", () => {
       Scene.with(loggedInModel),
       Scene.expect(Scene.role("link", { name: "Open your inbox →" })).toExist(),
       Scene.expect(Scene.role("button", { name: "Sign out" })).toExist(),
+    );
+  });
+
+  // Renders the inbox route so the virtualized list submodel actually builds
+  // (its itemToView/itemToKey viewInputs pass foldkit's walker). The list
+  // container starts Unmeasured — no ResizeObserver fires in a Scene — so the
+  // window is empty; we assert the section and the list container are present.
+  test("the inbox route renders the list section", () => {
+    const inboxModel: Model = {
+      _tag: "LoggedIn",
+      route: InboxRoute(),
+      session: {
+        userId: UserId.make("user-ada"),
+        email: "ada@example.com",
+        name: "Ada",
+      },
+      inboxPage: {
+        ...Inbox.init(),
+        threads: Option.some([
+          {
+            id: ThreadId.make("thread-1"),
+            subject: "Hi",
+            sender: "Ada",
+            snippet: "hello",
+            date: 1,
+            unread: false,
+            category: "none" as const,
+          },
+        ]),
+      },
+    };
+
+    Scene.scene(
+      { update, view },
+      Scene.with(inboxModel),
+      Scene.expect(Scene.text("Inbox")).toExist(),
+      Scene.expect(Scene.role("list")).toExist(),
     );
   });
 });

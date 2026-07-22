@@ -22,7 +22,6 @@ import { CompletedSignOut, GotSession } from "./auth";
 import { MessageId, ThreadId } from "./Gmail";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox } from "./page";
-import * as Ui from "./ui";
 
 const session = {
   userId: UserId.make("user-1"),
@@ -127,67 +126,61 @@ describe("update", () => {
     expect(next.route._tag).toBe("Home");
   });
 
-  test("clicking a list row issues LoadThread for that thread", () => {
-    const [model] = init(loggedInFlags, url("/inbox"));
-    const [, commands] = update(
-      model,
-      GotInboxMessage({
-        message: Inbox.GotListMessage({
-          message: Ui.Table.ClickedRow({ key: "thread-1" }),
-        }),
-      }),
-    );
+  const threadRow = {
+    id: ThreadId.make("thread-1"),
+    subject: "Hi",
+    sender: "Ada",
+    snippet: "hello",
+    date: 1,
+    unread: false,
+    category: "none" as const,
+  };
 
-    expect(commands.map((command) => command.name)).toContain("LoadThread");
-  });
+  const inboxMessage = (message: Inbox.Message) => GotInboxMessage({ message });
 
-  test("hovering a row starts the dwell timer; dwell prefetches it", () => {
-    const threadRow = {
-      id: ThreadId.make("thread-1"),
-      subject: "Hi",
-      sender: "Ada",
-      snippet: "hello",
-      date: 1,
-      unread: false,
-      category: "none" as const,
-    };
-    const inboxMessage = (message: Inbox.Message) =>
-      GotInboxMessage({ message });
-
+  const loadedInbox = (): Model => {
     const [model] = init(loggedInFlags, url("/inbox"));
     const [withThreads] = update(
       model,
       inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
     );
-    const [hovered, hoverCommands] = update(
-      withThreads,
-      inboxMessage(
-        Inbox.GotListMessage({ message: Ui.Table.EnteredRow({ index: 0 }) }),
-      ),
-    );
-    expect(hoverCommands.map((command) => command.name)).toContain(
-      "StartDwell",
-    );
+    return withThreads;
+  };
 
-    const [, dwellCommands] = update(
-      hovered,
-      inboxMessage(Inbox.DwellElapsed({ id: threadRow.id })),
+  test("clicking a list row issues LoadThread for that thread", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.OpenedRow({ index: 0 })),
     );
-    expect(dwellCommands.map((command) => command.name)).toContain(
-      "LoadThread",
-    );
+    expect(commands.map((command) => command.name)).toContain("LoadThread");
   });
 
-  test("a prefetched thread mounts silently and swaps on click", () => {
-    const threadRow = {
-      id: ThreadId.make("thread-1"),
-      subject: "Hi",
-      sender: "Ada",
-      snippet: "hello",
-      date: 1,
-      unread: false,
-      category: "none" as const,
-    };
+  test("hovering a row moves the list cursor to it", () => {
+    const [next] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.HoveredRow({ index: 0 })),
+    );
+    expect(next.inboxPage.selected).toEqual(Option.some(0));
+  });
+
+  test("j selects the first row and scrolls it into view; Enter opens it", () => {
+    const [selected, moveCommands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.PressedListKey({ key: "j" })),
+    );
+    expect(selected.inboxPage.selected).toEqual(Option.some(0));
+    expect(moveCommands.map((command) => command.name)).toEqual([
+      "ScrollListToRow",
+    ]);
+
+    const [, openCommands] = update(
+      selected,
+      inboxMessage(Inbox.PressedListKey({ key: "Enter" })),
+    );
+    expect(openCommands.map((command) => command.name)).toContain("LoadThread");
+  });
+
+  test("GotThread shows the detail; Escape closes it back to the list", () => {
     const detail = {
       id: threadRow.id,
       subject: "Hi",
@@ -202,115 +195,19 @@ describe("update", () => {
         },
       ],
     };
-    const inboxMessage = (message: Inbox.Message) =>
-      GotInboxMessage({ message });
 
-    const [model] = init(loggedInFlags, url("/inbox"));
-    const [withThreads] = update(
-      model,
-      inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
+    const [opening] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.OpenedRow({ index: 0 })),
     );
-    const [hovered] = update(
-      withThreads,
-      inboxMessage(
-        Inbox.GotListMessage({ message: Ui.Table.EnteredRow({ index: 0 }) }),
-      ),
-    );
-    const [loading] = update(
-      hovered,
-      inboxMessage(Inbox.DwellElapsed({ id: threadRow.id })),
-    );
+    const [open] = update(opening, inboxMessage(Inbox.GotThread({ detail })));
+    expect(Option.isSome(open.inboxPage.open)).toBe(true);
 
-    // The prefetch result mounts invisibly: no scroll reset, no swap.
-    const [mounted, mountCommands] = update(
-      loading,
-      inboxMessage(Inbox.GotThread({ detail })),
+    const [closed] = update(
+      open,
+      inboxMessage(Inbox.PressedListKey({ key: "Escape" })),
     );
-    expect(mountCommands.map((command) => command.name)).not.toContain(
-      "ResetScroll",
-    );
-
-    // The click commits; an all-plain (already-ready) thread swaps now.
-    const [, clickCommands] = update(
-      mounted,
-      inboxMessage(
-        Inbox.GotListMessage({
-          message: Ui.Table.ClickedRow({ key: "thread-1" }),
-        }),
-      ),
-    );
-    expect(clickCommands.map((command) => command.name)).toContain(
-      "ResetScroll",
-    );
-  });
-
-  test("j selects the first row and Enter opens it", () => {
-    const threadRow = {
-      id: ThreadId.make("thread-1"),
-      subject: "Hi",
-      sender: "Ada",
-      snippet: "hello",
-      date: 1,
-      unread: false,
-      category: "none" as const,
-    };
-    const inboxMessage = (message: Inbox.Message) =>
-      GotInboxMessage({ message });
-
-    const [model] = init(loggedInFlags, url("/inbox"));
-    const [withThreads] = update(
-      model,
-      inboxMessage(Inbox.GotThreads({ rows: [threadRow] })),
-    );
-    const [selected, moveCommands] = update(
-      withThreads,
-      inboxMessage(Inbox.PressedListKey({ key: "j" })),
-    );
-    // Moving the cursor claims the Table overlay (measuring rects, since
-    // this session never hovered), scrolls the row into view, and starts
-    // the prefetch dwell.
-    expect(moveCommands.map((command) => command.name)).toEqual([
-      "MeasureRowRects",
-      "ScrollRowIntoView",
-      "StartDwell",
-    ]);
-
-    const [, openCommands] = update(
-      selected,
-      inboxMessage(Inbox.PressedListKey({ key: "Enter" })),
-    );
-    expect(openCommands.map((command) => command.name)).toContain("LoadThread");
-  });
-
-  test("an open prefetches the adjacent thread into standby", () => {
-    const row = (n: number) => ({
-      id: ThreadId.make(`thread-${n}`),
-      subject: `S${n}`,
-      sender: "Ada",
-      snippet: "hello",
-      date: n,
-      unread: false,
-      category: "none" as const,
-    });
-    const inboxMessage = (message: Inbox.Message) =>
-      GotInboxMessage({ message });
-
-    const [model] = init(loggedInFlags, url("/inbox"));
-    const [withThreads] = update(
-      model,
-      inboxMessage(Inbox.GotThreads({ rows: [row(1), row(2)] })),
-    );
-    const [, openCommands] = update(
-      withThreads,
-      inboxMessage(
-        Inbox.GotListMessage({
-          message: Ui.Table.ClickedRow({ key: "thread-1" }),
-        }),
-      ),
-    );
-    expect(openCommands.map((command) => command.name)).toContain(
-      "PrefetchStandby",
-    );
+    expect(Option.isNone(closed.inboxPage.open)).toBe(true);
   });
 
   test("the inbox popover's sign-out runs the SignOut command", () => {

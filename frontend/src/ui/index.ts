@@ -19,5 +19,5 @@ export * from "./switch";
 export * as Menu from "./menu";
 export * as Palette from "./palette";
 export * as Popover from "./popover";
-export * as Table from "./table";
 export * as Tabs from "./tabs";
+export * as VirtualList from "./virtualList";

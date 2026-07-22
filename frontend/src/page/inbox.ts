@@ -5,7 +5,7 @@ import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
 
 import * as Icon from "../icons";
-import { MessageId, ThreadId } from "../Gmail";
+import { ThreadId } from "../Gmail";
 import {
   CACHE_TIER,
   SyncEngine,
@@ -17,76 +17,49 @@ import {
 } from "../sync";
 import * as Ui from "../ui";
 
-// The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors
-// come from the surface ladder + overlay tokens in styles.css, motion
-// from the spring tiers in ui/motion.ts — no view here names a raw color
-// or duration. Rows are real threads pulled through the SyncEngine
-// (Gmail → local SQLite → this list); the folder dropdown, tabs, and
-// palette remain chrome.
+// The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors come
+// from the surface ladder + overlay tokens in styles.css, motion from the
+// spring tiers in ui/motion.ts. Rows are real threads pulled through the
+// SyncEngine (Gmail → local SQLite → this list); the folder dropdown, tabs,
+// and palette are chrome.
 
-// The whole page sits on surface 1; everything that opens from it derives
-// its own level from this substrate.
 const PAGE_SURFACE = Ui.SurfaceLevel.make(1);
 
-// APPEARANCE
-//
-// System follows the OS via CSS color-scheme; Light/Dark pin a class on
-// <html> so the light-dark() tokens re-resolve. The swap is a Command (DOM
-// side effect), wrapped in a 180ms cross-fade (html.transitioning).
+// The virtualized list: rows are a fixed height so the visible window and the
+// traveling hover overlay are both pure arithmetic (index * ROW_HEIGHT).
+const LIST_ID = "inbox-list";
+const ROW_HEIGHT = 53;
+const LIST_OVERSCAN = 6;
+
+// Html email bodies render in a sandboxed iframe at a fixed height and scroll
+// internally — no content measurement, no pane pre-mounting.
+const BODY_FRAME_HEIGHT = 600;
+
+// APPEARANCE — System follows the OS; Light/Dark pin a class on <html> so the
+// light-dark() tokens re-resolve, wrapped in a 180ms cross-fade.
 
 export const Appearance = S.Literals(["System", "Light", "Dark"]);
 export type Appearance = typeof Appearance.Type;
 
 // DATA
 
-/** Avatar tiles are "content colors" — deliberately outside the surface
- *  token system, like a favicon. The brand marks them as validated raw
- *  colors rather than free strings that bypass the design tokens. */
 const HexColor = S.String.check(
   S.isPattern(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/),
 ).pipe(S.brand("HexColor"));
 type HexColor = typeof HexColor.Type;
 
-type Category =
-  | "todo"
-  | "newsletter"
-  | "reminder"
-  | "promotions"
-  | "primary"
-  | "vacation"
-  | "other";
-
-type Avatar =
-  | { kind: "image"; src: string }
-  | {
-      kind: "tile";
-      bg: HexColor;
-      fg: HexColor;
-      label: string;
-      serif?: boolean;
-      rounded?: boolean;
-    };
+type Category = "promotions" | "primary" | "other";
 
 type Email = {
-  id: string;
   sender: string;
-  groupCount?: number;
-  avatar: Avatar;
-  unread?: boolean;
-  /** Read rows drop the unread dot and recede: sender and subject render in
-   *  the muted text color instead of full-contrast foreground. */
-  isRead?: boolean;
-  subjectIcon?: "cloud";
+  unread: boolean;
   subject: string;
   preview: string;
   category: Category;
   time: string;
-  attachment?: boolean;
 };
 
-// Gmail's real category labels mapped onto the chip set the design
-// defines. Categories without an honest counterpart land on "other"
-// rather than pretending.
+// Gmail's category labels mapped onto the chip set the design defines.
 const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
   personal: "primary",
   promotions: "promotions",
@@ -96,13 +69,12 @@ const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
   none: "other",
 };
 
-// Real senders have no avatar images yet, so every row wears an initial
-// tile in the app accent — same shape the profile chip uses.
+// Sender tiles are "content colors" — deliberately outside the surface token
+// system, like a favicon.
 const AVATAR_BG = HexColor.make("#4f46e5");
 const AVATAR_FG = HexColor.make("#ffffff");
 
-// Same-day threads show the clock, older ones the date — matching the
-// format the design used.
+// Same-day threads show the clock, older ones the date.
 const formatTime = (epochMs: number): string => {
   const date = new Date(epochMs);
   const now = new Date();
@@ -115,39 +87,17 @@ const formatTime = (epochMs: number): string => {
 };
 
 const emailFromThreadRow = (row: ThreadRow): Email => ({
-  id: row.id,
   sender: row.sender,
-  avatar: {
-    kind: "tile",
-    bg: AVATAR_BG,
-    fg: AVATAR_FG,
-    label: (row.sender.slice(0, 1) || "?").toUpperCase(),
-    rounded: true,
-  },
   unread: row.unread,
-  isRead: !row.unread,
   subject: row.subject,
   preview: row.snippet,
   category: CATEGORY_FROM_THREAD[row.category],
   time: formatTime(row.date),
 });
 
-type CategoryConfig = {
-  label: string;
-  icon: Ui.IconView;
-  iconClass: string;
-};
+type CategoryConfig = { label: string; icon: Ui.IconView; iconClass: string };
 
-// Category accents are content colors, not theme tokens — they stay fixed
-// across themes (like avatar tiles).
 const CATEGORIES: Record<Category, CategoryConfig> = {
-  todo: { label: "To-do", icon: Icon.circleCheck, iconClass: "" },
-  newsletter: {
-    label: "Newsletter",
-    icon: Icon.leaf,
-    iconClass: "text-green-500",
-  },
-  reminder: { label: "Reminder", icon: Icon.bell, iconClass: "text-amber-400" },
   promotions: {
     label: "Promotions",
     icon: Icon.hand,
@@ -157,11 +107,6 @@ const CATEGORIES: Record<Category, CategoryConfig> = {
     label: "Primary",
     icon: Icon.circleUser,
     iconClass: "text-blue-400",
-  },
-  vacation: {
-    label: "Vacation",
-    icon: Icon.palmtree,
-    iconClass: "text-orange-400",
   },
   other: { label: "Other", icon: Icon.ellipsis, iconClass: "" },
 };
@@ -228,13 +173,8 @@ const FOLDERS: Record<FolderLabel, { icon: Ui.IconView; count?: number }> = {
 
 const FolderMenu = Ui.Menu.create<FolderLabel>();
 
-// COMMAND PALETTE
-//
-// The palette is the app's primary control surface (⌘K, or the toolbar
-// search button). Its corpus is everything the chrome used to hold:
-// actions, folder navigation, and the emails themselves. Items are plain
-// strings; specs resolve through lookup maps so the viewInputs carry only
-// one top-level function.
+// COMMAND PALETTE — the app's primary control surface (⌘K, or the toolbar
+// search button). Items are plain strings; specs resolve through lookup maps.
 
 const PALETTE_ACTIONS = ["Compose", "Toggle dark mode"] as const;
 
@@ -247,9 +187,6 @@ const ACTION_SPECS: Record<string, Ui.Palette.PaletteItemSpec> = {
   },
 };
 
-// The palette's corpus is actions and folders. Emails will join once the
-// palette can open a real thread — items would come from the model's rows,
-// not a static module-level list.
 const PALETTE_GROUPS: ReadonlyArray<Ui.Palette.Group<string>> = [
   { label: "Actions", items: PALETTE_ACTIONS },
   { label: "Folders", items: FOLDER_LABELS },
@@ -269,38 +206,21 @@ export const Model = S.Struct({
   appearance: Appearance,
   folderMenu: Ui.Menu.Model,
   tabs: Ui.Tabs.Model,
-  list: Ui.Table.Model,
+  list: Ui.VirtualList.Model,
   palette: Ui.Palette.Model,
   accountPopover: Ui.Popover.Model,
   // None = the first load hasn't completed; Some([]) = a genuinely empty
   // inbox. loadError keeps the last failure for the list to surface.
   threads: S.Option(S.Array(ThreadRow)),
   loadError: S.Option(S.String),
-  // The mounted thread detail — visible once committed and measured, or
-  // an invisible hover-prefetch pre-mount until then. Bodies live in the
-  // model only while mounted — closing (or mounting another thread)
-  // evicts them; the local database remains the working set.
+  // The open thread's detail, shown in place of the list. None = the list is
+  // showing. pendingLoad is the thread a LoadThread is in flight for; a
+  // GotThread that doesn't match is stale and dropped.
   open: S.Option(ThreadDetail),
-  // Measured srcdoc-iframe content heights by message id, set once per
-  // body after its load event so the frame fits its content exactly.
-  bodyHeights: S.Record(S.String, S.Number),
-  // True only after a real click: the pane swap requires it, so a hover
-  // prefetch can mount and measure without ever changing the screen.
-  openCommitted: S.Boolean,
-  // The thread a LoadThread is in flight for. A GotThread that doesn't
-  // match is stale (the cursor moved on) and gets dropped — the load is
-  // read-only, so discarding the result is the whole cancellation story.
   pendingLoad: S.Option(ThreadId),
-  // The single list cursor: mouse hover and j/k both move it (one row is
-  // "current" at a time — hover is not a second selection). Resting on a
-  // row prefetches it; Enter (or a click) opens it. The dwell timer
-  // checks the cursor hasn't moved before loading, so sweeping the list
-  // starts nothing.
+  // The single list cursor: mouse hover and j/k both move it. Drives the
+  // traveling hover overlay; Enter (or a click) opens it.
   selected: S.Option(S.Number),
-  // The adjacent-thread prefetch: while a thread is open, the next one
-  // down is loaded here so back→next triage skips the data phase. One
-  // slot, silently replaced — never shown directly.
-  standby: S.Option(ThreadDetail),
 });
 export type Model = typeof Model.Type;
 
@@ -308,17 +228,14 @@ export const init = (): Model => ({
   appearance: "System",
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
   tabs: Ui.Tabs.init({ id: "inbox-tabs" }),
-  list: Ui.Table.init({ id: "inbox-list" }),
+  list: Ui.VirtualList.init({ id: LIST_ID, rowHeightPx: ROW_HEIGHT }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
   threads: Option.none(),
   loadError: Option.none(),
   open: Option.none(),
-  bodyHeights: {},
-  openCommitted: false,
   pendingLoad: Option.none(),
   selected: Option.none(),
-  standby: Option.none(),
 });
 
 // MESSAGE
@@ -327,14 +244,16 @@ export const GotFolderMenuMessage = m("GotFolderMenuMessage", {
   message: Ui.Menu.Message,
 });
 export const CompletedApplyAppearance = m("CompletedApplyAppearance");
-export const GotTabsMessage = m("GotTabsMessage", {
-  message: Ui.Tabs.Message,
-});
+export const GotTabsMessage = m("GotTabsMessage", { message: Ui.Tabs.Message });
+/** Scroll/resize events from the VirtualList's container subscription. */
 export const GotListMessage = m("GotListMessage", {
-  message: Ui.Table.Message,
+  message: Ui.VirtualList.Message,
 });
-/** Toggles the command palette — from the toolbar button or the global ⌘K
- *  subscription in main.ts. A second ⌘K while open closes it. */
+/** Mouse entered a row: move the cursor (and the hover overlay) there. */
+export const HoveredRow = m("HoveredRow", { index: S.Number });
+/** A row was clicked: open its thread. */
+export const OpenedRow = m("OpenedRow", { index: S.Number });
+/** Toggles the command palette — toolbar button or the global ⌘K sub. */
 export const OpenedPalette = m("OpenedPalette");
 export const GotPaletteMessage = m("GotPaletteMessage", {
   message: Ui.Palette.Message,
@@ -342,47 +261,32 @@ export const GotPaletteMessage = m("GotPaletteMessage", {
 export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
   message: Ui.Popover.Message,
 });
-/** The popover's sign-out action. The session lives on the top-level model,
- *  so main.ts watches for this tag inside GotInboxMessage and runs the
- *  actual SignOut command; here it only closes the popover. */
+/** The popover's sign-out action. main.ts owns the session, so it watches for
+ *  this tag and runs SignOut; here it only closes the popover. */
 export const ClickedSignOut = m("InboxClickedSignOut");
-/** The SyncEngine finished a pull: real thread rows, read back from the
- *  local database. */
+/** The SyncEngine finished a pull: real thread rows from the local store. */
 export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
 export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
-/** Background hydration finished: rows re-read after threads missing
- *  local content were fully synced. Terminal — issues no further
- *  commands, so GotThreads → hydrate can't loop. */
+/** Background hydration finished: rows re-read after missing content synced. */
 export const GotHydratedThreads = m("GotHydratedThreads", {
   rows: S.Array(ThreadRow),
 });
 export const GotThread = m("GotThread", { detail: ThreadDetail });
-/** The hover dwell elapsed for a row: if the cursor is still there, its
- *  thread gets prefetched and pre-mounted invisibly. */
-export const DwellElapsed = m("DwellElapsed", { id: ThreadId });
-/** The adjacent-thread prefetch landed (or silently didn't). */
-export const GotStandbyThread = m("GotStandbyThread", { detail: ThreadDetail });
-export const StandbyFailed = m("StandbyFailed");
-/** List keyboard nav from the global subscription in main.ts: j/k move
- *  the selection, Enter opens it, Escape leaves an open thread. */
+/** List keyboard nav from the global subscription in main.ts. */
 export const PressedListKey = m("PressedListKey", {
   key: S.Literals(["j", "k", "Enter", "Escape"]),
 });
 export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
-/** An html body's iframe finished loading — time to measure it. */
-export const LoadedBodyFrame = m("LoadedBodyFrame", { messageId: MessageId });
-export const CompletedScrollReset = m("CompletedScrollReset");
-export const MeasuredBodyFrame = m("MeasuredBodyFrame", {
-  messageId: MessageId,
-  height: S.Number,
-});
+export const CompletedListScroll = m("CompletedListScroll");
 
 export const Message = S.Union([
   GotFolderMenuMessage,
   CompletedApplyAppearance,
   GotTabsMessage,
   GotListMessage,
+  HoveredRow,
+  OpenedRow,
   OpenedPalette,
   GotPaletteMessage,
   GotAccountPopoverMessage,
@@ -391,24 +295,15 @@ export const Message = S.Union([
   FailedLoadInbox,
   GotHydratedThreads,
   GotThread,
-  DwellElapsed,
-  GotStandbyThread,
-  StandbyFailed,
   PressedListKey,
   FailedLoadThread,
   ClickedBack,
-  LoadedBodyFrame,
-  MeasuredBodyFrame,
-  CompletedScrollReset,
+  CompletedListScroll,
 ]);
 export type Message = typeof Message.Type;
 
 // COMMAND
 
-// Pins (or releases) the theme on <html> so every light-dark() token
-// re-resolves, wrapped in the 180ms cross-fade class from styles.css. The
-// cross-fade cleanup stays inside the effect (no detached setTimeout), so
-// the runtime owns the timer's lifetime.
 const ApplyAppearance = Command.define(
   "ApplyAppearance",
   { appearance: Appearance },
@@ -429,8 +324,7 @@ const ApplyAppearance = Command.define(
 );
 
 // Pulls one page of real inbox threads through the SyncEngine
-// (Gmail → SQLite → rows). Triggered by main.ts on entering the
-// logged-in inbox; the runtime's resources provide the SyncEngine.
+// (Gmail → SQLite → rows). Triggered by main.ts on entering the inbox.
 export const LoadInbox = Command.define(
   "LoadInbox",
   GotThreads,
@@ -440,8 +334,6 @@ export const LoadInbox = Command.define(
     const engine = yield* SyncEngine;
     return yield* engine.loadInbox.pipe(
       Effect.map((rows) => GotThreads({ rows })),
-      // catchCause, not catch: a defect (e.g. an orDie'd own-schema decode)
-      // must surface as a visible failure, not kill the fiber silently.
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
       ),
@@ -450,8 +342,7 @@ export const LoadInbox = Command.define(
 );
 
 // Pulls full content for any listed thread that has none locally, then
-// re-reads the rows. Issued right after GotThreads so the list is already
-// painted; once this lands, every listed thread opens without a fetch.
+// re-reads the rows. Issued right after GotThreads so the list is painted.
 const HydrateInbox = Command.define(
   "HydrateInbox",
   GotHydratedThreads,
@@ -468,9 +359,8 @@ const HydrateInbox = Command.define(
   }),
 );
 
-// Opens a thread from the local store only: SQLite rows, bodies gunzipped
-// on the fly, cid: images rewritten from locally cached bytes — no
-// network on this path, which is what makes opening instant post-sync.
+// Opens a thread from the local store only: SQLite rows, bodies gunzipped on
+// the fly, cid: images rewritten from locally cached bytes — no network.
 export const LoadThread = Command.define(
   "LoadThread",
   { id: ThreadId },
@@ -479,13 +369,7 @@ export const LoadThread = Command.define(
 )(({ id }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    // Timeline marks bracket the data phase (SQLite + decompress + cid
-    // rewrite; on a cold thread, the self-heal fetch too). The perf
-    // harness (perf/) reads them to split click→paint into phases; they
-    // also show up in the DevTools Performance panel.
-    yield* Effect.sync(() => performance.mark("parcel:data:start"));
     return yield* engine.loadThread(id).pipe(
-      Effect.tap(() => Effect.sync(() => performance.mark("parcel:data:end"))),
       Effect.map((detail) => GotThread({ detail })),
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadThread({ error: Cause.pretty(cause) })),
@@ -494,117 +378,26 @@ export const LoadThread = Command.define(
   }),
 );
 
-// The hover→prefetch debounce: entering a row (by mouse or by j/k) starts
-// this timer, and the DwellElapsed handler checks the cursor is still on
-// the same row before loading anything — so sweeping across the whole
-// list starts timers, not loads.
-const StartDwell = Command.define(
-  "StartDwell",
-  { id: ThreadId },
-  DwellElapsed,
-)(({ id }) =>
-  Effect.gen(function* () {
-    yield* Effect.sleep("100 millis");
-    return DwellElapsed({ id });
-  }),
-);
-
-// The adjacent-thread prefetch: same read as LoadThread, but the result
-// parks in the standby slot and failure is silent — nobody asked for
-// this thread yet, and a real open of it would retry the load anyway.
-const PrefetchStandby = Command.define(
-  "PrefetchStandby",
-  { id: ThreadId },
-  GotStandbyThread,
-  StandbyFailed,
-)(({ id }) =>
-  Effect.gen(function* () {
-    const engine = yield* SyncEngine;
-    return yield* engine.loadThread(id).pipe(
-      Effect.map((detail) => GotStandbyThread({ detail })),
-      Effect.catchCause(() => Effect.succeed(StandbyFailed())),
-    );
-  }),
-);
-
-// Keeps the keyboard selection on screen. The DOM id mirrors the Table's
-// row-id scheme (`<table id>-row-<index>`) for the "inbox-list" table.
-const ScrollRowIntoView = Command.define(
-  "ScrollRowIntoView",
+// Keeps the keyboard cursor on screen. Row positions are known from the fixed
+// row height, so this scrolls the container directly — the target row need
+// not be mounted (it usually isn't, which is why scrollIntoView won't do).
+const ScrollListToRow = Command.define(
+  "ScrollListToRow",
   { index: S.Number },
-  CompletedScrollReset,
+  CompletedListScroll,
 )(({ index }) =>
   Effect.sync(() => {
-    document
-      .getElementById(`inbox-list-row-${index}`)
-      ?.scrollIntoView({ block: "nearest" });
-    return CompletedScrollReset();
-  }),
-);
-
-const frameId = (messageId: string): string => `body-frame-${messageId}`;
-const SCROLL_ID = "inbox-scroll";
-
-// The list ↔ detail pane swap happens on this flag: the detail pane stays
-// invisible (loading and measuring its iframes at final geometry behind
-// the list) until every html body has a real height — so when the screen
-// changes, the whole email is already painted.
-const detailIsReady = (model: Model): boolean =>
-  Option.match(model.open, {
-    onNone: () => false,
-    onSome: (detail) =>
-      detail.messages.every(
-        (message) =>
-          message.bodyKind !== "html" ||
-          (model.bodyHeights[message.id] ?? 0) > 0,
-      ),
-  });
-
-// Ready alone isn't enough to change the screen: a hover prefetch mounts
-// and measures without a click, so the swap also requires the commit.
-const detailIsShown = (model: Model): boolean =>
-  model.openCommitted && detailIsReady(model);
-
-// The scroll container survives the pane swap (both panes live inside
-// it), so entering and leaving a thread resets it explicitly — otherwise
-// the detail opens at the list's scroll offset.
-const ResetScroll = Command.define(
-  "ResetScroll",
-  CompletedScrollReset,
-)(
-  Effect.sync(() => {
-    const container = document.getElementById(SCROLL_ID);
-    if (container !== null) container.scrollTop = 0;
-    return CompletedScrollReset();
-  }),
-);
-
-// Reads the loaded iframe's content height (a DOM read is a side effect,
-// so it lives in a command). The height lands in the model and the frame
-// is sized once — content never scrolls inside the frame, the column
-// scrolls as one surface.
-const MeasureBodyFrame = Command.define(
-  "MeasureBodyFrame",
-  { messageId: MessageId, finalize: S.Boolean },
-  MeasuredBodyFrame,
-)(({ messageId, finalize }) =>
-  Effect.sync(() => {
-    const frame = document.getElementById(frameId(messageId));
-    const height =
-      frame instanceof HTMLIFrameElement
-        ? (frame.contentDocument?.documentElement.scrollHeight ?? 0)
-        : 0;
-    // When this is the last measurement a committed open waits on, the
-    // swap renders on the next dispatch — resetting the scroll here, in
-    // the same task, guarantees the detail's first painted frame is
-    // already at the top instead of one command-hop (a frame) later. The
-    // ResetScroll issued by the update stays as an idempotent fallback.
-    if (finalize && height > 0) {
-      const container = document.getElementById(SCROLL_ID);
-      if (container !== null) container.scrollTop = 0;
+    const element = document.getElementById(LIST_ID);
+    if (element !== null) {
+      const top = index * ROW_HEIGHT;
+      const bottom = top + ROW_HEIGHT;
+      if (top < element.scrollTop) {
+        element.scrollTop = top;
+      } else if (bottom > element.scrollTop + element.clientHeight) {
+        element.scrollTop = bottom - element.clientHeight;
+      }
     }
-    performance.mark(`parcel:measure:${messageId}`);
-    return MeasuredBodyFrame({ messageId, height });
+    return CompletedListScroll();
   }),
 );
 
@@ -615,106 +408,35 @@ type UpdateReturn = readonly [
   ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
 ];
 
-const selectedThreadId = (model: Model): ThreadId | undefined =>
-  Option.match(model.selected, {
-    onNone: () => undefined,
-    onSome: (index) =>
-      Option.match(model.threads, {
-        onNone: () => undefined,
-        onSome: (rows) => rows[index]?.id,
-      }),
-  });
-
-// While a thread is open, quietly load the next listed one into standby —
-// read-back-then-next is the dominant triage motion, and this removes its
-// data phase entirely.
-const adjacentPrefetch = (
-  model: Model,
-  id: ThreadId,
-): ReadonlyArray<Command.Command<Message, never, SyncEngine>> =>
+const threadIdAt = (model: Model, index: number): ThreadId | undefined =>
   Option.match(model.threads, {
-    onNone: () => [],
-    onSome: (rows) => {
-      const index = rows.findIndex((row) => row.id === id);
-      const next = index === -1 ? undefined : rows[index + 1];
-      return next === undefined ||
-        Option.exists(model.standby, (detail) => detail.id === next.id)
-        ? []
-        : [PrefetchStandby({ id: next.id })];
-    },
+    onNone: () => undefined,
+    onSome: (rows) => rows[index]?.id,
   });
 
-// The one open path — row clicks and the Enter key both funnel here. It
-// commits the thread and reuses whatever the prefetch machinery already
-// built: a pre-mounted pane just flips, an in-flight load just commits, a
-// standby detail mounts without touching SQLite, and only a completely
-// unknown thread issues a fresh LoadThread.
-const openThread = (model: Model, id: ThreadId): UpdateReturn => {
-  const prefetch = adjacentPrefetch(model, id);
-  // Opening by any means moves the keyboard cursor with it.
-  const rowIndex = Option.flatMap(model.threads, (rows) => {
-    const index = rows.findIndex((row) => row.id === id);
-    return index === -1 ? Option.none<number>() : Option.some(index);
-  });
-  const base = evo(model, {
-    selected: () => Option.orElse(rowIndex, () => model.selected),
-  });
-
-  if (Option.exists(base.open, (detail) => detail.id === id)) {
-    const next = evo(base, { openCommitted: () => true });
-    return [
-      next,
-      [
-        ...(detailIsShown(next) && !detailIsShown(base) ? [ResetScroll()] : []),
-        ...prefetch,
-      ],
-    ];
+// Row clicks and the Enter key both funnel here: move the cursor to the row
+// and, unless its thread is already open, load it.
+const openThread = (model: Model, index: number): UpdateReturn => {
+  const id = threadIdAt(model, index);
+  const base = evo(model, { selected: () => Option.some(index) });
+  if (id === undefined || Option.exists(base.open, (open) => open.id === id)) {
+    return [base, []];
   }
-
-  const standbyHit = Option.flatMap(base.standby, (detail) =>
-    detail.id === id ? Option.some(detail) : Option.none<ThreadDetail>(),
-  );
-  if (Option.isSome(standbyHit)) {
-    const next = evo(base, {
-      open: () => Option.some(standbyHit.value),
-      bodyHeights: () => ({}),
-      openCommitted: () => true,
-      pendingLoad: () => Option.none<ThreadId>(),
-      standby: () => Option.none<ThreadDetail>(),
-    });
-    // An all-plain standby thread has nothing to measure: shown now.
-    return [
-      next,
-      [...(detailIsShown(next) ? [ResetScroll()] : []), ...prefetch],
-    ];
-  }
-
-  if (Option.exists(base.pendingLoad, (pending) => pending === id)) {
-    return [evo(base, { openCommitted: () => true }), prefetch];
-  }
-
   return [
     evo(base, {
       open: () => Option.none<ThreadDetail>(),
-      bodyHeights: () => ({}),
-      openCommitted: () => true,
       pendingLoad: () => Option.some(id),
     }),
-    [LoadThread({ id }), ...prefetch],
+    [LoadThread({ id })],
   ];
 };
 
-// Leaving a thread (back button or Escape): evict the mounted detail and
-// forget any in-flight load; standby survives — it's what makes opening
-// the next thread instant.
 const closeThread = (model: Model): UpdateReturn => [
   evo(model, {
     open: () => Option.none<ThreadDetail>(),
-    bodyHeights: () => ({}),
-    openCommitted: () => false,
     pendingLoad: () => Option.none<ThreadId>(),
   }),
-  [ResetScroll()],
+  [],
 ];
 
 export const update = (model: Model, message: Message): UpdateReturn =>
@@ -722,8 +444,6 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     M.withReturnType<UpdateReturn>(),
     M.tagsExhaustive({
       GotFolderMenuMessage: ({ message }) => {
-        // Pure UI sketch: folder selection has no domain effect yet, so
-        // only the menu state advances.
         const [folderMenu, commands] = FolderMenu.update(
           model.folderMenu,
           message,
@@ -749,48 +469,21 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       },
 
       GotListMessage: ({ message }) => {
-        const [list, commands] = Ui.Table.update(model.list, message);
-        const listCommands = Command.mapMessages(commands, (message) =>
-          GotListMessage({ message }),
-        );
-
-        // Row keys are thread ids, so a Table click is an open request —
-        // the click lives on the Table (submodel viewInputs can't carry
-        // event handlers), and this page gives it meaning.
-        if (message._tag === "TableClickedRow") {
-          const decoded = S.decodeUnknownOption(ThreadId)(message.key);
-          const base = evo(model, { list: () => list });
-          if (Option.isNone(decoded)) return [base, listCommands];
-          const [next, openCommands] = openThread(base, decoded.value);
-          return [next, [...listCommands, ...openCommands]];
-        }
-
-        // Entering a row moves the cursor there (hover and j/k drive the
-        // same cursor) and starts the prefetch dwell timer.
-        if (message._tag === "EnteredRow") {
-          const id = Option.flatMap(
-            model.threads,
-            (rows): Option.Option<ThreadId> =>
-              Option.fromUndefinedOr(rows[message.index]?.id),
-          );
-          return [
-            evo(model, {
-              list: () => list,
-              selected: () =>
-                Option.isSome(id) ? Option.some(message.index) : model.selected,
-            }),
-            [
-              ...listCommands,
-              ...Option.match(id, {
-                onNone: () => [],
-                onSome: (id) => [StartDwell({ id })],
-              }),
-            ],
-          ];
-        }
-
-        return [evo(model, { list: () => list }), listCommands];
+        const [list, commands] = Ui.VirtualList.update(model.list, message);
+        return [
+          evo(model, { list: () => list }),
+          Command.mapMessages(commands, (message) =>
+            GotListMessage({ message }),
+          ),
+        ];
       },
+
+      HoveredRow: ({ index }) => [
+        evo(model, { selected: () => Option.some(index) }),
+        [],
+      ],
+
+      OpenedRow: ({ index }) => openThread(model, index),
 
       OpenedPalette: () => {
         const [palette, commands] = InboxPalette.toggle(model.palette);
@@ -810,8 +503,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const paletteCommands = Command.mapMessages(commands, (message) =>
           GotPaletteMessage({ message }),
         );
-        // Only the theme action has a domain effect in the sketch; every
-        // other selection just closes the palette.
+        // Only the theme action has a domain effect in the sketch.
         return Option.match(maybeSelected, {
           onNone: (): UpdateReturn => [
             evo(model, { palette: () => palette }),
@@ -866,87 +558,36 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       ],
 
       GotThread: ({ detail }) => {
-        // Only the load we're still waiting for counts — anything else is
-        // a superseded prefetch whose row the cursor left.
+        // Only the load we're still waiting for counts — anything else is a
+        // superseded open whose row the cursor left.
         if (!Option.exists(model.pendingLoad, (id) => id === detail.id)) {
           return [model, []];
         }
-        const next = evo(model, {
-          open: () => Option.some(detail),
-          bodyHeights: () => ({}),
-          pendingLoad: () => Option.none<ThreadId>(),
-          loadError: () => Option.none<string>(),
-        });
-        // All-plain committed threads have nothing to measure: they're
-        // shown now, so the pane swap (and its scroll reset) is immediate.
         return [
-          next,
-          detailIsShown(next) && !detailIsShown(model) ? [ResetScroll()] : [],
+          evo(model, {
+            open: () => Option.some(detail),
+            pendingLoad: () => Option.none<ThreadId>(),
+            loadError: () => Option.none<string>(),
+          }),
+          [],
         ];
       },
-
-      DwellElapsed: ({ id }) => {
-        const stillIntended = selectedThreadId(model) === id;
-        const alreadyMounted = Option.exists(
-          model.open,
-          (detail) => detail.id === id,
-        );
-        if (!stillIntended || alreadyMounted || model.openCommitted) {
-          return [model, []];
-        }
-
-        // A standby hit pre-mounts without touching SQLite at all.
-        const standbyHit = Option.flatMap(model.standby, (detail) =>
-          detail.id === id ? Option.some(detail) : Option.none<ThreadDetail>(),
-        );
-        if (Option.isSome(standbyHit)) {
-          return [
-            evo(model, {
-              open: () => Option.some(standbyHit.value),
-              bodyHeights: () => ({}),
-              pendingLoad: () => Option.none<ThreadId>(),
-              standby: () => Option.none<ThreadDetail>(),
-            }),
-            [],
-          ];
-        }
-
-        // Prefetch only an idle row; a newer dwell supersedes an older
-        // in-flight load (its result is dropped by the pendingLoad check
-        // in GotThread).
-        if (Option.exists(model.pendingLoad, (pending) => pending === id)) {
-          return [model, []];
-        }
-        return [
-          evo(model, { pendingLoad: () => Option.some(id) }),
-          [LoadThread({ id })],
-        ];
-      },
-
-      GotStandbyThread: ({ detail }) => [
-        // Don't clobber the slot if the user meanwhile opened this very
-        // thread — the mounted copy is the live one.
-        Option.exists(model.open, (open) => open.id === detail.id)
-          ? model
-          : evo(model, { standby: () => Option.some(detail) }),
-        [],
-      ],
-
-      StandbyFailed: () => [model, []],
 
       PressedListKey: ({ key }) => {
         // The palette owns the keyboard while it's open.
         if (model.palette.dialog.isOpen) return [model, []];
 
         if (key === "Escape") {
-          return detailIsShown(model) ? closeThread(model) : [model, []];
+          return Option.isSome(model.open) ? closeThread(model) : [model, []];
         }
         // Inside a thread, j/k/Enter are reserved for future in-thread nav.
-        if (detailIsShown(model)) return [model, []];
+        if (Option.isSome(model.open)) return [model, []];
 
         if (key === "Enter") {
-          const id = selectedThreadId(model);
-          return id === undefined ? [model, []] : openThread(model, id);
+          return Option.match(model.selected, {
+            onNone: (): UpdateReturn => [model, []],
+            onSome: (index) => openThread(model, index),
+          });
         }
 
         const rowCount = Option.match(model.threads, {
@@ -959,78 +600,26 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           key === "j"
             ? Math.min(current + 1, rowCount - 1)
             : Math.max(current - 1, 0);
-        // j/k claims the Table's traveling overlay too, so the keyboard
-        // cursor and the hover highlight are the same mark (see emailRowView).
-        const [list, listCommands] = Ui.Table.update(
-          model.list,
-          Ui.Table.KeyboardMoved({ index, rowCount }),
-        );
-        const next = evo(model, {
-          selected: () => Option.some(index),
-          list: () => list,
-        });
-        const id = selectedThreadId(next);
         return [
-          next,
-          [
-            ...Command.mapMessages(listCommands, (message) =>
-              GotListMessage({ message }),
-            ),
-            ScrollRowIntoView({ index }),
-            ...(id === undefined ? [] : [StartDwell({ id })]),
-          ],
+          evo(model, { selected: () => Option.some(index) }),
+          [ScrollListToRow({ index })],
         ];
       },
 
       FailedLoadThread: ({ error }) => [
         evo(model, {
           pendingLoad: () => Option.none<ThreadId>(),
-          // A failed prefetch stays silent (nobody asked for that thread);
-          // a failed committed open surfaces and un-commits, so the list
-          // stays interactive and a re-click retries.
-          openCommitted: () => false,
-          loadError: () =>
-            model.openCommitted ? Option.some(error) : model.loadError,
+          loadError: () => Option.some(error),
         }),
         [],
       ],
 
       ClickedBack: () => closeThread(model),
 
-      LoadedBodyFrame: ({ messageId }) => {
-        // finalize: this is the only html body a committed open still
-        // lacks a height for, so its measure command can reset the scroll
-        // in the same task the swap renders in.
-        const finalize =
-          model.openCommitted &&
-          Option.exists(model.open, (detail) =>
-            detail.messages.every(
-              (message) =>
-                message.bodyKind !== "html" ||
-                message.id === messageId ||
-                (model.bodyHeights[message.id] ?? 0) > 0,
-            ),
-          );
-        return [model, [MeasureBodyFrame({ messageId, finalize })]];
-      },
+      CompletedListScroll: () => [model, []],
 
-      MeasuredBodyFrame: ({ messageId, height }) => {
-        const next = evo(model, {
-          bodyHeights: () => ({ ...model.bodyHeights, [messageId]: height }),
-        });
-        // The measurement that completes a committed set flips the pane
-        // swap; reset the shared scroll container in the same frame. A
-        // prefetch's measurements change nothing on screen.
-        return [
-          next,
-          !detailIsShown(model) && detailIsShown(next) ? [ResetScroll()] : [],
-        ];
-      },
-
-      CompletedScrollReset: () => [model, []],
-
-      // The actual sign-out is main.ts's job (it owns the session); this
-      // page just folds the popover shut behind it.
+      // The actual sign-out is main.ts's job; this page just folds the
+      // popover shut behind it.
       InboxClickedSignOut: () => {
         const [accountPopover, commands] = Ui.Popover.close(
           model.accountPopover,
@@ -1060,19 +649,11 @@ const folderButtonContent = (): Html => {
   );
 };
 
-// The signed-in Google account, passed down from main.ts (the session
-// lives on the top-level model, not in this submodel).
-export type Profile = {
-  readonly name: string;
-  readonly email: string;
-};
+// The signed-in Google account, passed down from main.ts.
+export type Profile = { readonly name: string; readonly email: string };
 
-export type ViewInputs = {
-  readonly profile: Profile;
-};
+export type ViewInputs = { readonly profile: Profile };
 
-// The session carries no picture (see auth.ts Session), so the chip wears
-// an initial tile in the same shape as the sender avatars.
 const profileInitial = (profile: Profile, sizeClassName: string): Html => {
   const h = html();
   return h.span(
@@ -1085,10 +666,8 @@ const profileInitial = (profile: Profile, sizeClassName: string): Html => {
   );
 };
 
-// Static trigger content — the popover renders the button around it.
 const profileChipContent = (profile: Profile): Html => {
   const h = html();
-
   return h.span(
     [h.Class("flex items-center gap-2")],
     [
@@ -1101,11 +680,9 @@ const profileChipContent = (profile: Profile): Html => {
   );
 };
 
-// The account popover: full identity up top, sign-out below — the same
-// panel anatomy as a menu (p-1 shell, item-shaped rows, hairline divider).
+// The account popover: identity up top, sign-out below.
 const accountPanelView = (profile: Profile): Html => {
   const h = html<Message>();
-
   return h.div(
     [],
     [
@@ -1145,7 +722,6 @@ const accountPanelView = (profile: Profile): Html => {
 
 const toolbarView = (model: Model, profile: Profile): Html => {
   const h = html<Message>();
-
   return h.header(
     [h.Class("flex items-center justify-between gap-4 px-5 py-3")],
     [
@@ -1194,8 +770,7 @@ const toolbarView = (model: Model, profile: Profile): Html => {
         ],
       ),
 
-      // Right cluster: search (⌘K), the signed-in profile, notifications,
-      // compose.
+      // Right cluster: search (⌘K), profile, notifications, compose.
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
@@ -1243,51 +818,22 @@ const toolbarView = (model: Model, profile: Profile): Html => {
   );
 };
 
-const senderAvatarView = (avatar: Avatar, name: string): Html => {
+const senderTile = (label: string): Html => {
   const h = html();
-
-  if (avatar.kind === "image") {
-    return h.img([
-      h.Src(avatar.src),
-      h.Alt(name),
-      h.Class("h-7 w-7 shrink-0 rounded-full object-cover"),
-    ]);
-  }
-
-  const radius = avatar.rounded ? "rounded-full" : "rounded-[7px]";
-
   return h.span(
     [
       h.Class(
-        `flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden ${radius}`,
+        "flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm font-bold leading-none",
       ),
-      h.Style({ backgroundColor: avatar.bg, color: avatar.fg }),
+      h.Style({ backgroundColor: AVATAR_BG, color: AVATAR_FG }),
     ],
-    [
-      avatar.label === "apple"
-        ? Icon.appleFilled("h-4 w-4 -translate-y-[0.5px]")
-        : avatar.label === "cal.com"
-          ? h.span(
-              [h.Class("text-[8px] font-semibold leading-none tracking-tight")],
-              ["cal.com"],
-            )
-          : h.span(
-              [
-                h.Class("text-sm font-bold leading-none"),
-                ...(avatar.serif
-                  ? [h.Style({ fontFamily: "Georgia, serif" })]
-                  : []),
-              ],
-              [avatar.label],
-            ),
-    ],
+    [label],
   );
 };
 
 const categoryTagView = (category: Category): Html => {
   const h = html();
   const { label, icon, iconClass } = CATEGORIES[category];
-
   return h.span(
     [
       h.Class(
@@ -1298,32 +844,19 @@ const categoryTagView = (category: Category): Html => {
   );
 };
 
-// Sender and subject carry the read state: unread rows read at full
-// contrast, read rows recede to the muted text color (Tailwind needs the
-// literal strings, so both variants are spelled out).
-const READ_STATE = {
-  unread: {
-    sender: "truncate font-semibold text-foreground",
-    subject: "font-semibold text-foreground",
-  },
-  read: {
-    sender: "truncate font-semibold text-muted-foreground",
-    subject: "font-semibold text-muted-foreground",
-  },
-} as const;
-
-// No hover style on the row itself: the Table's traveling overlay is the
-// one highlight for both inputs. Mouse hover drives it directly; j/k
-// drives it too, via Ui.Table.KeyboardMoved (see PressedListKey) — moving
-// the mouse for real always hands it back (Ui.Table.EnteredRow).
-const emailRowView = (email: Email): Html => {
-  const h = html();
-  const readState = READ_STATE[email.isRead ? "read" : "unread"];
+// One list row. Carries no hover background of its own — the traveling
+// overlay (listOverlayView) is the single highlight for mouse and keyboard.
+// The row height is fixed by the VirtualList; content just fills and centers.
+const emailRowView = (email: Email, index: number): Html => {
+  const h = html<Message>();
+  const tone = email.unread ? "text-foreground" : "text-muted-foreground";
 
   return h.div(
     [
+      h.OnClick(OpenedRow({ index })),
+      h.OnMouseEnter(HoveredRow({ index })),
       h.Class(
-        "flex cursor-pointer items-center gap-4 border-b border-border px-4 py-3",
+        "flex h-full cursor-pointer items-center gap-4 border-b border-border px-4",
       ),
     ],
     [
@@ -1331,19 +864,8 @@ const emailRowView = (email: Email): Html => {
       h.div(
         [h.Class("flex w-56 shrink-0 items-center gap-3 md:w-64")],
         [
-          senderAvatarView(email.avatar, email.sender),
-          h.span(
-            [h.Class("flex min-w-0 items-baseline gap-1.5 truncate")],
-            [
-              h.span([h.Class(readState.sender)], [email.sender]),
-              email.groupCount === undefined
-                ? h.empty
-                : h.span(
-                    [h.Class("shrink-0 text-muted-foreground")],
-                    [`(${email.groupCount})`],
-                  ),
-            ],
-          ),
+          senderTile((email.sender.slice(0, 1) || "?").toUpperCase()),
+          h.span([h.Class(`truncate font-semibold ${tone}`)], [email.sender]),
         ],
       ),
 
@@ -1353,23 +875,17 @@ const emailRowView = (email: Email): Html => {
         [
           // The dot's slot is always reserved so the subject column lines up
           // across read and unread rows; only the dot itself hides.
-          email.unread && !email.isRead
+          email.unread
             ? Ui.badgeDot({ color: "indigo", ariaLabel: "Unread" })
             : h.span([h.Class("invisible h-[7px] w-[7px] shrink-0")], []),
-          email.subjectIcon === "cloud"
-            ? Icon.cloud("h-4 w-4 shrink-0 text-muted-foreground")
-            : h.empty,
-          // The truncation ellipsis draws in the truncating element's own
-          // color — left unset it inherits full-contrast foreground and
-          // glows at the end of every clipped row. Muted here matches the
-          // preview text it's actually eliding; the subject's explicit
-          // color classes are unaffected.
+          // The truncation ellipsis draws in the truncating element's color;
+          // muted here matches the preview text it's eliding.
           h.span(
             [h.Class("min-w-0 truncate text-muted-foreground")],
             [
-              h.span([h.Class(readState.subject)], [email.subject]),
+              h.span([h.Class(`font-semibold ${tone}`)], [email.subject]),
               h.span([h.Class("mx-2 text-muted-foreground/50")], ["—"]),
-              h.span([h.Class("text-muted-foreground")], [email.preview]),
+              h.span([], [email.preview]),
             ],
           ),
         ],
@@ -1379,9 +895,6 @@ const emailRowView = (email: Email): Html => {
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
-          email.attachment
-            ? Icon.paperclip("h-4 w-4 text-muted-foreground")
-            : h.empty,
           categoryTagView(email.category),
           h.span(
             [
@@ -1399,9 +912,6 @@ const emailRowView = (email: Email): Html => {
 
 const sectionHeaderView = (label: string): Html => {
   const h = html();
-
-  // Symmetric: the previous row's border sits above, this header's own
-  // border closes it below, and the label centers between the two lines.
   return h.div(
     [
       h.Class(
@@ -1412,8 +922,6 @@ const sectionHeaderView = (label: string): Html => {
   );
 };
 
-// A full-width quiet row for the states that aren't a thread: first load,
-// a load failure, an actually-empty inbox.
 const statusRowView = (text: string): Html => {
   const h = html();
   return h.div(
@@ -1426,79 +934,101 @@ const statusRowView = (text: string): Html => {
   );
 };
 
-// The whole list — header interleaved with rows — is one Table, so the
-// hover overlay travels across boundaries. Rows are the model's real
-// threads; until the first pull lands there are no rows to fake.
-const listChildren = (model: Model): ReadonlyArray<Ui.Table.TableChild> => {
-  const header = {
-    kind: "static" as const,
-    key: "header-inbox",
-    content: sectionHeaderView("Inbox"),
-  };
+// The traveling hover highlight. One absolutely-positioned overlay glides
+// between rows: `top` (transitioned) gives the travel, `translateY(-scrollTop)`
+// (not transitioned — see .fk-hover-overlay) tracks scrolling instantly.
+const listOverlayView = (model: Model): Html => {
+  const h = html<Message>();
+  return Option.match(model.selected, {
+    onNone: () => h.empty,
+    onSome: (index) =>
+      h.keyed("div")(
+        "inbox-hover-overlay",
+        [
+          h.Class("fk-hover-overlay"),
+          h.Style({
+            top: `${index * ROW_HEIGHT}px`,
+            left: "0",
+            right: "0",
+            height: `${ROW_HEIGHT}px`,
+            transform: `translateY(${-model.list.scrollTop}px)`,
+          }),
+        ],
+        [],
+      ),
+  });
+};
 
-  return Option.match(model.threads, {
-    onNone: () => [
-      header,
-      {
-        kind: "static" as const,
-        key: "inbox-status",
-        content: statusRowView(
-          Option.getOrElse(model.loadError, () => "Loading your inbox…"),
-        ),
-      },
+// The virtualized thread list plus its overlay. The wrapper is the overlay's
+// positioning context and clips it to the viewport; the list owns its scroll.
+const virtualListView = (
+  model: Model,
+  rows: ReadonlyArray<ThreadRow>,
+): Html => {
+  const h = html<Message>();
+  return h.div(
+    [h.Class("relative min-h-0 flex-1 overflow-clip")],
+    [
+      listOverlayView(model),
+      h.submodel({
+        slotId: LIST_ID,
+        model: model.list,
+        view: Ui.VirtualList.view<ThreadRow>(),
+        viewInputs: {
+          items: rows,
+          itemToKey: (row: ThreadRow) => row.id,
+          itemToView: (row: ThreadRow, index: number) =>
+            emailRowView(emailFromThreadRow(row), index),
+          overscan: LIST_OVERSCAN,
+          containerClassName: "h-full",
+        },
+        toParentMessage: (message) => GotListMessage({ message }),
+      }),
+    ],
+  );
+};
+
+// The list section: header, then whichever body the load state calls for.
+const listSectionView = (model: Model): Html => {
+  const h = html<Message>();
+
+  const body = Option.match(model.threads, {
+    onNone: (): ReadonlyArray<Html> => [
+      statusRowView(
+        Option.getOrElse(model.loadError, () => "Loading your inbox…"),
+      ),
     ],
     onSome: (rows) => [
-      header,
-      // A failure after the list is up (e.g. a thread open) still needs a
-      // face — without this row it would die into invisible model state.
       ...Option.match(model.loadError, {
-        onNone: () => [],
-        onSome: (error) => [
-          {
-            kind: "static" as const,
-            key: "inbox-error",
-            content: statusRowView(error),
-          },
-        ],
+        onNone: (): ReadonlyArray<Html> => [],
+        onSome: (error) => [statusRowView(error)],
       }),
-      ...(rows.length === 0
-        ? [
-            {
-              kind: "static" as const,
-              key: "inbox-status",
-              content: statusRowView("Your inbox is empty."),
-            },
-          ]
-        : rows.map((row) => ({
-            kind: "row" as const,
-            key: row.id,
-            content: emailRowView(emailFromThreadRow(row)),
-          }))),
+      rows.length === 0
+        ? statusRowView("Your inbox is empty.")
+        : virtualListView(model, rows),
     ],
   });
+
+  return h.div(
+    [h.Class("flex min-h-0 flex-1 flex-col")],
+    [sectionHeaderView("Inbox"), ...body],
+  );
 };
 
 // THREAD DETAIL
 //
-// Renders in the exact container the list uses, so switching between the
-// two never moves the column. Html bodies render in a sandboxed srcdoc
-// iframe (email css can't leak out, ours can't leak in; no scripts run —
-// allow-same-origin exists solely so the measure command can read the
-// content height). Plain bodies skip the iframe entirely.
+// Html bodies render in a sandboxed srcdoc iframe (email css can't leak out,
+// ours can't leak in; no scripts run). Plain bodies skip the iframe.
 
-// default-src 'none' keeps the frame network-silent. At the full cache
-// tier every image — inline cid: and remote alike — arrives as a blob:
-// url over locally stored bytes (see CACHE_TIER in sync.ts), so img-src
-// can drop the network entirely: nothing in a message body can phone
-// home, tracking pixels included. data: stays allowed for emails that
-// natively embed data: images. Lower tiers let remote images load live.
+// default-src 'none' keeps the frame network-silent. At the full cache tier
+// every image arrives as a blob: url over locally stored bytes, so img-src
+// drops the network entirely (tracking pixels included). Lower tiers let
+// remote images load live.
 const FRAME_CSP =
   (CACHE_TIER as CacheTier) === "full"
     ? "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'"
     : "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
 
-// Email html expects a white canvas regardless of app theme; the reset
-// only fills gaps for fragment bodies that bring no styling of their own.
 const srcdocFor = (body: string): string =>
   `<!doctype html><html><head><meta charset="utf-8">` +
   `<meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">` +
@@ -1514,15 +1044,7 @@ const formatDetailTime = (epochMs: number): string =>
     minute: "2-digit",
   });
 
-// Pre-measure the frame renders at a fixed placeholder height; the
-// measured height replaces it in one style patch (srcdoc unchanged, so
-// snabbdom never reloads the frame).
-const PLACEHOLDER_HEIGHT = 160;
-
-const messageBodyView = (
-  message: MessageDetail,
-  measuredHeight: number | undefined,
-): Html => {
+const messageBodyView = (message: MessageDetail): Html => {
   const h = html<Message>();
 
   if (message.bodyKind === "plain") {
@@ -1536,56 +1058,28 @@ const messageBodyView = (
     );
   }
 
-  // A 0 measurement (frame unreadable) keeps the placeholder rather than
-  // collapsing the body to invisible.
-  const isMeasured = measuredHeight !== undefined && measuredHeight > 0;
-
   return h.iframe(
     [
-      h.Id(frameId(message.id)),
       h.Sandbox(
         "allow-same-origin allow-popups allow-popups-to-escape-sandbox",
       ),
       h.Srcdoc(srcdocFor(message.body)),
-      h.OnLoad(LoadedBodyFrame({ messageId: message.id })),
       h.Class("mt-3 w-full rounded-lg bg-white"),
-      h.Style({
-        height: `${isMeasured ? measuredHeight : PLACEHOLDER_HEIGHT}px`,
-        border: "0",
-        // Browsers paint srcdoc progressively as it parses; staying
-        // hidden until the post-load measurement means the body appears
-        // fully laid out at final height in a single frame. "inherit",
-        // not "visible": visibility lets a child override a hidden
-        // ancestor, and a measured frame must not paint through the
-        // still-invisible prefetch pane.
-        visibility: isMeasured ? "inherit" : "hidden",
-      }),
+      h.Style({ height: `${BODY_FRAME_HEIGHT}px`, border: "0" }),
     ],
     [],
   );
 };
 
-const messageCardView = (
-  message: MessageDetail,
-  measuredHeight: number | undefined,
-): Html => {
+const messageCardView = (message: MessageDetail): Html => {
   const h = html<Message>();
-
   return h.div(
     [h.Class("border-b border-border px-4 py-4")],
     [
       h.div(
         [h.Class("flex items-center gap-3")],
         [
-          h.span(
-            [
-              h.Class(
-                "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold leading-none",
-              ),
-              h.Style({ backgroundColor: AVATAR_BG, color: AVATAR_FG }),
-            ],
-            [(message.fromName.slice(0, 1) || "?").toUpperCase()],
-          ),
+          senderTile((message.fromName.slice(0, 1) || "?").toUpperCase()),
           h.div(
             [h.Class("min-w-0 flex-1")],
             [
@@ -1609,16 +1103,15 @@ const messageCardView = (
           ),
         ],
       ),
-      messageBodyView(message, measuredHeight),
+      messageBodyView(message),
     ],
   );
 };
 
-const threadDetailView = (model: Model, detail: ThreadDetail): Html => {
+const threadDetailView = (detail: ThreadDetail): Html => {
   const h = html<Message>();
-
   return h.div(
-    [],
+    [h.Class("flex min-h-0 flex-1 flex-col")],
     [
       h.div(
         [h.Class("flex items-center gap-3 border-b border-border px-2 py-2.5")],
@@ -1644,8 +1137,9 @@ const threadDetailView = (model: Model, detail: ThreadDetail): Html => {
           ),
         ],
       ),
-      ...detail.messages.map((message) =>
-        messageCardView(message, model.bodyHeights[message.id]),
+      h.div(
+        [h.Class("min-h-0 flex-1 overflow-y-auto")],
+        detail.messages.map((message) => messageCardView(message)),
       ),
     ],
   );
@@ -1659,60 +1153,19 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
       [h.Class("flex h-screen flex-col bg-background text-foreground")],
       [
         toolbarView(model, profile),
-        // The list sits in a centered column narrower than the page, so the
-        // rows breathe with clear space on both sides.
+        // The list and the open thread share this centered column, so opening
+        // a thread never moves the column.
         h.div(
-          [h.Id(SCROLL_ID), h.Class("flex-1 overflow-y-auto pb-24")],
           [
-            h.div(
-              [h.Class("mx-auto w-full max-w-7xl px-6")],
-              [
-                // List and detail share this exact container, so opening a
-                // thread never changes the column's width or position. Both
-                // panes stay mounted while a detail is loading: the detail
-                // renders invisible-absolute underneath (same width, so
-                // iframes load and measure at final geometry) and the swap
-                // is a pure class flip once every body is ready — keyed
-                // wrappers keep the loaded iframes' element identity, and
-                // the screen never changes until the content is paintable.
-                h.div(
-                  [h.Class("relative")],
-                  [
-                    h.keyed("div")(
-                      "inbox-list-pane",
-                      [h.Class(detailIsShown(model) ? "hidden" : "")],
-                      [
-                        h.submodel({
-                          slotId: "inbox-list",
-                          model: model.list,
-                          view: Ui.Table.view,
-                          viewInputs: { children: listChildren(model) },
-                          toParentMessage: (message) =>
-                            GotListMessage({ message }),
-                        }),
-                      ],
-                    ),
-                    ...Option.match(model.open, {
-                      onNone: () => [],
-                      onSome: (detail) => [
-                        h.keyed("div")(
-                          "inbox-detail-pane",
-                          [
-                            h.Id("inbox-detail-pane"),
-                            h.Class(
-                              detailIsShown(model)
-                                ? ""
-                                : "pointer-events-none invisible absolute inset-x-0 top-0",
-                            ),
-                          ],
-                          [threadDetailView(model, detail)],
-                        ),
-                      ],
-                    }),
-                  ],
-                ),
-              ],
+            h.Class(
+              "mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-6",
             ),
+          ],
+          [
+            Option.match(model.open, {
+              onNone: () => listSectionView(model),
+              onSome: (detail) => threadDetailView(detail),
+            }),
           ],
         ),
         h.submodel({

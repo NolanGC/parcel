@@ -30,6 +30,7 @@ import {
   urlToAppRoute,
 } from "./route";
 import { SyncEngine } from "./sync";
+import * as Ui from "./ui";
 
 const APP_NAME = "parcel";
 
@@ -275,8 +276,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const route = urlToAppRoute(url);
 
         if (model._tag === "LoggedOut") {
-          // The inbox is gated; everything else is browsable while logged
-          // out.
+          // The inbox is gated; everything else is browsable while logged out.
           return route._tag === "Inbox"
             ? [model, [RedirectToLogin()]]
             : [evo(model, { route: () => route }), []];
@@ -371,7 +371,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 // while the inbox route is active — the dependency flips the stream on and
 // off as the route changes. `preventDefault` runs synchronously inside the
 // mapper, before the browser's own search shortcut fires.
-export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
+const keyboardSubscriptions = Subscription.make<Model, Message>()((entry) => ({
   paletteShortcut: entry(
     { isInbox: S.Boolean },
     {
@@ -442,6 +442,25 @@ export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
     },
   ),
 }));
+
+// The inbox list's scroll/resize tracking. The base VirtualList owns the
+// subscription (a MutationObserver reattaches it as the container mounts and
+// unmounts); we only lift it into this model/message context. Its scrollTop
+// drives the visible window and the traveling hover overlay.
+const listScrollSubscriptions = Subscription.lift(Ui.VirtualList.subscriptions)<
+  Model,
+  Message
+>({
+  toChildModel: (model) => model.inboxPage.list,
+  toParentMessage: (message) =>
+    GotInboxMessage({ message: Inbox.GotListMessage({ message }) }),
+});
+
+export const subscriptions = Subscription.aggregate<Model, Message>()(
+  keyboardSubscriptions,
+  listScrollSubscriptions,
+);
+
 export const managedResources = undefined;
 
 // VIEW

@@ -258,6 +258,13 @@ const remoteImageUrls = (html: string): ReadonlyArray<string> => {
   return [...urls];
 };
 
+// A transparent 1x1 GIF. Un-cached remote images rewrite to this at render
+// time so the html handed to the frame carries no live network URL — the
+// render reads only what SQLite holds; a missing image is an absence, never a
+// fetch. (The frame CSP stays as defense-in-depth, not the guard.)
+const PLACEHOLDER_IMAGE =
+  "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
 // One remote asset through the API image proxy (mail CDNs don't serve
 // CORS, so the client can't read their bytes directly). Failures yield
 // undefined and the asset is simply skipped: at the full tier the frame
@@ -716,6 +723,12 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const objectUrls: Array<string> = [];
           threadObjectUrls.set(id, objectUrls);
 
+          // Full tier caches everything and the frame blocks the network, so
+          // the render is hermetic (cached → blob:, un-cached → placeholder).
+          // Lower tiers cache nothing and deliberately let remote images load
+          // live, so there un-cached urls stay as written.
+          const isFullTier = (CACHE_TIER as CacheTier) === "full";
+
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {
               const stored = bodyByMessage.get(row.id);
@@ -727,8 +740,12 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                       data: new Uint8Array(stored.body),
                     });
 
-              // cid: inline images and cached remote urls both swap to
-              // blob: urls in one rewrite pass.
+              // Local-first render: the html must carry no live network URL,
+              // so every reference resolves against what SQLite has. cid:
+              // inline images and cached remote assets swap to blob: urls; any
+              // remote url we never cached swaps to an inert placeholder. So
+              // opening a thread makes zero requests by construction — the
+              // render never chases a missing image over the network.
               const replacements = new Map<string, string>();
               for (const image of allImages) {
                 if (image.message_id !== row.id) continue;
@@ -737,21 +754,28 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   registerObjectUrl(objectUrls, image.mime_type, image.bytes),
                 );
               }
-              for (const asset of allRemote) {
-                if (asset.message_id !== row.id) continue;
-                replacements.set(
-                  asset.url,
-                  registerObjectUrl(objectUrls, asset.mime_type, asset.bytes),
-                );
+              const cachedRemote = new Map(
+                allRemote
+                  .filter((asset) => asset.message_id === row.id)
+                  .map((asset) => [asset.url, asset] as const),
+              );
+              for (const url of remoteImageUrls(text)) {
+                const cached = cachedRemote.get(url);
+                if (cached !== undefined) {
+                  replacements.set(
+                    url,
+                    registerObjectUrl(objectUrls, cached.mime_type, cached.bytes),
+                  );
+                } else if (isFullTier) {
+                  replacements.set(url, PLACEHOLDER_IMAGE);
+                }
               }
               const rewritten = rewriteAll(text, replacements);
-              // Full tier: srcset comes off — its resolution variants
-              // aren't cached, and the frame CSP (no-network, see
-              // inbox.ts) would block them while overriding the rewritten
-              // src.
+              // Full tier: srcset comes off — its variants aren't cached, so
+              // left in it would be the one live URL that survives the rewrite
+              // (the src is already a blob: or the placeholder).
               const body =
-                (CACHE_TIER as CacheTier) === "full" &&
-                stored?.mime_type === "text/html"
+                isFullTier && stored?.mime_type === "text/html"
                   ? rewritten.replace(/\s+srcset\s*=\s*("[^"]*"|'[^']*')/gi, "")
                   : rewritten;
 
