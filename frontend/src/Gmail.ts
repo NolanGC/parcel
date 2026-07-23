@@ -5,6 +5,7 @@ import {
   HttpClientRequest,
   HttpClientResponse,
 } from "effect/unstable/http";
+import { RateLimiter } from "effect/unstable/persistence";
 
 import { AuthClient } from "./auth";
 
@@ -370,10 +371,46 @@ export interface ModifyLabels {
   readonly removeLabelIds?: ReadonlyArray<LabelId>;
 }
 
+// QUOTA
+//
+// Gmail's binding limit is 250 quota units per user per second (a moving
+// average). Every request is paced through a token bucket weighted by
+// Google's documented unit costs, with headroom under the ceiling, so
+// sustained sync work never draws 429s in steady state. The limiter also
+// learns from rate-limit/Retry-After response headers and replays 429s
+// through the bucket, so the occasional disagreement self-corrects here
+// before the SyncEngine ever sees a failure.
+
+const QUOTA_WINDOW = "1 second";
+const QUOTA_UNITS_PER_WINDOW = 200;
+
+// Google's per-method quota unit table, keyed by URL shape. Order matters:
+// an attachment URL also contains /messages/.
+const quotaUnits = (request: HttpClientRequest.HttpClientRequest): number => {
+  const url = request.url;
+  if (url.includes("/attachments/")) return 5;
+  if (url.includes("/history")) return 2;
+  if (url.includes("/profile")) return 1;
+  if (url.includes("/labels")) return 1;
+  if (url.includes("/threads")) return 10;
+  if (url.includes("/messages")) return 5;
+  return 10;
+};
+
 export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
   make: Effect.gen(function* () {
     const authClient = yield* AuthClient;
-    const http = yield* HttpClient.HttpClient;
+    const limiter = yield* RateLimiter.RateLimiter;
+    const http = (yield* HttpClient.HttpClient).pipe(
+      HttpClient.withRateLimiter({
+        limiter,
+        window: QUOTA_WINDOW,
+        limit: QUOTA_UNITS_PER_WINDOW,
+        key: "gmail",
+        algorithm: "token-bucket",
+        tokens: quotaUnits,
+      }),
+    );
 
     // Fresh token per request: getAccessToken refreshes server-side when
     // the stored one is expired, so callers never see a stale token, and
@@ -557,6 +594,15 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
     this,
     this.make,
   ).pipe(
-    Layer.provide(Layer.mergeAll(AuthClient.layer, FetchHttpClient.layer)),
+    Layer.provide(
+      Layer.mergeAll(
+        AuthClient.layer,
+        FetchHttpClient.layer,
+        // Process-local limiter store: the quota bucket lives and dies
+        // with the tab. (A second tab gets its own bucket — the multi-tab
+        // sync-leader question is open regardless.)
+        RateLimiter.layer.pipe(Layer.provide(RateLimiter.layerStoreMemory)),
+      ),
+    ),
   );
 }

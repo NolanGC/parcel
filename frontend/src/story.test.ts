@@ -53,10 +53,12 @@ describe("init", () => {
 
     expect(model._tag).toBe("LoggedIn");
     expect(model.route._tag).toBe("Inbox");
-    // The boot-time CheckSession revalidation + the first inbox pull.
+    // The boot-time CheckSession revalidation + the inbox boot (local
+    // read + the sync machine's checkpoint read).
     expect(commands.map((command) => command.name)).toEqual([
       "CheckSession",
       "LoadInbox",
+      "ReadSyncCheckpoint",
     ]);
   });
 
@@ -70,6 +72,7 @@ describe("init", () => {
       "RedirectToInbox",
       "CheckSession",
       "LoadInbox",
+      "ReadSyncCheckpoint",
     ]);
   });
 

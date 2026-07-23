@@ -14,6 +14,7 @@ import {
   type MessageDetail,
   type ThreadCategory,
 } from "../sync";
+import * as SyncMachine from "../syncMachine";
 import * as Ui from "../ui";
 
 // The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors come
@@ -223,6 +224,10 @@ export const Model = S.Struct({
   palette: Ui.Palette.Model,
   accountPopover: Ui.Popover.Model,
   threads: ThreadsData.schema,
+  // The sync machine: fills and freshens the SQLite store behind the UI.
+  // Its state renders as the toolbar pill; its progress triggers the
+  // strided row refreshes (see GotSyncMessage).
+  sync: SyncMachine.State,
   screen: Screen,
   // The single list cursor: mouse hover and j/k both move it. Drives the
   // traveling hover overlay; Enter (or a click) opens it.
@@ -248,6 +253,7 @@ export const init = (): Model => ({
   // main.ts issues LoadInbox on entering the inbox, so the page is born
   // loading rather than idle.
   threads: AsyncData.Loading(),
+  sync: SyncMachine.init(),
   screen: ShowingList({ error: Option.none() }),
   selected: Option.none(),
   hoverSession: 0,
@@ -287,6 +293,10 @@ export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
 export const ClickedSignOut = m("InboxClickedSignOut");
 /** The SyncEngine finished a pull: real thread rows from the local store. */
 export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
+/** A sync-machine fact (checkpoint read, batch landed, failure, …). */
+export const GotSyncMessage = m("GotSyncMessage", {
+  message: SyncMachine.Message,
+});
 export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
 export const GotThread = m("GotThread", { detail: ThreadDetail });
 /** List keyboard nav from the global subscription in main.ts. */
@@ -311,6 +321,7 @@ export const Message = S.Union([
   GotAccountPopoverMessage,
   ClickedSignOut,
   GotThreads,
+  GotSyncMessage,
   FailedLoadInbox,
   GotThread,
   PressedListKey,
@@ -341,8 +352,9 @@ const ApplyAppearance = Command.define(
   }),
 );
 
-// Pulls one page of real inbox threads through the SyncEngine
-// (Gmail → SQLite → rows). Triggered by main.ts on entering the inbox.
+// Selects the whole local store (newest first) — no network; filling the
+// store is the sync machine's job. Runs at boot and again whenever the
+// machine reports enough new rows (see GotSyncMessage).
 export const LoadInbox = Command.define(
   "LoadInbox",
   GotThreads,
@@ -358,6 +370,17 @@ export const LoadInbox = Command.define(
     );
   }),
 );
+
+/** Everything main.ts issues on entering the inbox: the first local read
+ *  plus the sync machine's checkpoint-derived boot. */
+export const bootCommands = (): ReadonlyArray<
+  Command.Command<Message, never, SyncEngine>
+> => [
+  LoadInbox(),
+  ...Command.mapMessages(SyncMachine.bootCommands(), (message) =>
+    GotSyncMessage({ message }),
+  ),
+];
 
 // Opens a thread from the local store only: SQLite rows, cid: images
 // rewritten from locally cached bytes — no network.
@@ -410,6 +433,34 @@ type UpdateReturn = readonly [
 
 const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
   Option.getOrElse(AsyncData.getData(model.threads), () => []);
+
+// Re-selecting and decoding the whole store costs tens of ms at 10k rows,
+// so backfill progress refreshes the list on a stride, not per batch.
+const REFRESH_STRIDE = 200;
+
+// Whether a sync-machine fact means the store has enough new rows to be
+// worth re-reading: the prime (first screen), a strided slice of the
+// backfill, the backfill's end, or an incremental pass that changed rows.
+const shouldRefreshRows = (
+  before: SyncMachine.State,
+  message: SyncMachine.Message,
+): boolean =>
+  M.value(message).pipe(
+    M.tags({
+      CompletedPrime: () => true,
+      CompletedBatch: ({ syncedCount, maybeNextPageToken }) => {
+        if (Option.isNone(maybeNextPageToken)) return true;
+        const previousCount =
+          before._tag === "Backfilling" ? before.syncedCount : 0;
+        return (
+          Math.floor(previousCount / REFRESH_STRIDE) !==
+          Math.floor(syncedCount / REFRESH_STRIDE)
+        );
+      },
+      AppliedHistory: ({ changedCount }) => changedCount > 0,
+    }),
+    M.orElse(() => false),
+  );
 
 // Row clicks and the Enter key both funnel here: move the cursor to the row
 // and, unless its thread is already open, load it.
@@ -567,6 +618,19 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
         [],
       ],
+
+      GotSyncMessage: ({ message }) => {
+        const [sync, commands] = SyncMachine.step(model.sync, message);
+        return [
+          evo(model, { sync: () => sync }),
+          [
+            ...Command.mapMessages(commands, (message) =>
+              GotSyncMessage({ message }),
+            ),
+            ...(shouldRefreshRows(model.sync, message) ? [LoadInbox()] : []),
+          ],
+        ];
+      },
 
       FailedLoadInbox: ({ error }) => [
         evo(model, {
@@ -737,6 +801,47 @@ const accountPanelView = (profile: Profile): Html => {
   );
 };
 
+// The sync pill: the machine's state rendered directly — no parallel
+// status struct to keep honest. Because the machine's entry state is
+// derived from the persisted checkpoint, a refresh mid-backfill shows real
+// progress from first paint.
+const syncPillView = (sync: SyncMachine.State): Html => {
+  const h = html<Message>();
+
+  const pill = (children: ReadonlyArray<Html | string>): Html =>
+    h.div(
+      [
+        h.Class(
+          "flex h-7 shrink-0 items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] tabular-nums text-muted-foreground",
+        ),
+        h.Role("status"),
+      ],
+      children,
+    );
+
+  const workingDot = h.span(
+    [h.Class("animate-pulse")],
+    [Ui.badgeDot({ color: "indigo" })],
+  );
+
+  return M.value(sync).pipe(
+    M.tagsExhaustive({
+      Cold: () => h.empty,
+      Priming: () => pill([workingDot, "Syncing…"]),
+      Backfilling: ({ syncedCount, totalEstimate }) =>
+        pill([
+          workingDot,
+          `Syncing ${syncedCount.toLocaleString()} of ~${totalEstimate.toLocaleString()}`,
+        ]),
+      CatchingUp: () => pill([workingDot, "Checking…"]),
+      Settled: () => pill([Icon.check("h-3.5 w-3.5"), "Synced"]),
+      Backoff: () => pill([Ui.badgeDot({ color: "amber" }), "Retrying…"]),
+      NeedsAuth: () =>
+        pill([Ui.badgeDot({ color: "red" }), "Reconnect Gmail"]),
+    }),
+  );
+};
+
 const toolbarView = (model: Model, profile: Profile): Html => {
   const h = html<Message>();
   return h.header(
@@ -787,10 +892,12 @@ const toolbarView = (model: Model, profile: Profile): Html => {
         ],
       ),
 
-      // Right cluster: search (⌘K), profile, notifications, compose.
+      // Right cluster: sync pill, search (⌘K), profile, notifications,
+      // compose.
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
+          syncPillView(model.sync),
           h.button(
             [
               h.Type("button"),
@@ -1028,9 +1135,20 @@ const listBodyView = (
     onSome: (message) => [statusRowView(message)],
   }),
   rows.length === 0
-    ? statusRowView("Your inbox is empty.")
+    ? statusRowView(
+        // A cold store while the machine is still filling it isn't empty,
+        // it's early — the first primed rows land within a second or two.
+        isSyncFilling(model.sync)
+          ? "Syncing your inbox…"
+          : "Your inbox is empty.",
+      )
     : virtualListView(model, rows),
 ];
+
+const isSyncFilling = (sync: SyncMachine.State): boolean =>
+  sync._tag === "Cold" ||
+  sync._tag === "Priming" ||
+  sync._tag === "Backfilling";
 
 // The list section: header, then whichever body the load state calls for.
 const listSectionView = (model: Model): Html => {

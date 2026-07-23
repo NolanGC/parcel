@@ -141,12 +141,13 @@ export type AppResources =
   | KeyValueStore.KeyValueStore
   | SyncEngine;
 
-// The inbox page owns the LoadInbox command; wrapping its messages here
-// keeps the parent/child message boundary intact.
+// The inbox page owns its boot (the first local read plus the sync
+// machine's checkpoint read); wrapping its messages here keeps the
+// parent/child message boundary intact.
 const loadInboxCommands = (): ReadonlyArray<
   Command.Command<Message, never, AppResources>
 > =>
-  Command.mapMessages([Inbox.LoadInbox()], (message) =>
+  Command.mapMessages(Inbox.bootCommands(), (message) =>
     GotInboxMessage({ message }),
   );
 

@@ -137,5 +137,15 @@ export const SqlLive = SqliteMigrator.layer({
         )
       `;
     }),
+
+    // Backfill progress for the sync machine's checkpoint: counts drive the
+    // toolbar pill across refreshes, backfill_done gates the boot-time entry
+    // state (Backfilling vs CatchingUp).
+    "0002_sync_checkpoint": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE sync_state ADD COLUMN synced_count INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE sync_state ADD COLUMN total_estimate INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE sync_state ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0`;
+    }),
   } satisfies Record<`${number}_${string}`, any>),
 }).pipe(Layer.provideMerge(ClientLive));
