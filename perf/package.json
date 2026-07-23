@@ -1,0 +1,12 @@
+{
+  "name": "@foldkit/perf",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun src/bench.ts"
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}

@@ -7,6 +7,7 @@ import { icon, iconFilled } from "./ui/icon";
 // resting, 2 active/checked.
 
 export const inbox = icon(Lucide.Inbox);
+export const arrowLeft = icon(Lucide.ArrowLeft);
 export const chevronsUpDown = icon(Lucide.ChevronsUpDown);
 export const circleCheck = icon(Lucide.CircleCheck);
 export const bell = icon(Lucide.Bell);
@@ -33,5 +34,6 @@ export const sun = icon(Lucide.Sun);
 export const moon = icon(Lucide.Moon);
 export const hand = icon(Lucide.Hand);
 export const circleUser = icon(Lucide.CircleUser);
+export const logOut = icon(Lucide.LogOut);
 export const palmtree = icon(Lucide.TreePalm);
 export const appleFilled = iconFilled(Lucide.Apple);

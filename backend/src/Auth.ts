@@ -17,7 +17,7 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import pg from "pg";
 
 import { Account, Session, User, Verification } from "./auth-schema.ts";
-import { UserId } from "./TodoProtocol.ts";
+import { UserId } from "./Protocol.ts";
 import { Hyperdrive } from "./Db.ts";
 
 export class AuthError extends Data.TaggedError("AuthError")<{
@@ -35,6 +35,7 @@ type MakeAuthOptions = {
   baseOrigin: string;
   frontendOrigin: Option.Option<string>;
   isLocal: boolean;
+  google: Option.Option<{ clientId: string; clientSecret: string }>;
 };
 
 // Exactly one origin may make credentialed requests: the frontend bound as
@@ -77,13 +78,32 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
     secret: options.secret,
     baseURL: options.baseOrigin,
     basePath: "/api/auth",
-    emailAndPassword: {
-      enabled: true,
-      // We can add something here for email verification (Cloudflare Email Routing
-      // domain + `Cloudflare.Email.Send`); wire `sendVerificationEmail` in
-      // `emailVerification` at the same time.
-      requireEmailVerification: false,
-    },
+    // Google is the only sign-in method; email+password stays at its
+    // disabled default everywhere. The integ tests never need it: they mint
+    // sessions with a test-only BetterAuth instance (test-utils plugin)
+    // over this same database and secret — see test/integ.test.ts.
+    socialProviders: Option.match(options.google, {
+      onNone: () => ({}),
+      onSome: ({ clientId, clientSecret }) => ({
+        google: {
+          clientId,
+          clientSecret,
+          // Gmail access outlives the sign-in hour, so the app needs a
+          // refresh token — Google only issues one when access is
+          // "offline" AND a consent screen was shown (re-logins without
+          // `consent` return access tokens only). `select_account` also
+          // keeps the account chooser on shared machines. Tokens land on
+          // the `account` row; `auth.api.getAccessToken` refreshes them.
+          accessType: "offline" as const,
+          prompt: "select_account consent" as const,
+          // Sign-in doubles as the Gmail grant. Read-only for now; wider
+          // scopes (send, modify) can be requested later per user via
+          // `linkSocial({ provider: "google", scopes: [...] })` without
+          // re-onboarding everyone.
+          scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+      }),
+    }),
     session: {
       // Short-lived signed cookie holding the session payload, so gated
       // requests validate without a database round-trip until it expires.
@@ -111,9 +131,6 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
             secure: true,
           },
         },
-    // OAuth extension point — add providers here later, e.g.
-    // just a config change so should be easy
-    // socialProviders: { github: { clientId, clientSecret } }.
   });
 };
 
@@ -224,14 +241,43 @@ export const BetterAuthPg = Layer.effect(
       return raw ? Option.some(new URL(raw).origin) : Option.none();
     };
 
+    // Google OAuth credentials, bound in alchemy.run.ts from the deploy
+    // machine's env. Read lazily for the same reason as FRONTEND_ORIGIN.
+    // None means the stage deployed without them (only the integ-test
+    // stage legitimately does): the provider is simply not offered.
+    const google = (): Option.Option<{
+      clientId: string;
+      clientSecret: string;
+    }> => {
+      const clientId = env.GOOGLE_CLIENT_ID as string | undefined;
+      const clientSecret = env.GOOGLE_CLIENT_SECRET as string | undefined;
+      return clientId && clientSecret
+        ? Option.some({ clientId, clientSecret })
+        : Option.none();
+    };
+
     const withAuth = <A>(
       requestUrl: string,
       use: (auth: AuthInstance) => Promise<A>,
     ) =>
       Effect.gen(function* () {
-        const baseOrigin = new URL(requestUrl).origin;
+        // The public origin bound in alchemy.run.ts, not the request URL:
+        // under `alchemy dev` the request URL inside workerd carries the
+        // proxy's random internal port (127.0.0.1:<random>), and Google
+        // rejects OAuth callbacks built from anything but the exact
+        // registered origin. The request URL is only a fallback for a
+        // missing binding (first deploy of a fresh stage).
+        const baseOrigin = (env.API_ORIGIN as string | undefined)
+          ? new URL(env.API_ORIGIN as string).origin
+          : new URL(requestUrl).origin;
         const connectionString = Redacted.value(yield* conn.connectionString);
-        const secretValue = Redacted.value(yield* secret);
+        // The integ-test stage overrides the per-stage Random secret with
+        // one the test run generated (TEST_AUTH_SECRET, bound in
+        // alchemy.run.ts only for that stage), so the tests' test-utils
+        // BetterAuth instance can sign session cookies this worker accepts.
+        const secretValue =
+          (env.TEST_AUTH_SECRET as string | undefined) ??
+          Redacted.value(yield* secret);
         const frontend = frontendOrigin();
         const pool = new pg.Pool({ connectionString, max: 1 });
         return yield* Effect.tryPromise({
@@ -244,6 +290,7 @@ export const BetterAuthPg = Layer.effect(
                 isLocal: /^http:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(
                   baseOrigin,
                 ),
+                google: google(),
               }),
             ),
           catch: (cause) => new AuthError({ cause }),

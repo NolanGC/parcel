@@ -11,7 +11,7 @@ import { Path } from "effect/Path";
 import { adopt } from "alchemy/AdoptPolicy";
 
 import { Hyperdrive, Postgres, PostgresLive } from "./backend/src/Db.ts";
-import TodoServiceLive, { TodoService } from "./backend/src/TodoService.ts";
+import ApiServiceLive, { ApiService } from "./backend/src/ApiService.ts";
 
 export default Alchemy.Stack(
   "Parcel",
@@ -24,7 +24,7 @@ export default Alchemy.Stack(
     state: Cloudflare.state(),
   },
   Effect.gen(function* () {
-    const { branchId } = yield* Postgres;
+    const { branchId, origin } = yield* Postgres;
     const hd = yield* Hyperdrive;
     const path = yield* Path;
     const stage = yield* Alchemy.Stage;
@@ -55,7 +55,7 @@ export default Alchemy.Stack(
     // account (`wrangler whoami` / dashboard), not per-stage. Set in .env
     // locally and in CI env for cloud deploys. Combined with each worker's
     // deterministic `name` (below), this makes both URLs plain strings known
-    // before either resource deploys, so Website and TodoService never need
+    // before either resource deploys, so Website and ApiService never need
     // each other's live Output to configure VITE_API_URL / FRONTEND_ORIGIN —
     // no circular dependency, no bootstrap-order deploy required. Worker
     // names must be DNS-safe, so stage names like `dev_someone` are
@@ -93,7 +93,7 @@ export default Alchemy.Stack(
     const apiUrl = url("api");
     const websiteUrl = url("web");
 
-    const api = yield* TodoService;
+    const api = yield* ApiService;
 
     yield* Cloudflare.Website.Vite("Website", {
       name: `parcel-web-${dnsSafeStage}`,
@@ -114,6 +114,76 @@ export default Alchemy.Stack(
       ],
     });
 
+    // The worker's own public origin. It cannot derive this from request
+    // URLs: under `alchemy dev` the request URL inside workerd carries the
+    // proxy's random internal port (e.g. 127.0.0.1:56385), and OAuth
+    // callbacks must be built from the exact origin registered with Google.
+    yield* api.bind("API_ORIGIN", {
+      bindings: [{ type: "plain_text", name: "API_ORIGIN", text: apiUrl }],
+    });
+
+    // Google OAuth credentials, from .env locally and CI env for cloud
+    // deploys (Google Cloud Console → APIs & Services → Credentials). Google
+    // is the only sign-in method, so a production deploy without them would
+    // ship a worker nobody can log into — fail the deploy instead. Other
+    // stages may deploy without them (the integ-test stage doesn't use
+    // Google at all); Auth.ts just leaves the provider off.
+    const googleClientId = yield* Config.option(
+      Config.string("GOOGLE_CLIENT_ID"),
+    );
+    const googleClientSecret = yield* Config.option(
+      Config.string("GOOGLE_CLIENT_SECRET"),
+    );
+    const googleOAuth = Option.all({
+      clientId: googleClientId,
+      clientSecret: googleClientSecret,
+    });
+    if (isProduction && Option.isNone(googleOAuth)) {
+      return yield* Effect.die(
+        new Error(
+          "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set for production deploys — Google is the only sign-in method.",
+        ),
+      );
+    }
+    if (Option.isSome(googleOAuth)) {
+      yield* api.bind("GOOGLE_OAUTH", {
+        bindings: [
+          {
+            type: "plain_text",
+            name: "GOOGLE_CLIENT_ID",
+            text: googleOAuth.value.clientId,
+          },
+          {
+            type: "secret_text",
+            name: "GOOGLE_CLIENT_SECRET",
+            text: googleOAuth.value.clientSecret,
+          },
+        ],
+      });
+    }
+
+    // The integ tests (test/integ.test.ts) mint session cookies with their
+    // own test-only BetterAuth instance (test-utils plugin) over this
+    // stage's database — an OAuth consent screen can't run headlessly, and
+    // no other auth method is deployed. For the worker to accept those
+    // cookies it must sign with the same secret: the test run generates one
+    // (INTEG_AUTH_SECRET in its own process env) and this binding overrides
+    // the per-stage Random secret with it, on the "test" stage only.
+    const integAuthSecret = yield* Config.option(
+      Config.string("INTEG_AUTH_SECRET"),
+    );
+    if (stage === "test" && Option.isSome(integAuthSecret)) {
+      yield* api.bind("TEST_AUTH_SECRET", {
+        bindings: [
+          {
+            type: "secret_text",
+            name: "TEST_AUTH_SECRET",
+            text: integAuthSecret.value,
+          },
+        ],
+      });
+    }
+
     return {
       apiUrl,
       websiteUrl,
@@ -121,6 +191,11 @@ export default Alchemy.Stack(
       hyperdriveId: hd.hyperdriveId,
       nameServers: zone?.nameServers,
       zoneStatus: zone?.status,
+      // Only the integ-test stage exposes the database origin: the tests
+      // connect to it directly to persist users/sessions through their
+      // test-only BetterAuth instance. Undefined everywhere else so real
+      // deploys never surface database credentials in outputs.
+      dbOrigin: stage === "test" ? origin : undefined,
     };
-  }).pipe(Effect.provide(TodoServiceLive), Effect.provide(PostgresLive)),
+  }).pipe(Effect.provide(ApiServiceLive), Effect.provide(PostgresLive)),
 );

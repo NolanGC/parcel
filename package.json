@@ -6,7 +6,8 @@
   "workspaces": [
     "backend",
     "frontend",
-    "packages/desktop"
+    "packages/desktop",
+    "perf"
   ],
   "scripts": {
     "build": "tsc --noEmit",
@@ -20,6 +21,7 @@
     "destroy:branch": "alchemy destroy --stage pr-$(git branch --show-current | tr '[:upper:]/_' '[:lower:]--' | tr -cd 'a-z0-9-')",
     "clear": "pkill -f 'workerd serve' || true",
     "destroy": "alchemy destroy",
+    "perf": "bun perf/src/bench.ts",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --disable-nested-config .",
@@ -31,7 +33,9 @@
     "@cloudflare/workers-types": "^4.20250805.0",
     "@effect/platform-bun": "4.0.0-beta.88",
     "@effect/platform-node": "4.0.0-beta.88",
+    "@effect/sql": "^0.52.0",
     "@effect/sql-pg": "4.0.0-beta.88",
+    "@effect/sql-sqlite-wasm": "^0.53.0",
     "alchemy": "2.0.0-beta.59",
     "better-auth": "^1.6.23",
     "drizzle-orm": "1.0.0-rc.1",

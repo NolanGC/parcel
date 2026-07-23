@@ -6,25 +6,39 @@
 // - Deploy and teardown of the whole stack, including adoption of resources
 //   stranded by earlier failed runs (`adopt: true`).
 // - Stack outputs exist (website/api URLs, database branch id, Hyperdrive id).
-// - Auth gating: anonymous /api/todos → 401.
-// - Real BetterAuth email sign-up returning a usable session cookie.
-// - Full CRUD through the API: create (with server-side title trimming and
-//   422 on an empty title), list, toggle, delete.
-// - Per-user isolation: a second user can't see, toggle, or delete the
-//   first user's todo (the userId-scoped WHERE clauses answer 404).
+// - Auth wiring: anonymous get-session answers null.
+// - Real BetterAuth sessions: users and sessions are minted directly in
+//   the stage's database by a test-only BetterAuth instance (the test-utils
+//   plugin, per the Better Auth testing docs) and the resulting cookie is
+//   accepted by the deployed worker. The app itself is Google-only — no
+//   password endpoints exist on any stage, and OAuth consent can't run
+//   headlessly, so this is the supported way to authenticate tests.
 //
 // Does NOT cover:
-// - Sign-in, sign-out, session expiry (only sign-up is exercised).
+// - Google OAuth sign-in (the only real sign-in method; needs a browser).
+// - Sign-out and session expiry.
 // - The Website worker beyond deploying it, and none of the frontend.
 // - Local dev mode (`alchemy dev`); the test always deploys to the cloud.
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
 import * as Planetscale from "alchemy/Planetscale";
 import * as Test from "alchemy/Test/Bun";
+import { betterAuth } from "better-auth";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { testUtils } from "better-auth/plugins";
 import { expect } from "bun:test";
+import { drizzle } from "drizzle-orm/node-postgres";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 import * as Schedule from "effect/Schedule";
+import pg from "pg";
+import {
+  Account,
+  Session,
+  User,
+  Verification,
+} from "../backend/src/auth-schema.ts";
 import Stack from "../alchemy.run.ts";
 
 // Opt-in guard: a bare `bun test` must never deploy real infrastructure.
@@ -35,6 +49,14 @@ if (process.env.INTEG !== "1") {
   );
   process.exit(0);
 }
+
+// Fresh auth secret per run, handed to the deploy below through the
+// process env: alchemy.run.ts binds it to the test-stage worker as
+// TEST_AUTH_SECRET, and the test-only BetterAuth instance in
+// mintSessionCookie signs cookies with it — same secret + same database is
+// what makes the deployed worker accept them.
+const INTEG_AUTH_SECRET = crypto.randomUUID();
+process.env.INTEG_AUTH_SECRET = INTEG_AUTH_SECRET;
 
 const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
   providers: Layer.mergeAll(
@@ -57,9 +79,10 @@ const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
   adopt: true,
 });
 
-// The `test` stage provisions its own dedicated PlanetScale cluster, which
-// takes longer than the default 120s hook timeout to become ready — give the
-// deploy/teardown hooks the same 5 min budget as the test bodies below.
+// The `test` stage branches off the staging database (see Db.ts), so the
+// deploy is mostly workers + Hyperdrive; the 5 min budget is headroom over
+// the default 120s hook timeout for slow Cloudflare/PlanetScale API days,
+// matching the test bodies below.
 const stack = beforeAll(deploy(Stack), { timeout: 300_000 });
 
 // Teardown must not leave paid resources behind, so ride out transient API
@@ -148,35 +171,66 @@ const api = (
     }),
   );
 
-// Creates a real user through the auth API and returns the session cookie
-// BetterAuth set, so requests below authenticate the same way a browser
-// would.
-const signUpTestUser = (apiUrl: string) =>
-  Effect.gen(function* () {
-    const response = yield* api(apiUrl, "/api/auth/sign-up/email", {
-      method: "POST",
-      body: {
-        name: "Integ Tester",
-        email: `integ-${crypto.randomUUID()}@example.com`,
-        password: "integ-password-123",
-      },
+// The database origin the stack exposes on the test stage (undefined on
+// every other stage — see alchemy.run.ts).
+type DbOrigin = Cloudflare.Hyperdrive.Origin;
+
+// Creates a real user + session directly in the stage's database through a
+// test-only BetterAuth instance (test-utils plugin) and returns the session
+// cookie, so requests below authenticate exactly like a browser that
+// completed the Google flow — same user row, session row, and signed
+// cookie; no auth HTTP endpoints involved (none that mint sessions are
+// deployed). Retried because a freshly provisioned branch can refuse the
+// first direct connections.
+const mintSessionCookie = (apiUrl: string, dbOrigin: DbOrigin) =>
+  Effect.tryPromise(async () => {
+    const pool = new pg.Pool({
+      host: dbOrigin.host,
+      port: "port" in dbOrigin ? dbOrigin.port : undefined,
+      database: dbOrigin.database,
+      user: dbOrigin.user,
+      password: Redacted.value(dbOrigin.password),
+      ssl: true,
+      max: 1,
     });
-    expect(response.status).toBe(200);
-    const cookie = response.setCookie
-      .map((header) => header.split(";")[0])
-      .join("; ");
-    expect(cookie).not.toBe("");
-    return cookie;
-  });
-
-interface WireTodo {
-  readonly id: string;
-  readonly title: string;
-  readonly completed: boolean;
-}
-
-const todoIds = (body: unknown): ReadonlyArray<string> =>
-  (body as ReadonlyArray<WireTodo>).map((todo) => todo.id);
+    try {
+      const auth = betterAuth({
+        database: drizzleAdapter(drizzle({ client: pool }), {
+          provider: "pg",
+          schema: {
+            user: User,
+            session: Session,
+            account: Account,
+            verification: Verification,
+          },
+        }),
+        secret: INTEG_AUTH_SECRET,
+        baseURL: apiUrl,
+        basePath: "/api/auth",
+        // Must mirror the worker's cloud cookie attributes (Auth.ts): the
+        // secure flag is what puts the __Secure- prefix on the cookie name
+        // the worker looks up.
+        advanced: {
+          defaultCookieAttributes: { sameSite: "none", secure: true },
+        },
+        plugins: [testUtils()],
+      });
+      const ctx = await auth.$context;
+      const user = ctx.test.createUser({
+        email: `integ-${crypto.randomUUID()}@example.com`,
+        name: "Integ Tester",
+      });
+      await ctx.test.saveUser(user);
+      const { headers } = await ctx.test.login({ userId: user.id });
+      const cookie = headers.get("cookie");
+      if (cookie === null || cookie === "") {
+        throw new Error("test-utils login returned no session cookie");
+      }
+      return cookie;
+    } finally {
+      await pool.end();
+    }
+  }).pipe(Effect.retry({ times: 4, schedule: Schedule.spaced("5 seconds") }));
 
 test(
   "stack exposes frontend, api, hyperdrive, and database branch ids",
@@ -191,72 +245,26 @@ test(
 );
 
 test(
-  "todos are gated per user and support full CRUD",
+  "the deployed worker resolves sessions minted by the test-utils instance",
   Effect.gen(function* () {
-    const { apiUrl } = yield* stack;
+    const { apiUrl, dbOrigin } = yield* stack;
     yield* getWhenReady(apiUrl);
 
-    const anonymous = yield* api(apiUrl, "/api/todos");
-    expect(anonymous.status).toBe(401);
+    // Anonymous get-session answers null: the worker is up, auth-wired,
+    // and not leaking a session to strangers.
+    const anonymous = yield* api(apiUrl, "/api/auth/get-session");
+    expect(anonymous.status).toBe(200);
+    expect(anonymous.body ?? null).toBeNull();
 
-    const alice = yield* signUpTestUser(apiUrl);
-    const bob = yield* signUpTestUser(apiUrl);
-
-    // Create validates and trims the title server-side.
-    const blank = yield* api(apiUrl, "/api/todos", {
-      method: "POST",
-      cookie: alice,
-      body: { title: "   " },
-    });
-    expect(blank.status).toBe(422);
-
-    const title = `Ship the integration test ${crypto.randomUUID()}`;
-    const created = yield* api(apiUrl, "/api/todos", {
-      method: "POST",
-      cookie: alice,
-      body: { title: `  ${title}  ` },
-    });
-    expect(created.status).toBe(201);
-    const todo = created.body as WireTodo;
-    expect(todo.title).toBe(title);
-    expect(todo.completed).toBe(false);
-
-    const aliceList = yield* api(apiUrl, "/api/todos", { cookie: alice });
-    expect(aliceList.status).toBe(200);
-    expect(todoIds(aliceList.body)).toContain(todo.id);
-
-    // Another user can't see the todo, and the userId-scoped WHERE clauses
-    // make it indistinguishable from a missing one when they try to mutate.
-    const bobList = yield* api(apiUrl, "/api/todos", { cookie: bob });
-    expect(bobList.status).toBe(200);
-    expect(todoIds(bobList.body)).not.toContain(todo.id);
-    const bobPatch = yield* api(apiUrl, `/api/todos/${todo.id}`, {
-      method: "PATCH",
-      cookie: bob,
-      body: { completed: true },
-    });
-    expect(bobPatch.status).toBe(404);
-    const bobDelete = yield* api(apiUrl, `/api/todos/${todo.id}`, {
-      method: "DELETE",
-      cookie: bob,
-    });
-    expect(bobDelete.status).toBe(404);
-
-    const patched = yield* api(apiUrl, `/api/todos/${todo.id}`, {
-      method: "PATCH",
-      cookie: alice,
-      body: { completed: true },
-    });
-    expect(patched.status).toBe(200);
-    expect((patched.body as WireTodo).completed).toBe(true);
-
-    const deleted = yield* api(apiUrl, `/api/todos/${todo.id}`, {
-      method: "DELETE",
-      cookie: alice,
-    });
-    expect(deleted.status).toBe(200);
-    const afterDelete = yield* api(apiUrl, "/api/todos", { cookie: alice });
-    expect(todoIds(afterDelete.body)).not.toContain(todo.id);
+    expect(dbOrigin).toBeDefined();
+    const cookie = yield* mintSessionCookie(apiUrl, dbOrigin!);
+    const session = yield* api(apiUrl, "/api/auth/get-session", { cookie });
+    expect(session.status).toBe(200);
+    const body = session.body as {
+      readonly user?: { readonly email?: string; readonly name?: string };
+    };
+    expect(body.user?.name).toBe("Integ Tester");
+    expect(body.user?.email).toContain("@example.com");
   }),
   { timeout: 300_000 },
 );

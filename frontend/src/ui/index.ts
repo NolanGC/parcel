@@ -9,6 +9,7 @@
  * tiers, never raw colors or durations.
  */
 
+export * from "./badge";
 export * from "./button";
 export * from "./icon";
 export * from "./label";
@@ -17,5 +18,6 @@ export * from "./surface";
 export * from "./switch";
 export * as Menu from "./menu";
 export * as Palette from "./palette";
-export * as Table from "./table";
+export * as Popover from "./popover";
 export * as Tabs from "./tabs";
+export * as VirtualList from "./virtualList";

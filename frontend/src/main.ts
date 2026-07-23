@@ -1,6 +1,5 @@
-import { MAX_TODO_TITLE_LENGTH, Todo, TodoId } from "@foldkit/backend";
-import { Input } from "@foldkit/ui";
-import { Array, Effect, Match as M, Option, Schema as S, Stream } from "effect";
+import { Effect, Match as M, Option, Schema as S, Stream } from "effect";
+import { KeyValueStore } from "effect/unstable/persistence";
 import { Command, Runtime, Subscription } from "foldkit";
 import { html, type Document, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
@@ -10,6 +9,7 @@ import { evo } from "foldkit/struct";
 import { Url, toString as urlToString } from "foldkit/url";
 
 import {
+  AuthClient,
   CheckSession,
   ClearSession,
   CompletedSessionPersistence,
@@ -21,31 +21,23 @@ import {
   SignOut,
   readStoredSession,
 } from "./auth";
-import { API_URL } from "./config";
 import { Inbox, Login } from "./page";
 import {
   AppRoute,
   homeRouter,
+  inboxRouter,
   loginRouter,
-  todosRouter,
   urlToAppRoute,
 } from "./route";
+import { SyncEngine } from "./sync";
+import * as Ui from "./ui";
 
 const APP_NAME = "parcel";
 
 // MODEL
 
-// Todos live in Postgres, so the client fetches them after login and models
-// them as remote data.
-export const TodosLoading = ts("TodosLoading");
-export const TodosFailed = ts("TodosFailed", { error: S.String });
-export const TodosLoaded = ts("TodosLoaded", { todos: S.Array(Todo) });
-
-const TodosState = S.Union([TodosLoading, TodosFailed, TodosLoaded]);
-type TodosState = typeof TodosState.Type;
-
-// Top-level union: todo state only exists when logged in. The
-// sign-in/sign-up form itself is the shared `Login` page submodel.
+// Top-level union: the inbox route is gated on the session, everything
+// else (the marketing landing, the sign-in page) is browsable logged out.
 export const LoggedOut = ts("LoggedOut", {
   route: AppRoute,
   loginPage: Login.Model,
@@ -56,13 +48,6 @@ export type LoggedOut = typeof LoggedOut.Type;
 export const LoggedIn = ts("LoggedIn", {
   route: AppRoute,
   session: Session,
-  todos: TodosState,
-  newTitle: S.String,
-  // True while a create request is in flight; the form is disabled so a
-  // double submit can't insert twice.
-  creating: S.Boolean,
-  // Latest failed mutation (create/toggle/delete); cleared on the next edit.
-  actionError: S.Option(S.String),
   inboxPage: Inbox.Model,
 });
 export type LoggedIn = typeof LoggedIn.Type;
@@ -78,19 +63,6 @@ export const ClickedLink = m("ClickedLink", {
   request: UrlRequest,
 });
 export const ChangedUrl = m("ChangedUrl", { url: Url });
-export const GotTodos = m("GotTodos", { todos: S.Array(Todo) });
-export const FailedFetchTodos = m("FailedFetchTodos", { error: S.String });
-export const UpdatedNewTitle = m("UpdatedNewTitle", { value: S.String });
-export const SubmittedNewTodo = m("SubmittedNewTodo");
-export const CreatedTodo = m("CreatedTodo", { todo: Todo });
-export const ClickedToggle = m("ClickedToggle", {
-  id: TodoId,
-  completed: S.Boolean,
-});
-export const UpdatedTodo = m("UpdatedTodo", { todo: Todo });
-export const ClickedDelete = m("ClickedDelete", { id: TodoId });
-export const DeletedTodo = m("DeletedTodo", { id: TodoId });
-export const FailedMutateTodo = m("FailedMutateTodo", { error: S.String });
 export const GotLoginMessage = m("GotLoginMessage", {
   message: Login.Message,
 });
@@ -104,16 +76,6 @@ export const Message = S.Union([
   CompletedLoadExternal,
   ClickedLink,
   ChangedUrl,
-  GotTodos,
-  FailedFetchTodos,
-  UpdatedNewTitle,
-  SubmittedNewTodo,
-  CreatedTodo,
-  ClickedToggle,
-  UpdatedTodo,
-  ClickedDelete,
-  DeletedTodo,
-  FailedMutateTodo,
   GotLoginMessage,
   GotInboxMessage,
   ClickedSignOut,
@@ -140,53 +102,105 @@ export const flags: Effect.Effect<Flags> = readStoredSession.pipe(
 
 // INIT
 
-const initLoggedOut = (route: AppRoute, checkingSession: boolean): LoggedOut =>
+const initLoggedOut = (
+  route: AppRoute,
+  checkingSession: boolean,
+  loginError: Option.Option<string> = Option.none(),
+): LoggedOut =>
   LoggedOut({
     route,
-    loginPage: Login.init(checkingSession),
+    loginPage: Login.init(checkingSession, loginError),
     inboxPage: Inbox.init(),
   });
+
+// A declined or failed Google round-trip lands back on /login?error=<code>
+// (the errorCallbackURL in auth.ts); read it at boot so the page can say
+// what happened instead of silently showing the button again.
+const oauthErrorFromUrl = (url: Url): Option.Option<string> =>
+  Option.map(
+    Option.flatMap(url.search, (search) =>
+      Option.fromNullishOr(new URLSearchParams(search).get("error")),
+    ),
+    (code) =>
+      code === "access_denied"
+        ? "Google sign-in was cancelled."
+        : `Google sign-in failed (${code}).`,
+  );
 
 const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
   LoggedIn({
     route,
     session,
-    todos: TodosLoading(),
-    newTitle: "",
-    creating: false,
-    actionError: Option.none(),
     inboxPage: Inbox.init(),
   });
 
-export const init: Runtime.RoutingApplicationInit<Model, Message, Flags> = (
-  flags,
-  url,
-) => {
+// Everything the app's commands can require; entry.ts provides the
+// matching layers via `resources`.
+export type AppResources =
+  | AuthClient
+  | KeyValueStore.KeyValueStore
+  | SyncEngine;
+
+// The inbox page owns the LoadInbox command; wrapping its messages here
+// keeps the parent/child message boundary intact.
+const loadInboxCommands = (): ReadonlyArray<
+  Command.Command<Message, never, AppResources>
+> =>
+  Command.mapMessages([Inbox.LoadInbox()], (message) =>
+    GotInboxMessage({ message }),
+  );
+
+export const init: Runtime.RoutingApplicationInit<
+  Model,
+  Message,
+  Flags,
+  AppResources
+> = (flags, url) => {
   const route = urlToAppRoute(url);
 
+  // Pure: returns the starting model plus command *descriptions* — the
+  // runtime executes them after boot. Every branch revalidates with
+  // CheckSession because the cached session is only an optimistic first
+  // paint; the cookie's verdict arrives later as GotSession.
   return Option.match(flags.maybeSession, {
     onNone: () =>
-      route._tag === "Todos"
-        ? ([
+      route._tag === "Inbox"
+        ? // No cached session but the URL asks for the gated inbox: start
+          // on the login page instead (replaceUrl, so /inbox doesn't
+          // pollute history) while the session check runs.
+          ([
             initLoggedOut(LoginRouteValue, true),
             [RedirectToLogin(), CheckSession()],
           ] as const)
-        : ([initLoggedOut(route, true), [CheckSession()]] as const),
+        : // No cached session on a public route: render it as requested.
+          // This is also where a failed OAuth round-trip lands
+          // (/login?error=...), so surface that error on the login page.
+          ([
+            initLoggedOut(route, true, oauthErrorFromUrl(url)),
+            [CheckSession()],
+          ] as const),
     onSome: (session) =>
       route._tag === "Login"
-        ? ([
-            initLoggedIn(TodosRouteValue, session),
-            [RedirectToTodos(), FetchTodos(), CheckSession()],
+        ? // Cached session but the URL is /login: nothing to sign into —
+          // bounce straight to the inbox.
+          ([
+            initLoggedIn(InboxRouteValue, session),
+            [RedirectToInbox(), CheckSession(), ...loadInboxCommands()],
           ] as const)
-        : ([
+        : // Cached session on any other route: paint logged-in
+          // immediately; GotSession later confirms or evicts (the
+          // "cached profile lied" transition in update). The inbox pull
+          // starts on the optimistic session — a stale cookie surfaces as
+          // the pull's own auth error, not a blank list.
+          ([
             initLoggedIn(route, session),
-            [FetchTodos(), CheckSession()],
+            [CheckSession(), ...loadInboxCommands()],
           ] as const),
   });
 };
 
 const LoginRouteValue: AppRoute = { _tag: "Login" };
-const TodosRouteValue: AppRoute = { _tag: "Todos" };
+const InboxRouteValue: AppRoute = { _tag: "Inbox" };
 const HomeRouteValue: AppRoute = { _tag: "Home" };
 
 // COMMAND
@@ -208,166 +222,35 @@ const RedirectToLogin = Command.define(
   CompletedNavigateInternal,
 )(replaceUrl(loginRouter()).pipe(Effect.as(CompletedNavigateInternal())));
 
-const RedirectToTodos = Command.define(
-  "RedirectToTodos",
+const RedirectToInbox = Command.define(
+  "RedirectToInbox",
   CompletedNavigateInternal,
-)(replaceUrl(todosRouter()).pipe(Effect.as(CompletedNavigateInternal())));
+)(replaceUrl(inboxRouter()).pipe(Effect.as(CompletedNavigateInternal())));
 
 const RedirectToHome = Command.define(
   "RedirectToHome",
   CompletedNavigateInternal,
 )(replaceUrl(homeRouter()).pipe(Effect.as(CompletedNavigateInternal())));
 
-// All API endpoints are cookie-authenticated, so every call must be
-// credentialed — that's what makes the browser attach the session cookie
-// across the frontend/api origin split. Error responses are plain text, so
-// the body doubles as the user-facing message.
-const apiFetch = (path: string, init?: RequestInit) =>
-  Effect.tryPromise(async () => {
-    const response = await fetch(new URL(path, API_URL), {
-      credentials: "include",
-      ...init,
-    });
-    const text = await response.text();
-    return { response, text };
-  });
-
-const parseJson = (text: string): unknown => {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return null;
-  }
-};
-
-const errorMessage = (
-  response: Response,
-  text: string,
-  fallback: string,
-): string =>
-  text.trim().length > 0 && !response.ok
-    ? text.trim()
-    : `${fallback} (${response.status})`;
-
-const jsonInit = (method: string, payload: unknown): RequestInit => ({
-  method,
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify(payload),
-});
-
-const decodeTodos = S.decodeUnknownOption(S.Array(Todo));
-const decodeTodo = S.decodeUnknownOption(Todo);
-
-export const FetchTodos = Command.define(
-  "FetchTodos",
-  GotTodos,
-  FailedFetchTodos,
-)(
-  apiFetch("/api/todos").pipe(
-    Effect.map(({ response, text }) =>
-      Option.match(response.ok ? decodeTodos(parseJson(text)) : Option.none(), {
-        onNone: () =>
-          FailedFetchTodos({
-            error: errorMessage(response, text, "Failed to load todos."),
-          }),
-        onSome: (todos) => GotTodos({ todos }),
-      }),
-    ),
-    Effect.catch((error) =>
-      Effect.succeed(FailedFetchTodos({ error: String(error) })),
-    ),
-  ),
-);
-
-export const CreateTodo = Command.define(
-  "CreateTodo",
-  { title: S.String },
-  CreatedTodo,
-  FailedMutateTodo,
-)(({ title }) =>
-  apiFetch("/api/todos", jsonInit("POST", { title })).pipe(
-    Effect.map(({ response, text }) =>
-      Option.match(response.ok ? decodeTodo(parseJson(text)) : Option.none(), {
-        onNone: () =>
-          FailedMutateTodo({
-            error: errorMessage(response, text, "Failed to add the todo."),
-          }),
-        onSome: (todo) => CreatedTodo({ todo }),
-      }),
-    ),
-    Effect.catch((error) =>
-      Effect.succeed(FailedMutateTodo({ error: String(error) })),
-    ),
-  ),
-);
-
-export const ToggleTodo = Command.define(
-  "ToggleTodo",
-  { id: TodoId, completed: S.Boolean },
-  UpdatedTodo,
-  FailedMutateTodo,
-)(({ completed, id }) =>
-  apiFetch(`/api/todos/${id}`, jsonInit("PATCH", { completed })).pipe(
-    Effect.map(({ response, text }) =>
-      Option.match(response.ok ? decodeTodo(parseJson(text)) : Option.none(), {
-        onNone: () =>
-          FailedMutateTodo({
-            error: errorMessage(response, text, "Failed to update the todo."),
-          }),
-        onSome: (todo) => UpdatedTodo({ todo }),
-      }),
-    ),
-    Effect.catch((error) =>
-      Effect.succeed(FailedMutateTodo({ error: String(error) })),
-    ),
-  ),
-);
-
-export const DeleteTodo = Command.define(
-  "DeleteTodo",
-  { id: TodoId },
-  DeletedTodo,
-  FailedMutateTodo,
-)(({ id }) =>
-  apiFetch(`/api/todos/${id}`, { method: "DELETE" }).pipe(
-    Effect.map(({ response, text }) =>
-      response.ok
-        ? DeletedTodo({ id })
-        : FailedMutateTodo({
-            error: errorMessage(response, text, "Failed to delete the todo."),
-          }),
-    ),
-    Effect.catch((error) =>
-      Effect.succeed(FailedMutateTodo({ error: String(error) })),
-    ),
-  ),
-);
-
 // UPDATE
 
-type UpdateReturn = readonly [Model, ReadonlyArray<Command.Command<Message>>];
+type UpdateReturn = readonly [
+  Model,
+  ReadonlyArray<Command.Command<Message, never, AppResources>>,
+];
 const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
-// Entering the logged-in world from anywhere: land on the todo list,
-// persist the profile cache, and load it.
+// Entering the logged-in world from anywhere: land in the inbox, persist
+// the profile cache, and start the first real pull.
 const enterLoggedIn = (session: Session): UpdateReturn => [
-  initLoggedIn(TodosRouteValue, session),
-  [SaveSession({ session }), RedirectToTodos(), FetchTodos()],
+  initLoggedIn(InboxRouteValue, session),
+  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands()],
 ];
 
 const leaveLoggedIn = (): UpdateReturn => [
   initLoggedOut(HomeRouteValue, false),
   [ClearSession(), RedirectToHome()],
 ];
-
-const replaceTodo = (state: TodosState, todo: Todo): TodosState =>
-  state._tag === "TodosLoaded"
-    ? TodosLoaded({
-        todos: Array.map(state.todos, (existing) =>
-          existing.id === todo.id ? todo : existing,
-        ),
-      })
-    : state;
 
 export const update = (model: Model, message: Message): UpdateReturn =>
   M.value(message).pipe(
@@ -393,15 +276,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const route = urlToAppRoute(url);
 
         if (model._tag === "LoggedOut") {
-          // The todo list is gated; everything else is browsable while
-          // logged out.
-          return route._tag === "Todos"
+          // The inbox is gated; everything else is browsable while logged out.
+          return route._tag === "Inbox"
             ? [model, [RedirectToLogin()]]
             : [evo(model, { route: () => route }), []];
         }
 
         if (route._tag === "Login") {
-          return [model, [RedirectToTodos()]];
+          return [model, [RedirectToInbox()]];
         }
 
         return [evo(model, { route: () => route }), []];
@@ -448,11 +330,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           : [model, []],
 
       GotLoginMessage: ({ message }) => {
-        // The submodel signals a completed sign-in/up; the transition out
-        // of LoggedOut belongs to the app, so intercept it here.
-        if (message._tag === "SucceededAuth") {
-          return enterLoggedIn(message.session);
-        }
+        // Sign-in completes via a full-page OAuth redirect, not a submodel
+        // message: the returning visit's boot-time CheckSession performs
+        // the logged-in transition (GotSession above).
         if (model._tag !== "LoggedOut") return [model, []];
         const [loginPage, commands] = Login.update(model.loginPage, message);
         return [
@@ -465,9 +345,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       GotInboxMessage: ({ message }) => {
         const [inboxPage, commands] = Inbox.update(model.inboxPage, message);
-        const mapped = Command.mapMessages(commands, (message) =>
-          GotInboxMessage({ message }),
-        );
+        const mapped = [
+          ...Command.mapMessages(commands, (message) =>
+            GotInboxMessage({ message }),
+          ),
+          // The inbox's account popover offers sign-out, but the session is
+          // this model's to end — the page only closes its popover.
+          ...(message._tag === "InboxClickedSignOut" ? [SignOut()] : []),
+        ];
         // The arms are intentionally identical: `evo` needs the union
         // narrowed to a concrete variant, and both variants carry inboxPage.
         return model._tag === "LoggedOut"
@@ -477,97 +362,6 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       ClickedSignOut: () => [model, [SignOut()]],
       CompletedSignOut: () => leaveLoggedIn(),
-
-      GotTodos: ({ todos }) =>
-        model._tag === "LoggedIn"
-          ? [evo(model, { todos: () => TodosLoaded({ todos }) }), []]
-          : [model, []],
-
-      FailedFetchTodos: ({ error }) =>
-        model._tag === "LoggedIn"
-          ? [evo(model, { todos: () => TodosFailed({ error }) }), []]
-          : [model, []],
-
-      UpdatedNewTitle: ({ value }) =>
-        model._tag === "LoggedIn"
-          ? [
-              evo(model, {
-                newTitle: () => value,
-                actionError: () => Option.none(),
-              }),
-              [],
-            ]
-          : [model, []],
-
-      SubmittedNewTodo: () => {
-        if (model._tag !== "LoggedIn" || model.creating) return [model, []];
-        const title = model.newTitle.trim();
-        if (title.length === 0) return [model, []];
-        return [
-          evo(model, {
-            creating: () => true,
-            actionError: () => Option.none(),
-          }),
-          [CreateTodo({ title })],
-        ];
-      },
-
-      CreatedTodo: ({ todo }) =>
-        model._tag === "LoggedIn"
-          ? [
-              evo(model, {
-                todos: (todos) =>
-                  todos._tag === "TodosLoaded"
-                    ? TodosLoaded({ todos: [...todos.todos, todo] })
-                    : todos,
-                newTitle: () => "",
-                creating: () => false,
-              }),
-              [],
-            ]
-          : [model, []],
-
-      ClickedToggle: ({ completed, id }) =>
-        model._tag === "LoggedIn"
-          ? [model, [ToggleTodo({ id, completed })]]
-          : [model, []],
-
-      UpdatedTodo: ({ todo }) =>
-        model._tag === "LoggedIn"
-          ? [evo(model, { todos: (todos) => replaceTodo(todos, todo) }), []]
-          : [model, []],
-
-      ClickedDelete: ({ id }) =>
-        model._tag === "LoggedIn" ? [model, [DeleteTodo({ id })]] : [model, []],
-
-      DeletedTodo: ({ id }) =>
-        model._tag === "LoggedIn"
-          ? [
-              evo(model, {
-                todos: (todos) =>
-                  todos._tag === "TodosLoaded"
-                    ? TodosLoaded({
-                        todos: Array.filter(
-                          todos.todos,
-                          (todo) => todo.id !== id,
-                        ),
-                      })
-                    : todos,
-              }),
-              [],
-            ]
-          : [model, []],
-
-      FailedMutateTodo: ({ error }) =>
-        model._tag === "LoggedIn"
-          ? [
-              evo(model, {
-                creating: () => false,
-                actionError: () => Option.some(error),
-              }),
-              [],
-            ]
-          : [model, []],
     }),
   );
 
@@ -577,7 +371,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 // while the inbox route is active — the dependency flips the stream on and
 // off as the route changes. `preventDefault` runs synchronously inside the
 // mapper, before the browser's own search shortcut fires.
-export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
+const keyboardSubscriptions = Subscription.make<Model, Message>()((entry) => ({
   paletteShortcut: entry(
     { isInbox: S.Boolean },
     {
@@ -603,94 +397,87 @@ export const subscriptions = Subscription.make<Model, Message>()((entry) => ({
         ),
     },
   ),
+  // j/k/Enter/Escape drive the inbox list (selection, open, close). Bare
+  // keys only, and never while typing — the palette's input (or any
+  // editable target) keeps its keystrokes.
+  listKeys: entry(
+    { isInbox: S.Boolean },
+    {
+      modelToDependencies: (model) => ({
+        isInbox: model.route._tag === "Inbox",
+      }),
+      dependenciesToStream: ({ isInbox }) =>
+        Stream.when(
+          Subscription.fromEventFilterMap<KeyboardEvent, Message>({
+            target: window,
+            type: "keydown",
+            toMessage: (event) => {
+              if (event.metaKey || event.ctrlKey || event.altKey) {
+                return Option.none();
+              }
+              const target = event.target;
+              if (
+                target instanceof HTMLElement &&
+                (target.tagName === "INPUT" ||
+                  target.tagName === "TEXTAREA" ||
+                  target.isContentEditable)
+              ) {
+                return Option.none();
+              }
+              const key = event.key;
+              return key === "j" ||
+                key === "k" ||
+                key === "Enter" ||
+                key === "Escape"
+                ? Option.some(
+                    GotInboxMessage({
+                      message: Inbox.PressedListKey({ key }),
+                    }),
+                  )
+                : Option.none();
+            },
+          }),
+          Effect.sync(() => isInbox),
+        ),
+    },
+  ),
 }));
+
+// The inbox list's scroll/resize tracking. The base VirtualList owns the
+// subscription (a MutationObserver reattaches it as the container mounts and
+// unmounts); we only lift it into this model/message context. Its scrollTop
+// drives the visible window and the traveling hover overlay.
+const listScrollSubscriptions = Subscription.lift(Ui.VirtualList.subscriptions)<
+  Model,
+  Message
+>({
+  toChildModel: (model) => model.inboxPage.list,
+  toParentMessage: (message) =>
+    GotInboxMessage({ message: Inbox.GotListMessage({ message }) }),
+});
+
+export const subscriptions = Subscription.aggregate<Model, Message>()(
+  keyboardSubscriptions,
+  listScrollSubscriptions,
+);
+
 export const managedResources = undefined;
 
 // VIEW
 
-const navigationView = (model: LoggedIn): Html => {
-  const h = html<Message>();
-
-  return h.nav(
-    [h.Class("border-b border-neutral-900")],
-    [
-      h.div(
-        [
-          h.Class(
-            "mx-auto flex max-w-5xl items-center gap-2 px-3 py-3 sm:px-4",
-          ),
-        ],
-        [
-          h.div(
-            [
-              h.Class(
-                "mr-2 shrink-0 text-sm font-bold uppercase text-neutral-400 sm:mr-4",
-              ),
-            ],
-            [h.a([h.Href(homeRouter())], [APP_NAME])],
-          ),
-          h.ul(
-            [h.Class("flex min-w-0 flex-1 items-center gap-1")],
-            [
-              h.li(
-                [],
-                [
-                  h.a(
-                    [
-                      h.Href(todosRouter()),
-                      h.Class(
-                        `px-3 py-2 text-sm font-medium ${
-                          model.route._tag === "Todos"
-                            ? "bg-neutral-800 text-neutral-100"
-                            : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"
-                        }`,
-                      ),
-                    ],
-                    ["Todos"],
-                  ),
-                ],
-              ),
-            ],
-          ),
-          h.div(
-            [
-              h.Class(
-                "ml-2 flex shrink-0 items-center gap-2 sm:ml-auto sm:gap-3",
-              ),
-            ],
-            [
-              h.span(
-                [h.Class("hidden text-sm text-neutral-400 sm:inline")],
-                [model.session.name],
-              ),
-              h.button(
-                [
-                  h.Type("button"),
-                  h.OnClick(ClickedSignOut()),
-                  h.Class(
-                    "border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm font-medium text-neutral-300 hover:bg-neutral-800 sm:px-3",
-                  ),
-                ],
-                ["Sign out"],
-              ),
-            ],
-          ),
-        ],
-      ),
-    ],
-  );
-};
-
 export const view = (model: Model): Document =>
   model._tag === "LoggedOut" ? loggedOutView(model) : loggedInView(model);
 
-const inboxView = (inboxPage: Inbox.Model): Html => {
+const inboxView = (inboxPage: Inbox.Model, session: Session): Html => {
   const h = html<Message>();
 
   return h.submodel({
     slotId: "inbox",
     model: inboxPage,
     view: Inbox.view,
+    viewInputs: {
+      profile: { name: session.name, email: session.email },
+    },
     toParentMessage: (message) => GotInboxMessage({ message }),
   });
 };
@@ -702,17 +489,11 @@ const loggedOutView = (model: LoggedOut): Document => {
     M.withReturnType<Document>(),
     M.tagsExhaustive({
       Home: () => ({ title: APP_NAME, body: landingView(false) }),
-      // Redirect in flight; render the landing rather than a flash of form.
-      Todos: () => ({ title: APP_NAME, body: landingView(false) }),
-      Inbox: () => ({
-        title: `Inbox — ${APP_NAME}`,
-        body: inboxView(model.inboxPage),
-      }),
+      // Redirect in flight; render the landing rather than a flash of the
+      // gated inbox.
+      Inbox: () => ({ title: APP_NAME, body: landingView(false) }),
       Login: () => ({
-        title:
-          model.loginPage.mode._tag === "SignInMode"
-            ? `Sign in — ${APP_NAME}`
-            : `Sign up — ${APP_NAME}`,
+        title: `Sign in — ${APP_NAME}`,
         body: loginView(model),
       }),
       NotFound: ({ path }) => ({
@@ -725,9 +506,6 @@ const loggedOutView = (model: LoggedOut): Document => {
     }),
   );
 };
-
-const authFieldClass =
-  "w-full border border-neutral-700 bg-neutral-950 px-4 py-3 text-neutral-100 outline-none placeholder:text-neutral-500 focus-visible:border-neutral-400 focus-visible:ring-1 focus-visible:ring-neutral-400 disabled:opacity-50";
 
 const loginView = (model: LoggedOut): Html => {
   const h = html<Message>();
@@ -743,36 +521,30 @@ const loginView = (model: LoggedOut): Html => {
 const loggedInView = (model: LoggedIn): Document => {
   const h = html<Message>();
 
-  if (model.route._tag === "Home") {
-    return { title: APP_NAME, body: landingView(true) };
-  }
-
-  // The inbox sketch is a full-window design; render it without the app
-  // chrome, same as the logged-out variant.
-  if (model.route._tag === "Inbox") {
-    return { title: `Inbox — ${APP_NAME}`, body: inboxView(model.inboxPage) };
-  }
-
-  const routeContent = M.value(model.route).pipe(
-    M.withReturnType<Html>(),
+  return M.value(model.route).pipe(
+    M.withReturnType<Document>(),
     M.tagsExhaustive({
-      NotFound: ({ path }) =>
-        notFoundView("Page not found", `No route for ${path}.`),
-      Login: () => h.empty,
-      Todos: () => todosView(model),
+      Home: () => ({ title: APP_NAME, body: landingView(true) }),
+      // Redirect to the inbox in flight.
+      Login: () => ({ title: APP_NAME, body: landingView(true) }),
+      // The inbox is a full-window design; no app chrome around it.
+      Inbox: () => ({
+        title: `Inbox — ${APP_NAME}`,
+        body: inboxView(model.inboxPage, model.session),
+      }),
+      NotFound: ({ path }) => ({
+        title: "Not Found",
+        body: h.div(
+          [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
+          [notFoundView("Page not found", `No route for ${path}.`)],
+        ),
+      }),
     }),
   );
-
-  return {
-    title:
-      model.route._tag === "NotFound" ? "Not Found" : `Todos — ${APP_NAME}`,
-    body: h.div(
-      [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
-      [navigationView(model), routeContent],
-    ),
-  };
 };
 
+// The marketing landing: the only public page besides sign-in. Static
+// content served from the SPA bundle.
 const landingView = (isLoggedIn: boolean): Html => {
   const h = html<Message>();
 
@@ -786,163 +558,30 @@ const landingView = (isLoggedIn: boolean): Html => {
           h.p(
             [h.Class("mt-3 text-neutral-400")],
             [
-              "A simple todo list built end-to-end with Effect, using Foldkit and Alchemy.",
+              "A fast, keyboard-first email client for your Gmail. Sign in with Google and your inbox is ready — nothing to configure.",
             ],
           ),
           h.a(
             [
-              h.Href(isLoggedIn ? todosRouter() : loginRouter()),
+              h.Href(isLoggedIn ? inboxRouter() : loginRouter()),
               h.Class("mt-8 inline-block underline underline-offset-4"),
             ],
-            [isLoggedIn ? "Open your todos →" : "Sign in to your todos →"],
+            [isLoggedIn ? "Open your inbox →" : "Sign in with Google →"],
           ),
-        ],
-      ),
-    ],
-  );
-};
-
-const todoItemView = (todo: Todo): Html => {
-  const h = html<Message>();
-
-  return h.keyed("li")(
-    todo.id,
-    [
-      h.Class(
-        "flex items-center gap-3 border border-neutral-800 bg-neutral-900 px-4 py-3",
-      ),
-    ],
-    [
-      h.input([
-        h.Type("checkbox"),
-        h.Checked(todo.completed),
-        h.OnClick(ClickedToggle({ id: todo.id, completed: !todo.completed })),
-        h.AriaLabel(
-          todo.completed
-            ? `Mark "${todo.title}" as not done`
-            : `Mark "${todo.title}" as done`,
-        ),
-        h.Class("size-4 shrink-0 accent-neutral-400"),
-      ]),
-      h.span(
-        [
-          h.Class(
-            todo.completed
-              ? "min-w-0 flex-1 break-words text-neutral-500 line-through"
-              : "min-w-0 flex-1 break-words",
-          ),
-        ],
-        [todo.title],
-      ),
-      h.button(
-        [
-          h.Type("button"),
-          h.OnClick(ClickedDelete({ id: todo.id })),
-          h.AriaLabel(`Delete "${todo.title}"`),
-          h.Class(
-            "shrink-0 border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200",
-          ),
-        ],
-        ["Delete"],
-      ),
-    ],
-  );
-};
-
-const todoListView = (model: LoggedIn): Html => {
-  const h = html<Message>();
-
-  return M.value(model.todos).pipe(
-    M.withReturnType<Html>(),
-    M.tagsExhaustive({
-      TodosLoading: () =>
-        h.p([h.Class("mt-8 text-neutral-500")], ["Loading todos…"]),
-      TodosFailed: ({ error }) =>
-        h.p([h.Class("mt-8 text-sm text-red-400"), h.Role("alert")], [error]),
-      TodosLoaded: ({ todos }) => {
-        if (todos.length === 0) {
-          return h.p(
-            [h.Class("mt-8 text-neutral-500")],
-            ["Nothing to do yet."],
-          );
-        }
-        const remaining = Array.filter(todos, (todo) => !todo.completed).length;
-        return h.div(
-          [h.Class("mt-8")],
-          [
-            h.ul(
-              [h.Class("flex flex-col gap-2")],
-              Array.map(todos, todoItemView),
-            ),
-            h.p(
-              [h.Class("mt-4 text-sm text-neutral-500")],
-              [
-                remaining === 1
-                  ? "1 todo remaining"
-                  : `${remaining} todos remaining`,
-              ],
-            ),
-          ],
-        );
-      },
-    }),
-  );
-};
-
-const todosView = (model: LoggedIn): Html => {
-  const h = html<Message>();
-  const canSubmit =
-    !model.creating &&
-    model.newTitle.trim().length > 0 &&
-    model.newTitle.trim().length <= MAX_TODO_TITLE_LENGTH;
-
-  return h.main(
-    [h.Class("mx-auto max-w-xl px-4 py-10")],
-    [
-      h.h1([h.Class("text-2xl font-bold")], ["Todos"]),
-      h.form(
-        [h.Class("mt-6 flex gap-2"), h.OnSubmit(SubmittedNewTodo())],
-        [
-          Input.view<Message>({
-            id: "new-todo",
-            value: model.newTitle,
-            isDisabled: model.creating,
-            onInput: (value) => UpdatedNewTitle({ value }),
-            toView: (attributes) =>
-              h.div(
-                [h.Class("min-w-0 flex-1")],
+          isLoggedIn
+            ? h.button(
                 [
-                  h.label(
-                    [...attributes.label, h.Class("sr-only")],
-                    ["New todo"],
+                  h.Type("button"),
+                  h.OnClick(ClickedSignOut()),
+                  h.Class(
+                    "mt-6 block text-sm text-neutral-400 underline underline-offset-4 hover:text-neutral-200",
                   ),
-                  h.input([
-                    ...attributes.input,
-                    h.Type("text"),
-                    h.Placeholder("What needs doing?"),
-                    h.Class(authFieldClass),
-                  ]),
                 ],
-              ),
-          }),
-          h.button(
-            [
-              h.Type("submit"),
-              h.Disabled(!canSubmit),
-              h.Class(
-                "shrink-0 border border-neutral-700 bg-neutral-800 px-4 py-3 font-medium text-neutral-100 hover:bg-neutral-700 disabled:opacity-50",
-              ),
-            ],
-            [model.creating ? "Adding…" : "Add"],
-          ),
+                ["Sign out"],
+              )
+            : h.empty,
         ],
       ),
-      Option.match(model.actionError, {
-        onNone: () => h.empty,
-        onSome: (error) =>
-          h.p([h.Class("mt-3 text-sm text-red-400"), h.Role("alert")], [error]),
-      }),
-      todoListView(model),
     ],
   );
 };

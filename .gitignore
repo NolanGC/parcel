@@ -21,3 +21,6 @@ packages/desktop/src-tauri/gen/schemas/
 # Local tooling
 .direnv/
 .DS_Store
+
+# Perf harness: persistent Chrome profile (contains a live session)
+perf/.chrome-profile/

@@ -3,53 +3,31 @@
 // command execution.
 //
 // Covers:
-// - Logged out: the login route renders the sign-in form; the landing page
-//   links to sign-in.
-// - Logged in: nav shows the user's name and a sign-out button; the todo
-//   list renders its items, the labeled composer with Add disabled when
-//   empty, per-item toggle/delete controls, the remaining count; the empty
-//   state; a mutation error renders as role="alert".
+// - Logged out: the login route renders the Google sign-in button; the
+//   landing page links to sign-in.
+// - Logged in: the landing page links to the inbox and offers sign-out.
 //
 // Does NOT cover:
-// - Click flows (adding, toggling, deleting, signing out).
-// - Anything visual: layout, styling, focus management.
-import { TodoId, UserId, type Todo } from "@foldkit/backend";
-import { DateTime, Option } from "effect";
-import { Scene } from "foldkit";
+// - The inbox sketch itself (static mock; heavy to snapshot semantically).
+// - Click flows or anything visual: layout, styling, focus management.
+import { UserId } from "@foldkit/backend";
+import { Option } from "effect";
+import { AsyncData, Scene } from "foldkit";
 import { describe, test } from "vitest";
 
-import { TodosLoaded, update, view, type Model } from "./main";
+import { ThreadId } from "./Gmail";
+import { update, view, type Model } from "./main";
 import { Inbox, Login } from "./page";
-import { HomeRoute, LoginRoute, TodosRoute } from "./route";
-
-const createdAt = DateTime.makeUnsafe(0);
-
-const milk: Todo = {
-  id: TodoId.make("00000000-0000-4000-8000-000000000001"),
-  title: "Buy milk",
-  completed: false,
-  createdAt,
-};
-
-const bread: Todo = {
-  id: TodoId.make("00000000-0000-4000-8000-000000000002"),
-  title: "Bake bread",
-  completed: true,
-  createdAt,
-};
+import { HomeRoute, InboxRoute, LoginRoute } from "./route";
 
 const loggedInModel: Model = {
   _tag: "LoggedIn",
-  route: TodosRoute(),
+  route: HomeRoute(),
   session: {
     userId: UserId.make("user-ada"),
     email: "ada@example.com",
     name: "Ada",
   },
-  todos: TodosLoaded({ todos: [milk, bread] }),
-  newTitle: "",
-  creating: false,
-  actionError: Option.none(),
   inboxPage: Inbox.init(),
 };
 
@@ -61,14 +39,26 @@ const loggedOutModel: Model = {
 };
 
 describe("view", () => {
-  test("logged out, the login route renders the sign-in form", () => {
+  test("logged out, the login route renders the Google sign-in", () => {
     Scene.scene(
       { update, view },
       Scene.with(loggedOutModel),
       Scene.expect(Scene.role("heading", { name: "Sign in" })).toExist(),
-      Scene.expect(Scene.label("Email")).toExist(),
-      Scene.expect(Scene.label("Password")).toExist(),
-      Scene.expect(Scene.role("button", { name: "Sign in" })).toBeEnabled(),
+      Scene.expect(
+        Scene.role("button", { name: "Continue with Google" }),
+      ).toBeEnabled(),
+    );
+  });
+
+  test("a sign-in error renders as an alert", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with({
+        ...loggedOutModel,
+        loginPage: Login.init(false, Option.some("Google sign-in failed.")),
+      }),
+      Scene.expect(Scene.role("alert")).toExist(),
+      Scene.expect(Scene.text("Google sign-in failed.")).toExist(),
     );
   });
 
@@ -77,56 +67,54 @@ describe("view", () => {
       { update, view },
       Scene.with({ ...loggedOutModel, route: HomeRoute() }),
       Scene.expect(
-        Scene.role("link", { name: "Sign in to your todos →" }),
+        Scene.role("link", { name: "Sign in with Google →" }),
       ).toExist(),
     );
   });
 
-  test("logged in, the nav shows the user and a sign out button", () => {
+  test("logged in, the landing page opens the inbox and offers sign out", () => {
     Scene.scene(
       { update, view },
       Scene.with(loggedInModel),
-      Scene.expect(Scene.text("Ada")).toExist(),
+      Scene.expect(Scene.role("link", { name: "Open your inbox →" })).toExist(),
       Scene.expect(Scene.role("button", { name: "Sign out" })).toExist(),
     );
   });
 
-  test("the todo list renders items, controls, and the remaining count", () => {
-    Scene.scene(
-      { update, view },
-      Scene.with(loggedInModel),
-      Scene.expect(Scene.role("heading", { name: "Todos" })).toExist(),
-      Scene.expect(Scene.text("Buy milk")).toExist(),
-      Scene.expect(Scene.text("Bake bread")).toExist(),
-      Scene.expect(Scene.label("New todo")).toExist(),
-      Scene.expect(Scene.role("button", { name: "Add" })).toBeDisabled(),
-      Scene.expect(
-        Scene.role("checkbox", { name: 'Mark "Buy milk" as done' }),
-      ).toExist(),
-      Scene.expect(
-        Scene.role("button", { name: 'Delete "Buy milk"' }),
-      ).toExist(),
-      Scene.expect(Scene.text("1 todo remaining")).toExist(),
-    );
-  });
+  // Renders the inbox route so the virtualized list submodel actually builds
+  // (its itemToView/itemToKey viewInputs pass foldkit's walker). The list
+  // container starts Unmeasured — no ResizeObserver fires in a Scene — so the
+  // window is empty; we assert the section and the list container are present.
+  test("the inbox route renders the list section", () => {
+    const inboxModel: Model = {
+      _tag: "LoggedIn",
+      route: InboxRoute(),
+      session: {
+        userId: UserId.make("user-ada"),
+        email: "ada@example.com",
+        name: "Ada",
+      },
+      inboxPage: {
+        ...Inbox.init(),
+        threads: AsyncData.succeed([
+          {
+            id: ThreadId.make("thread-1"),
+            subject: "Hi",
+            sender: "Ada",
+            snippet: "hello",
+            date: 1,
+            unread: false,
+            category: "none" as const,
+          },
+        ]),
+      },
+    };
 
-  test("an empty list renders the empty state", () => {
     Scene.scene(
       { update, view },
-      Scene.with({ ...loggedInModel, todos: TodosLoaded({ todos: [] }) }),
-      Scene.expect(Scene.text("Nothing to do yet.")).toExist(),
-    );
-  });
-
-  test("a mutation error renders as an alert", () => {
-    Scene.scene(
-      { update, view },
-      Scene.with({
-        ...loggedInModel,
-        actionError: Option.some("Failed to add the todo."),
-      }),
-      Scene.expect(Scene.role("alert")).toExist(),
-      Scene.expect(Scene.text("Failed to add the todo.")).toExist(),
+      Scene.with(inboxModel),
+      Scene.expect(Scene.text("Inbox")).toExist(),
+      Scene.expect(Scene.role("list")).toExist(),
     );
   });
 });

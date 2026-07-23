@@ -6,6 +6,7 @@
     "frontend/scripts/**/*.ts",
     "frontend/vite.config.ts",
     "frontend/vitest.config.ts",
+    "perf/src/**/*.ts",
     "test/**/*.ts"
   ],
   "compilerOptions": {
