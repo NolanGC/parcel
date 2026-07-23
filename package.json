@@ -49,13 +49,5 @@
     "drizzle-kit": "1.0.0-rc.1",
     "oxfmt": "^0.57.0",
     "oxlint": "^1.72.0"
-  },
-  "overrides": {
-    "@distilled.cloud/cloudflare-runtime": "0.12.0",
-    "@distilled.cloud/cloudflare-vite-plugin": "0.12.0",
-    "@distilled.cloud/cloudflare-rolldown-plugin": "0.12.0"
-  },
-  "patchedDependencies": {
-    "alchemy@2.0.0-beta.59": "patches/alchemy@2.0.0-beta.59.patch"
   }
 }
