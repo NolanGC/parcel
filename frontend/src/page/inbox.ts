@@ -1,17 +1,16 @@
-import { Cause, Effect, Match as M, Option, Schema as S } from "effect";
-import { Command, Submodel } from "foldkit";
+import { Cause, Effect, Match as M, Option, Result, Schema as S } from "effect";
+import { AsyncData, Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
+import { ts } from "foldkit/schema";
 import { evo } from "foldkit/struct";
 
 import * as Icon from "../icons";
 import { ThreadId } from "../Gmail";
 import {
-  CACHE_TIER,
   SyncEngine,
   ThreadDetail,
   ThreadRow,
-  type CacheTier,
   type MessageDetail,
   type ThreadCategory,
 } from "../sync";
@@ -202,6 +201,20 @@ const InboxPalette = Ui.Palette.create<string>();
 
 // MODEL
 
+// The inbox rows as an async-loaded value: Loading renders the placeholder,
+// Success/Refreshing the rows, Failure the error, and Stale keeps the last
+// good rows on screen with the refresh error above them.
+const ThreadsData = AsyncData.Schema(S.Array(ThreadRow), S.String);
+
+// Which screen the page shows, as a tagged state — the list, the list with a
+// thread load in flight, or an open thread. One state at a time, so "detail
+// open while a different load is pending" can't be expressed.
+export const ShowingList = ts("ShowingList", { error: S.Option(S.String) });
+export const OpeningThread = ts("OpeningThread", { id: ThreadId });
+export const ShowingThread = ts("ShowingThread", { detail: ThreadDetail });
+export const Screen = S.Union([ShowingList, OpeningThread, ShowingThread]);
+export type Screen = typeof Screen.Type;
+
 export const Model = S.Struct({
   appearance: Appearance,
   folderMenu: Ui.Menu.Model,
@@ -209,15 +222,8 @@ export const Model = S.Struct({
   list: Ui.VirtualList.Model,
   palette: Ui.Palette.Model,
   accountPopover: Ui.Popover.Model,
-  // None = the first load hasn't completed; Some([]) = a genuinely empty
-  // inbox. loadError keeps the last failure for the list to surface.
-  threads: S.Option(S.Array(ThreadRow)),
-  loadError: S.Option(S.String),
-  // The open thread's detail, shown in place of the list. None = the list is
-  // showing. pendingLoad is the thread a LoadThread is in flight for; a
-  // GotThread that doesn't match is stale and dropped.
-  open: S.Option(ThreadDetail),
-  pendingLoad: S.Option(ThreadId),
+  threads: ThreadsData.schema,
+  screen: Screen,
   // The single list cursor: mouse hover and j/k both move it. Drives the
   // traveling hover overlay; Enter (or a click) opens it.
   selected: S.Option(S.Number),
@@ -231,10 +237,10 @@ export const init = (): Model => ({
   list: Ui.VirtualList.init({ id: LIST_ID, rowHeightPx: ROW_HEIGHT }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
-  threads: Option.none(),
-  loadError: Option.none(),
-  open: Option.none(),
-  pendingLoad: Option.none(),
+  // main.ts issues LoadInbox on entering the inbox, so the page is born
+  // loading rather than idle.
+  threads: AsyncData.Loading(),
+  screen: ShowingList({ error: Option.none() }),
   selected: Option.none(),
 });
 
@@ -267,10 +273,6 @@ export const ClickedSignOut = m("InboxClickedSignOut");
 /** The SyncEngine finished a pull: real thread rows from the local store. */
 export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
 export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
-/** Background hydration finished: rows re-read after missing content synced. */
-export const GotHydratedThreads = m("GotHydratedThreads", {
-  rows: S.Array(ThreadRow),
-});
 export const GotThread = m("GotThread", { detail: ThreadDetail });
 /** List keyboard nav from the global subscription in main.ts. */
 export const PressedListKey = m("PressedListKey", {
@@ -293,7 +295,6 @@ export const Message = S.Union([
   ClickedSignOut,
   GotThreads,
   FailedLoadInbox,
-  GotHydratedThreads,
   GotThread,
   PressedListKey,
   FailedLoadThread,
@@ -341,26 +342,8 @@ export const LoadInbox = Command.define(
   }),
 );
 
-// Pulls full content for any listed thread that has none locally, then
-// re-reads the rows. Issued right after GotThreads so the list is painted.
-const HydrateInbox = Command.define(
-  "HydrateInbox",
-  GotHydratedThreads,
-  FailedLoadInbox,
-)(
-  Effect.gen(function* () {
-    const engine = yield* SyncEngine;
-    return yield* engine.hydrateMissing.pipe(
-      Effect.map((rows) => GotHydratedThreads({ rows })),
-      Effect.catchCause((cause) =>
-        Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
-      ),
-    );
-  }),
-);
-
-// Opens a thread from the local store only: SQLite rows, bodies gunzipped on
-// the fly, cid: images rewritten from locally cached bytes — no network.
+// Opens a thread from the local store only: SQLite rows, cid: images
+// rewritten from locally cached bytes — no network.
 export const LoadThread = Command.define(
   "LoadThread",
   { id: ThreadId },
@@ -408,34 +391,28 @@ type UpdateReturn = readonly [
   ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
 ];
 
-const threadIdAt = (model: Model, index: number): ThreadId | undefined =>
-  Option.match(model.threads, {
-    onNone: () => undefined,
-    onSome: (rows) => rows[index]?.id,
-  });
+const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
+  Option.getOrElse(AsyncData.getData(model.threads), () => []);
 
 // Row clicks and the Enter key both funnel here: move the cursor to the row
 // and, unless its thread is already open, load it.
 const openThread = (model: Model, index: number): UpdateReturn => {
-  const id = threadIdAt(model, index);
+  const id = listedRows(model)[index]?.id;
   const base = evo(model, { selected: () => Option.some(index) });
-  if (id === undefined || Option.exists(base.open, (open) => open.id === id)) {
+  if (
+    id === undefined ||
+    (base.screen._tag === "ShowingThread" && base.screen.detail.id === id)
+  ) {
     return [base, []];
   }
   return [
-    evo(base, {
-      open: () => Option.none<ThreadDetail>(),
-      pendingLoad: () => Option.some(id),
-    }),
+    evo(base, { screen: () => OpeningThread({ id }) }),
     [LoadThread({ id })],
   ];
 };
 
 const closeThread = (model: Model): UpdateReturn => [
-  evo(model, {
-    open: () => Option.none<ThreadDetail>(),
-    pendingLoad: () => Option.none<ThreadId>(),
-  }),
+  evo(model, { screen: () => ShowingList({ error: Option.none() }) }),
   [],
 ];
 
@@ -539,38 +516,37 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
+      // settle folds the fetch outcome into whatever state threads is in:
+      // success replaces the rows; failure keeps any previous rows (Stale)
+      // or lands on Failure when there were none.
       GotThreads: ({ rows }) => [
         evo(model, {
-          threads: () => Option.some(rows),
-          loadError: () => Option.none<string>(),
+          threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
+            Result.succeed(rows),
+          ),
         }),
-        [HydrateInbox()],
-      ],
-
-      GotHydratedThreads: ({ rows }) => [
-        evo(model, { threads: () => Option.some(rows) }),
         [],
       ],
 
       FailedLoadInbox: ({ error }) => [
-        evo(model, { loadError: () => Option.some(error) }),
+        evo(model, {
+          threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
+            Result.fail(error),
+          ),
+        }),
         [],
       ],
 
       GotThread: ({ detail }) => {
         // Only the load we're still waiting for counts — anything else is a
         // superseded open whose row the cursor left.
-        if (!Option.exists(model.pendingLoad, (id) => id === detail.id)) {
+        if (
+          model.screen._tag !== "OpeningThread" ||
+          model.screen.id !== detail.id
+        ) {
           return [model, []];
         }
-        return [
-          evo(model, {
-            open: () => Option.some(detail),
-            pendingLoad: () => Option.none<ThreadId>(),
-            loadError: () => Option.none<string>(),
-          }),
-          [],
-        ];
+        return [evo(model, { screen: () => ShowingThread({ detail }) }), []];
       },
 
       PressedListKey: ({ key }) => {
@@ -578,10 +554,12 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         if (model.palette.dialog.isOpen) return [model, []];
 
         if (key === "Escape") {
-          return Option.isSome(model.open) ? closeThread(model) : [model, []];
+          return model.screen._tag === "ShowingThread"
+            ? closeThread(model)
+            : [model, []];
         }
         // Inside a thread, j/k/Enter are reserved for future in-thread nav.
-        if (Option.isSome(model.open)) return [model, []];
+        if (model.screen._tag === "ShowingThread") return [model, []];
 
         if (key === "Enter") {
           return Option.match(model.selected, {
@@ -590,10 +568,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           });
         }
 
-        const rowCount = Option.match(model.threads, {
-          onNone: () => 0,
-          onSome: (rows) => rows.length,
-        });
+        const rowCount = listedRows(model).length;
         if (rowCount === 0) return [model, []];
         const current = Option.getOrElse(model.selected, () => -1);
         const index =
@@ -608,8 +583,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       FailedLoadThread: ({ error }) => [
         evo(model, {
-          pendingLoad: () => Option.none<ThreadId>(),
-          loadError: () => Option.some(error),
+          screen: () => ShowingList({ error: Option.some(error) }),
         }),
         [],
       ],
@@ -988,25 +962,38 @@ const virtualListView = (
   );
 };
 
+// The loaded rows, preceded by an error row when one is present (a stale
+// refresh, or a thread open that failed).
+const listBodyView = (
+  model: Model,
+  rows: ReadonlyArray<ThreadRow>,
+  error: Option.Option<string>,
+): ReadonlyArray<Html> => [
+  ...Option.match(error, {
+    onNone: (): ReadonlyArray<Html> => [],
+    onSome: (message) => [statusRowView(message)],
+  }),
+  rows.length === 0
+    ? statusRowView("Your inbox is empty.")
+    : virtualListView(model, rows),
+];
+
 // The list section: header, then whichever body the load state calls for.
 const listSectionView = (model: Model): Html => {
   const h = html<Message>();
 
-  const body = Option.match(model.threads, {
-    onNone: (): ReadonlyArray<Html> => [
-      statusRowView(
-        Option.getOrElse(model.loadError, () => "Loading your inbox…"),
-      ),
-    ],
-    onSome: (rows) => [
-      ...Option.match(model.loadError, {
-        onNone: (): ReadonlyArray<Html> => [],
-        onSome: (error) => [statusRowView(error)],
-      }),
-      rows.length === 0
-        ? statusRowView("Your inbox is empty.")
-        : virtualListView(model, rows),
-    ],
+  const openError =
+    model.screen._tag === "ShowingList"
+      ? model.screen.error
+      : Option.none<string>();
+
+  const body = AsyncData.match(model.threads, {
+    onIdle: (): ReadonlyArray<Html> => [statusRowView("Loading your inbox…")],
+    onLoading: () => [statusRowView("Loading your inbox…")],
+    onFailure: (error) => [statusRowView(error)],
+    onSuccess: (rows) => listBodyView(model, rows, openError),
+    onRefreshing: (rows) => listBodyView(model, rows, openError),
+    onStale: ({ error, data }) => listBodyView(model, data, Option.some(error)),
   });
 
   return h.div(
@@ -1020,14 +1007,11 @@ const listSectionView = (model: Model): Html => {
 // Html bodies render in a sandboxed srcdoc iframe (email css can't leak out,
 // ours can't leak in; no scripts run). Plain bodies skip the iframe.
 
-// default-src 'none' keeps the frame network-silent. At the full cache tier
-// every image arrives as a blob: url over locally stored bytes, so img-src
-// drops the network entirely (tracking pixels included). Lower tiers let
-// remote images load live.
+// default-src 'none' blocks everything except images (inline cid: images
+// arrive as blob: urls over locally stored bytes; remote images load live)
+// and inline styles.
 const FRAME_CSP =
-  (CACHE_TIER as CacheTier) === "full"
-    ? "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'"
-    : "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
+  "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
 
 const srcdocFor = (body: string): string =>
   `<!doctype html><html><head><meta charset="utf-8">` +
@@ -1162,10 +1146,14 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
             ),
           ],
           [
-            Option.match(model.open, {
-              onNone: () => listSectionView(model),
-              onSome: (detail) => threadDetailView(detail),
-            }),
+            M.value(model.screen).pipe(
+              M.withReturnType<Html>(),
+              M.tagsExhaustive({
+                ShowingList: () => listSectionView(model),
+                OpeningThread: () => listSectionView(model),
+                ShowingThread: ({ detail }) => threadDetailView(detail),
+              }),
+            ),
           ],
         ),
         h.submodel({

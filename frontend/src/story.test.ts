@@ -201,13 +201,13 @@ describe("update", () => {
       inboxMessage(Inbox.OpenedRow({ index: 0 })),
     );
     const [open] = update(opening, inboxMessage(Inbox.GotThread({ detail })));
-    expect(Option.isSome(open.inboxPage.open)).toBe(true);
+    expect(open.inboxPage.screen._tag).toBe("ShowingThread");
 
     const [closed] = update(
       open,
       inboxMessage(Inbox.PressedListKey({ key: "Escape" })),
     );
-    expect(Option.isNone(closed.inboxPage.open)).toBe(true);
+    expect(closed.inboxPage.screen._tag).toBe("ShowingList");
   });
 
   test("the inbox popover's sign-out runs the SignOut command", () => {

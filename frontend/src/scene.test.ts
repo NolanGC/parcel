@@ -12,7 +12,7 @@
 // - Click flows or anything visual: layout, styling, focus management.
 import { UserId } from "@foldkit/backend";
 import { Option } from "effect";
-import { Scene } from "foldkit";
+import { AsyncData, Scene } from "foldkit";
 import { describe, test } from "vitest";
 
 import { ThreadId } from "./Gmail";
@@ -96,7 +96,7 @@ describe("view", () => {
       },
       inboxPage: {
         ...Inbox.init(),
-        threads: Option.some([
+        threads: AsyncData.succeed([
           {
             id: ThreadId.make("thread-1"),
             subject: "Hi",

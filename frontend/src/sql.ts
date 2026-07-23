@@ -21,20 +21,15 @@ const ClientLive = SqliteClient.layer({
   ),
 });
 
-// Local mailbox store. Normalized around the two access patterns that
-// matter: the inbox list (one indexed query over `threads`, no bodies
-// touched) and opening a thread (its `messages` rows + `message_bodies`
-// decompressed on demand). Everything the UI sorts or filters on is a
-// real column extracted once at sync time — raw API JSON is never stored.
+// Local mailbox store. Everything the UI sorts or filters on is a real
+// column extracted once at sync time — raw API JSON is never stored.
 export const SqlLive = SqliteMigrator.layer({
   loader: Migrator.fromRecord({
     "0001_create_tables": Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      // The sync engine's persistent state. Single-row with typed columns
-      // (CHECK makes "exactly one sync state" a database invariant); NULLs
-      // mean "not yet synced", and the row maps 1:1 onto a schema struct
-      // at the read boundary.
+      // The sync engine's persistent state, a single row by CHECK.
+      // NULLs mean "not yet synced".
       yield* sql`
         CREATE TABLE sync_state (
           id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -57,10 +52,8 @@ export const SqlLive = SqliteMigrator.layer({
       `;
 
       // Denormalized for the list view: everything the inbox needs to
-      // paint lives here. latest_date is epoch milliseconds (Gmail's
-      // internalDate string converted at write time — string ordering
-      // misorders across digit counts). participants is a JSON array of
-      // { name, email } for the "From" column.
+      // paint lives here. latest_date is epoch milliseconds; participants
+      // is a JSON array of sender names.
       yield* sql`
         CREATE TABLE threads (
           id TEXT PRIMARY KEY,
@@ -96,8 +89,6 @@ export const SqlLive = SqliteMigrator.layer({
         CREATE INDEX messages_thread ON messages (thread_id, internal_date)
       `;
 
-      // Junction table (not a JSON column) because label membership is
-      // the core list query — "INBOX ∩ UNREAD" needs an index.
       yield* sql`
         CREATE TABLE message_labels (
           message_id TEXT NOT NULL REFERENCES messages (id),
@@ -110,16 +101,13 @@ export const SqlLive = SqliteMigrator.layer({
       `;
 
       // Bodies live apart from messages so list queries never page them
-      // in. body holds the displayable content (decoded from base64url
-      // MIME at sync time), compressed per the Compression service;
-      // codec ('gzip' | 'none') makes each row self-describing, so the
-      // small-body threshold can change without a migration.
+      // in. body holds the displayable content, decoded from base64url
+      // MIME at sync time.
       yield* sql`
         CREATE TABLE message_bodies (
           message_id TEXT PRIMARY KEY REFERENCES messages (id),
           mime_type TEXT NOT NULL,
-          codec TEXT NOT NULL,
-          body BLOB NOT NULL
+          body TEXT NOT NULL
         )
       `;
 
@@ -135,15 +123,10 @@ export const SqlLive = SqliteMigrator.layer({
           attempts INTEGER NOT NULL DEFAULT 0
         )
       `;
-    }),
 
-    // Inline images (multipart/related parts with a Content-ID) fetched
-    // at sync time so opening a thread touches no network. content_id is
-    // stored without its RFC angle brackets — exactly what the html
-    // references as cid:<content_id>. bytes stay raw: image formats are
-    // already compressed, gzip buys nothing.
-    "0002_message_attachments": Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
+      // Inline images (MIME parts with a Content-ID) fetched at sync time.
+      // content_id is stored without its RFC angle brackets — exactly what
+      // the html references as cid:<content_id>.
       yield* sql`
         CREATE TABLE message_attachments (
           message_id TEXT NOT NULL REFERENCES messages (id),
@@ -151,40 +134,6 @@ export const SqlLive = SqliteMigrator.layer({
           mime_type TEXT NOT NULL,
           bytes BLOB NOT NULL,
           PRIMARY KEY (message_id, content_id)
-        )
-      `;
-    }),
-
-    // Remote html assets (plain <img src="https://..."> in message bodies)
-    // fetched through the API image proxy at sync time, for the deepest
-    // cache tier (see CACHE_TIER in sync.ts). url is stored exactly as it
-    // appears in the html — it's the replaceAll key at read time. bytes
-    // raw, same reasoning as message_attachments.
-    "0003_remote_assets": Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* sql`
-        CREATE TABLE remote_assets (
-          message_id TEXT NOT NULL REFERENCES messages (id),
-          url TEXT NOT NULL,
-          mime_type TEXT NOT NULL,
-          bytes BLOB NOT NULL,
-          PRIMARY KEY (message_id, url)
-        )
-      `;
-    }),
-
-    // Negative cache for the remote-asset fetch: urls that failed through
-    // the proxy (dead tracker endpoints, hotlink-protected CDNs) land here
-    // and are never retried — without this every sync/backfill pass
-    // re-fires every failing url. Keyed by url alone: a url that fails for
-    // one message fails for all. No TTL yet; clearing the table is the
-    // retry mechanism.
-    "0004_remote_asset_failures": Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* sql`
-        CREATE TABLE remote_asset_failures (
-          url TEXT PRIMARY KEY,
-          failed_at INTEGER NOT NULL
         )
       `;
     }),
