@@ -227,6 +227,14 @@ export const Model = S.Struct({
   // The single list cursor: mouse hover and j/k both move it. Drives the
   // traveling hover overlay; Enter (or a click) opens it.
   selected: S.Option(S.Number),
+  // Hover-session state for the traveling overlay (the FF treatment).
+  // Bumped on each pointer entry; keys the overlay so a new session remounts
+  // it (snap + @starting-style fade-in) instead of sliding from a stale row.
+  hoverSession: S.Number,
+  isPointerInside: S.Boolean,
+  // True once j/k has claimed the overlay: it then stays visible regardless
+  // of the pointer, until real mouse motion over a row reclaims it.
+  keyboardControlled: S.Boolean,
 });
 export type Model = typeof Model.Type;
 
@@ -242,6 +250,9 @@ export const init = (): Model => ({
   threads: AsyncData.Loading(),
   screen: ShowingList({ error: Option.none() }),
   selected: Option.none(),
+  hoverSession: 0,
+  isPointerInside: false,
+  keyboardControlled: false,
 });
 
 // MESSAGE
@@ -257,6 +268,10 @@ export const GotListMessage = m("GotListMessage", {
 });
 /** Mouse entered a row: move the cursor (and the hover overlay) there. */
 export const HoveredRow = m("HoveredRow", { index: S.Number });
+/** Pointer entered the list area: a fresh hover session. */
+export const EnteredList = m("EnteredList");
+/** Pointer left the list area: the overlay fades out in place. */
+export const LeftList = m("LeftList");
 /** A row was clicked: open its thread. */
 export const OpenedRow = m("OpenedRow", { index: S.Number });
 /** Toggles the command palette — toolbar button or the global ⌘K sub. */
@@ -288,6 +303,8 @@ export const Message = S.Union([
   GotTabsMessage,
   GotListMessage,
   HoveredRow,
+  EnteredList,
+  LeftList,
   OpenedRow,
   OpenedPalette,
   GotPaletteMessage,
@@ -455,10 +472,33 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
+      // Real pointer motion always reclaims the overlay from the keyboard.
       HoveredRow: ({ index }) => [
-        evo(model, { selected: () => Option.some(index) }),
+        evo(model, {
+          selected: () => Option.some(index),
+          keyboardControlled: () => false,
+        }),
         [],
       ],
+
+      EnteredList: () => [
+        evo(model, {
+          hoverSession: (session) => session + 1,
+          isPointerInside: () => true,
+          // Cleared so the overlay stays unmounted until the first row is
+          // hovered — it then mounts there (snap + fade-in) instead of
+          // sliding from wherever the last session ended. Skipped while the
+          // keyboard holds the overlay: the pointer merely entering the
+          // list shouldn't blank a cursor it hasn't reclaimed.
+          selected: (selected) =>
+            model.keyboardControlled ? selected : Option.none(),
+        }),
+        [],
+      ],
+
+      // The cursor is kept so the overlay fades out in place (data-hidden)
+      // and Enter still opens the last-hovered row.
+      LeftList: () => [evo(model, { isPointerInside: () => false }), []],
 
       OpenedRow: ({ index }) => openThread(model, index),
 
@@ -576,7 +616,10 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             ? Math.min(current + 1, rowCount - 1)
             : Math.max(current - 1, 0);
         return [
-          evo(model, { selected: () => Option.some(index) }),
+          evo(model, {
+            selected: () => Option.some(index),
+            keyboardControlled: () => true,
+          }),
           [ScrollListToRow({ index })],
         ];
       },
@@ -911,15 +954,21 @@ const statusRowView = (text: string): Html => {
 // The traveling hover highlight. One absolutely-positioned overlay glides
 // between rows: `top` (transitioned) gives the travel, `translateY(-scrollTop)`
 // (not transitioned — see .fk-hover-overlay) tracks scrolling instantly.
+// Keyed by the hover session so re-entering the list remounts it (snap +
+// @starting-style fade-in) instead of sliding from a stale row; leaving keeps
+// it mounted and fades it out in place (data-hidden), unless the keyboard
+// holds it.
 const listOverlayView = (model: Model): Html => {
   const h = html<Message>();
   return Option.match(model.selected, {
     onNone: () => h.empty,
-    onSome: (index) =>
-      h.keyed("div")(
-        "inbox-hover-overlay",
+    onSome: (index) => {
+      const visible = model.isPointerInside || model.keyboardControlled;
+      return h.keyed("div")(
+        `inbox-hover-overlay-${model.hoverSession}`,
         [
           h.Class("fk-hover-overlay"),
+          ...(visible ? [] : [h.DataAttribute("hidden", "")]),
           h.Style({
             top: `${index * ROW_HEIGHT}px`,
             left: "0",
@@ -929,7 +978,8 @@ const listOverlayView = (model: Model): Html => {
           }),
         ],
         [],
-      ),
+      );
+    },
   });
 };
 
@@ -941,7 +991,11 @@ const virtualListView = (
 ): Html => {
   const h = html<Message>();
   return h.div(
-    [h.Class("relative min-h-0 flex-1 overflow-clip")],
+    [
+      h.Class("relative min-h-0 flex-1 overflow-clip"),
+      h.OnMouseEnter(EnteredList()),
+      h.OnMouseLeave(LeftList()),
+    ],
     [
       listOverlayView(model),
       h.submodel({

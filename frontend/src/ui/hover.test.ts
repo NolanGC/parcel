@@ -1,19 +1,22 @@
-// Pure-update tests for the Menu's traveling hover overlay: the behavioral
+// Pure-update tests for the traveling hover overlays: the behavioral
 // invariants that make panning read as continuous motion. No DOM, no commands
 // executed — models in, models + issued commands out.
 //
-// Covers: the hover index tracks activations but SURVIVES deactivation (the
-// deadspace fix — the base menu clears its active index in the gaps between
-// items); opening resets rects/hover but measurement waits for
-// CompletedAnchorMenu, when the portaled panel actually exists.
-//
-// (The inbox list's overlay is math-driven off the VirtualList scroll
-// position, not a measured-rect submodel, so it has no pure-update surface to
-// test here — it's exercised by the inbox story/scene tests instead.)
+// Covers:
+// - Menu: the hover index tracks activations but SURVIVES deactivation (the
+//   deadspace fix — the base menu clears its active index in the gaps between
+//   items); opening resets rects/hover but measurement waits for
+//   CompletedAnchorMenu, when the portaled panel actually exists.
+// - Inbox list: the hover-session state machine (positioning itself is pure
+//   arithmetic off the VirtualList scroll, so only the session/claim rules
+//   have behavior worth pinning) — entry starts a fresh session, leave keeps
+//   the cursor for the in-place fade, and the keyboard/pointer claim.
 import { Menu as BaseMenu } from "@foldkit/ui";
 import { Option } from "effect";
 import { describe, expect, test } from "vitest";
 
+import { ThreadId } from "../Gmail";
+import * as Inbox from "../page/inbox";
 import * as Menu from "./menu";
 
 describe("Ui.Menu hover overlay", () => {
@@ -82,5 +85,60 @@ describe("Ui.Menu hover overlay", () => {
       Menu.GotItemRects({ rects: [rect] }),
     );
     expect(next.rects).toEqual([rect]);
+  });
+});
+
+describe("Inbox list hover session", () => {
+  const rows = [3, 4, 5].map((n) => ({
+    id: ThreadId.make(`thread-${n}`),
+    subject: "Hi",
+    sender: "Ada",
+    snippet: "hello",
+    date: n,
+    unread: false,
+    category: "none" as const,
+  }));
+
+  // A list with real rows, pointer inside, cursor mouse-held at `index`.
+  const hoveredAt = (index: number): Inbox.Model => {
+    const [loaded] = Inbox.update(Inbox.init(), Inbox.GotThreads({ rows }));
+    const [entered] = Inbox.update(loaded, Inbox.EnteredList());
+    const [next] = Inbox.update(entered, Inbox.HoveredRow({ index }));
+    return next;
+  };
+
+  test("entering the list starts a fresh session with no cursor", () => {
+    const [left] = Inbox.update(hoveredAt(1), Inbox.LeftList());
+    const [next] = Inbox.update(left, Inbox.EnteredList());
+    // Remounts the overlay (snap + fade-in) instead of sliding from row 1.
+    expect(next.hoverSession).toBe(left.hoverSession + 1);
+    expect(Option.isNone(next.selected)).toBe(true);
+    expect(next.isPointerInside).toBe(true);
+  });
+
+  test("leaving keeps the cursor so the overlay fades out in place", () => {
+    const [next] = Inbox.update(hoveredAt(1), Inbox.LeftList());
+    expect(next.selected).toEqual(Option.some(1));
+    expect(next.isPointerInside).toBe(false);
+  });
+
+  test("a keyboard-held cursor survives the pointer re-entering", () => {
+    const [claimed] = Inbox.update(
+      hoveredAt(1),
+      Inbox.PressedListKey({ key: "j" }),
+    );
+    expect(claimed.keyboardControlled).toBe(true);
+    const [next] = Inbox.update(claimed, Inbox.EnteredList());
+    expect(next.selected).toEqual(claimed.selected);
+  });
+
+  test("real mouse motion over a row reclaims the overlay", () => {
+    const [claimed] = Inbox.update(
+      hoveredAt(1),
+      Inbox.PressedListKey({ key: "j" }),
+    );
+    const [next] = Inbox.update(claimed, Inbox.HoveredRow({ index: 1 }));
+    expect(next.keyboardControlled).toBe(false);
+    expect(next.selected).toEqual(Option.some(1));
   });
 });
