@@ -412,10 +412,7 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       }),
     );
 
-    // Fresh token per request: getAccessToken refreshes server-side when
-    // the stored one is expired, so callers never see a stale token, and
-    // nothing token-shaped survives in this closure between calls.
-    const accessToken = Effect.tryPromise(() =>
+    const fetchAccessToken = Effect.tryPromise(() =>
       authClient.getAccessToken({ providerId: "google" }),
     ).pipe(
       Effect.mapError(
@@ -433,9 +430,24 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       ),
     );
 
+    // getAccessToken is a round-trip to our own backend, and it used to run
+    // once per Gmail call — during a backfill that doubles the request count
+    // and puts our server in front of every single API call. Google's tokens
+    // last an hour; caching for five minutes keeps the refresh-on-expiry
+    // behaviour while collapsing thousands of calls into a handful.
+    //
+    // The cache is what makes a 401 possible mid-flight (a token revoked
+    // inside the window), so `request` invalidates and retries once on an
+    // auth-shaped failure rather than letting the sync machine park in its
+    // terminal NeedsAuth state over a stale string.
+    const [accessToken, invalidateAccessToken] = yield* Effect.cachedInvalidateWithTTL(
+      fetchAccessToken,
+      "5 minutes",
+    );
+
     // Effect.fn wraps every call in a named span, so each Gmail request
     // shows up in traces as "Gmail.request" with its own timing.
-    const request = Effect.fn("Gmail.request")(function* <A>(
+    const sendOnce = Effect.fn("Gmail.request")(function* <A>(
       // `any` on the encoded side: response schemas carry brands on the
       // Type side only, and pinning Encoded would unify A with it.
       schema: S.Codec<A, any>,
@@ -490,6 +502,28 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       );
     });
 
+    // An auth failure on a cached token is ambiguous: the grant may really
+    // be gone, or the string may just have gone stale inside the TTL. Drop
+    // the cache and try once more — if it fails again the grant is genuinely
+    // gone and the error is honest.
+    const request = <A>(
+      schema: S.Codec<A, any>,
+      method: "GET" | "POST",
+      path: string,
+      query: Record<string, QueryValue> = {},
+      body?: unknown,
+    ) =>
+      sendOnce(schema, method, path, query, body).pipe(
+        Effect.catchTag("GmailAuthError", (error) =>
+          invalidateAccessToken.pipe(
+            Effect.andThen(sendOnce(schema, method, path, query, body)),
+            // Preserve the original failure if the retry is refused before
+            // it reaches Google.
+            Effect.catchTag("GmailTokenError", () => Effect.fail(error)),
+          ),
+        ),
+      );
+
     return {
       // READS (covered by gmail.readonly)
 
@@ -543,8 +577,17 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
           `/messages/${messageId}/attachments/${id}`,
         ),
 
-      /** All labels — system (INBOX, UNREAD, …) and user-created. */
+      /** All labels — system (INBOX, UNREAD, …) and user-created. Note that
+       *  the list form omits the counters; use {@link getLabel} for those. */
       listLabels: request(ListLabelsResponse, "GET", "/labels"),
+
+      /**
+       * One label, including its `threadsTotal`/`messagesTotal` counters —
+       * the only way to ask how big a *label* is. `getProfile.threadsTotal`
+       * counts the whole mailbox (All Mail, Sent, Spam, Trash), so it is the
+       * wrong denominator for anything scoped to a label.
+       */
+      getLabel: (id: LabelId) => request(Label, "GET", `/labels/${id}`),
 
       /**
        * The incremental-sync primitive: every mailbox change since

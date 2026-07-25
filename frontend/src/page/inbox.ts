@@ -7,6 +7,7 @@ import { evo } from "foldkit/struct";
 
 import * as Icon from "../icons";
 import { ThreadId } from "../Gmail";
+import { Search, SearchHit } from "../search";
 import {
   SyncEngine,
   ThreadDetail,
@@ -173,30 +174,23 @@ const FOLDERS: Record<FolderLabel, { icon: Ui.IconView; count?: number }> = {
 
 const FolderMenu = Ui.Menu.create<FolderLabel>();
 
-// COMMAND PALETTE — the app's primary control surface (⌘K, or the toolbar
-// search button). Items are plain strings; specs resolve through lookup maps.
+// COMMAND PALETTE — search over the local store (⌘K, or the toolbar search
+// button). Items are thread ids; the corpus is the mailbox itself.
+//
+// The whole store already rides in the model (SyncEngine.loadInbox selects
+// every row — see the VirtualList note in sync.ts), so matching is pure and
+// instant: no command round-trip, no debounce, nothing async to keep honest.
+// The rank/cap happens here rather than in the palette because only an
+// unbounded corpus needs one, and the palette re-applies the same scorer.
 
-const PALETTE_ACTIONS = ["Compose", "Toggle dark mode"] as const;
+const PALETTE_RESULT_LIMIT = 50;
 
-const ACTION_SPECS: Record<string, Ui.Palette.PaletteItemSpec> = {
-  Compose: { icon: Icon.squarePen, label: "Compose" },
-  "Toggle dark mode": {
-    icon: Icon.moon,
-    label: "Toggle dark mode",
-    keywords: "theme appearance light",
-  },
-};
-
-const PALETTE_GROUPS: ReadonlyArray<Ui.Palette.Group<string>> = [
-  { label: "Actions", items: PALETTE_ACTIONS },
-  { label: "Folders", items: FOLDER_LABELS },
-];
-
-const paletteItemSpec = (item: string): Ui.Palette.PaletteItemSpec =>
-  ACTION_SPECS[item] ??
-  (item in FOLDERS
-    ? { icon: FOLDERS[item as FolderLabel].icon, label: item }
-    : { label: item });
+const threadItemSpec = (row: ThreadRow): Ui.Palette.PaletteItemSpec => ({
+  icon: row.unread ? Icon.mail : Icon.mailOpen,
+  label: row.subject === "" ? "(no subject)" : row.subject,
+  detail: row.sender,
+  keywords: `${row.sender} ${row.snippet}`,
+});
 
 const InboxPalette = Ui.Palette.create<string>();
 
@@ -240,6 +234,15 @@ export const Model = S.Struct({
   // True once j/k has claimed the overlay: it then stays visible regardless
   // of the pointer, until real mouse motion over a row reclaims it.
   keyboardControlled: S.Boolean,
+  // The palette's results, as the Search service ranked them — not derived
+  // from `threads`, because the semantic stages coming next will surface
+  // threads no substring pass would find.
+  searchHits: S.Array(SearchHit),
+  // Bumped per issued search; a reply carrying an older seq lost the race to
+  // a later keystroke and is dropped. The correctness half of a debounce,
+  // without the latency half.
+  searchSeq: S.Number,
+  searchError: S.Option(S.String),
 });
 export type Model = typeof Model.Type;
 
@@ -259,6 +262,9 @@ export const init = (): Model => ({
   hoverSession: 0,
   isPointerInside: false,
   keyboardControlled: false,
+  searchHits: [],
+  searchSeq: 0,
+  searchError: Option.none(),
 });
 
 // MESSAGE
@@ -291,6 +297,17 @@ export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
 /** The popover's sign-out action. main.ts owns the session, so it watches for
  *  this tag and runs SignOut; here it only closes the popover. */
 export const ClickedSignOut = m("InboxClickedSignOut");
+/** The popover's light/dark switch. */
+export const ClickedAppearance = m("InboxClickedAppearance");
+/** Ranked results for the search identified by `seq`. */
+export const GotSearchHits = m("GotSearchHits", {
+  seq: S.Number,
+  hits: S.Array(SearchHit),
+});
+export const FailedSearch = m("FailedSearch", {
+  seq: S.Number,
+  error: S.String,
+});
 /** The SyncEngine finished a pull: real thread rows from the local store. */
 export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
 /** A sync-machine fact (checkpoint read, batch landed, failure, …). */
@@ -320,6 +337,9 @@ export const Message = S.Union([
   GotPaletteMessage,
   GotAccountPopoverMessage,
   ClickedSignOut,
+  ClickedAppearance,
+  GotSearchHits,
+  FailedSearch,
   GotThreads,
   GotSyncMessage,
   FailedLoadInbox,
@@ -374,13 +394,34 @@ export const LoadInbox = Command.define(
 /** Everything main.ts issues on entering the inbox: the first local read
  *  plus the sync machine's checkpoint-derived boot. */
 export const bootCommands = (): ReadonlyArray<
-  Command.Command<Message, never, SyncEngine>
+  Command.Command<Message, never, SyncEngine | Search>
 > => [
   LoadInbox(),
   ...Command.mapMessages(SyncMachine.bootCommands(), (message) =>
     GotSyncMessage({ message }),
   ),
 ];
+
+// One palette search. `seq` rides through the service untouched so the
+// update can tell a fresh reply from a superseded one.
+const RunSearch = Command.define(
+  "RunSearch",
+  { seq: S.Number, text: S.String },
+  GotSearchHits,
+  FailedSearch,
+)(({ seq, text }) =>
+  Effect.gen(function* () {
+    const search = yield* Search;
+    return yield* search
+      .search({ text, limit: PALETTE_RESULT_LIMIT })
+      .pipe(
+        Effect.map((hits) => GotSearchHits({ seq, hits })),
+        Effect.catchCause((cause) =>
+          Effect.succeed(FailedSearch({ seq, error: Cause.pretty(cause) })),
+        ),
+      );
+  }),
+);
 
 // Opens a thread from the local store only: SQLite rows, cid: images
 // rewritten from locally cached bytes — no network.
@@ -428,8 +469,16 @@ const ScrollListToRow = Command.define(
 
 type UpdateReturn = readonly [
   Model,
-  ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
+  ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>>,
 ];
+
+// Issues a search and claims the next sequence number. Every palette query
+// goes through here so the seq can never be bumped without a search in
+// flight to match it.
+const runSearch = (model: Model, text: string): UpdateReturn => {
+  const seq = model.searchSeq + 1;
+  return [evo(model, { searchSeq: () => seq }), [RunSearch({ seq, text })]];
+};
 
 const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
   Option.getOrElse(AsyncData.getData(model.threads), () => []);
@@ -477,6 +526,14 @@ const openThread = (model: Model, index: number): UpdateReturn => {
     evo(base, { screen: () => OpeningThread({ id }) }),
     [LoadThread({ id })],
   ];
+};
+
+// Picking a palette result: the item is a thread id, so resolve it back to
+// its list index and reuse the ordinary open path — the cursor lands on the
+// row, so closing the thread returns to it in place.
+const openThreadId = (model: Model, id: string): UpdateReturn => {
+  const index = listedRows(model).findIndex((row) => row.id === id);
+  return index === -1 ? [model, []] : openThread(model, index);
 };
 
 const closeThread = (model: Model): UpdateReturn => [
@@ -553,14 +610,17 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       OpenedRow: ({ index }) => openThread(model, index),
 
+      // Opening runs the empty search, so the palette paints its "recent"
+      // list in the same frame the dialog appears rather than a beat later.
       OpenedPalette: () => {
         const [palette, commands] = InboxPalette.toggle(model.palette);
-        return [
-          evo(model, { palette: () => palette }),
-          Command.mapMessages(commands, (message) =>
-            GotPaletteMessage({ message }),
-          ),
-        ];
+        const opened = evo(model, { palette: () => palette });
+        const paletteCommands = Command.mapMessages(commands, (message) =>
+          GotPaletteMessage({ message }),
+        );
+        if (!palette.dialog.isOpen) return [opened, paletteCommands];
+        const [next, searchCommands] = runSearch(opened, "");
+        return [next, [...paletteCommands, ...searchCommands]];
       },
 
       GotPaletteMessage: ({ message }) => {
@@ -571,28 +631,48 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         const paletteCommands = Command.mapMessages(commands, (message) =>
           GotPaletteMessage({ message }),
         );
-        // Only the theme action has a domain effect in the sketch.
+        const stepped = evo(model, { palette: () => palette });
+        // Every item is a thread id — picking one opens that thread.
         return Option.match(maybeSelected, {
-          onNone: (): UpdateReturn => [
-            evo(model, { palette: () => palette }),
-            paletteCommands,
-          ],
-          onSome: (item): UpdateReturn => {
-            if (item !== "Toggle dark mode") {
-              return [evo(model, { palette: () => palette }), paletteCommands];
+          onSome: (id): UpdateReturn => {
+            const [next, openCommands] = openThreadId(stepped, id);
+            return [next, [...paletteCommands, ...openCommands]];
+          },
+          // A keystroke is the only palette message that changes the corpus;
+          // the rest (cursor moves, rect measurements) reuse the last hits.
+          onNone: (): UpdateReturn => {
+            if (message._tag !== "PaletteChangedQuery") {
+              return [stepped, paletteCommands];
             }
-            const appearance: Appearance =
-              model.appearance === "Dark" ? "Light" : "Dark";
-            return [
-              evo(model, {
-                palette: () => palette,
-                appearance: () => appearance,
-              }),
-              [...paletteCommands, ApplyAppearance({ appearance })],
-            ];
+            const [next, searchCommands] = runSearch(stepped, message.query);
+            return [next, [...paletteCommands, ...searchCommands]];
           },
         });
       },
+
+      // Stale replies lost a race to a later keystroke; showing them would
+      // flash results for a query the user has already moved past.
+      GotSearchHits: ({ seq, hits }) =>
+        seq !== model.searchSeq
+          ? [model, []]
+          : [
+              evo(model, {
+                searchHits: () => hits,
+                searchError: () => Option.none(),
+              }),
+              [],
+            ],
+
+      FailedSearch: ({ seq, error }) =>
+        seq !== model.searchSeq
+          ? [model, []]
+          : [
+              evo(model, {
+                searchHits: () => [],
+                searchError: () => Option.some(error),
+              }),
+              [],
+            ],
 
       GotAccountPopoverMessage: ({ message }) => {
         const [accountPopover, commands] = Ui.Popover.update(
@@ -712,6 +792,16 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
         ];
       },
+
+      // The popover stays open so the switch reads as a live preview.
+      InboxClickedAppearance: () => {
+        const appearance: Appearance =
+          model.appearance === "Dark" ? "Light" : "Dark";
+        return [
+          evo(model, { appearance: () => appearance }),
+          [ApplyAppearance({ appearance })],
+        ];
+      },
     }),
   );
 
@@ -762,8 +852,14 @@ const profileChipContent = (profile: Profile): Html => {
 };
 
 // The account popover: identity up top, sign-out below.
-const accountPanelView = (profile: Profile): Html => {
+const accountPanelView = (
+  profile: Profile,
+  appearance: Appearance,
+): Html => {
   const h = html<Message>();
+  const itemClass = `flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`;
+  const isDark = appearance === "Dark";
+
   return h.div(
     [],
     [
@@ -790,11 +886,16 @@ const accountPanelView = (profile: Profile): Html => {
       h.button(
         [
           h.Type("button"),
-          h.OnClick(ClickedSignOut()),
-          h.Class(
-            `flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
-          ),
+          h.OnClick(ClickedAppearance()),
+          h.Class(itemClass),
         ],
+        [
+          (isDark ? Icon.sun : Icon.moon)("h-4 w-4 shrink-0"),
+          isDark ? "Light mode" : "Dark mode",
+        ],
+      ),
+      h.button(
+        [h.Type("button"), h.OnClick(ClickedSignOut()), h.Class(itemClass)],
         [Icon.logOut("h-4 w-4 shrink-0"), "Sign out"],
       ),
     ],
@@ -924,7 +1025,7 @@ const toolbarView = (model: Model, profile: Profile): Html => {
               buttonClassName: `flex cursor-pointer items-center rounded-lg bg-hover py-1 pl-1.5 pr-2.5 outline-none hover:bg-active focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
               ariaLabel: "Account",
               substrate: PAGE_SURFACE,
-              toPanelContent: () => accountPanelView(profile),
+              toPanelContent: () => accountPanelView(profile, model.appearance),
             },
             toParentMessage: (message) => GotAccountPopoverMessage({ message }),
           }),
@@ -1301,6 +1402,41 @@ const threadDetailView = (detail: ThreadDetail): Html => {
   );
 };
 
+// Renders whatever the Search service last ranked. `prefiltered` keeps the
+// palette from re-scoring: the service's order is the answer, and a lexical
+// re-filter would discard exactly the semantic hits the later stages exist
+// to produce.
+const paletteView = (model: Model): Html => {
+  const h = html<Message>();
+  const specs = new Map(
+    model.searchHits.map(({ thread }) => [
+      thread.id as string,
+      threadItemSpec(thread),
+    ]),
+  );
+
+  return h.submodel({
+    slotId: "inbox-palette",
+    model: model.palette,
+    view: InboxPalette.view,
+    viewInputs: {
+      // One unlabeled group: results are the only thing in the palette.
+      groups: [
+        {
+          label: "",
+          items: model.searchHits.map(({ thread }) => thread.id as string),
+        },
+      ],
+      itemSpec: (item: string) => specs.get(item) ?? { label: item },
+      placeholder: "Search your mail…",
+      prefiltered: true,
+      emptyLabel: Option.getOrElse(model.searchError, () => "No results"),
+      substrate: PAGE_SURFACE,
+    },
+    toParentMessage: (message) => GotPaletteMessage({ message }),
+  });
+};
+
 export const view = Submodel.defineView<Model, Message, ViewInputs>(
   (model, { profile }): Html => {
     const h = html<Message>();
@@ -1328,18 +1464,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
             ),
           ],
         ),
-        h.submodel({
-          slotId: "inbox-palette",
-          model: model.palette,
-          view: InboxPalette.view,
-          viewInputs: {
-            groups: PALETTE_GROUPS,
-            itemSpec: paletteItemSpec,
-            placeholder: "Type to search or navigate…",
-            substrate: PAGE_SURFACE,
-          },
-          toParentMessage: (message) => GotPaletteMessage({ message }),
-        }),
+        paletteView(model),
       ],
     );
   },

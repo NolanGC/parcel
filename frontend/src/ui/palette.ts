@@ -9,14 +9,7 @@ import { icon, type IconView } from "./icon";
 import { paletteBackdrop, palettePanel } from "./motion";
 import { measureRect, Rect } from "./rect";
 import { DIALOG_OFFSET, elevate, surface, type SurfaceLevel } from "./surface";
-import {
-  ArrowDown,
-  ArrowUp,
-  Command as CommandKey,
-  CornerDownLeft,
-  Search,
-  Settings,
-} from "lucide";
+import { Command as CommandKey, Search } from "lucide";
 
 /**
  * FoldkitUI · Palette — a ⌘K command palette composed from Fluid
@@ -32,12 +25,16 @@ import {
  * - Labels: the active row lifts weight via `weightLabel`, no reflow.
  *
  * Behavior rides @foldkit/ui's Dialog (native <dialog>, focus trap, scroll
- * lock, Esc, animation lifecycle). Filtering is a pure view-side function
- * over the static corpus in `viewInputs.groups` — no command round-trip per
- * keystroke; the only DOM work is re-measuring row rects (a Command, same
- * pattern as Menu). Items are plain strings, so this module mirrors Menu's
- * `create<Item>()` factory: `update` returns the selected Item as an
- * out-value and closes itself.
+ * lock, Esc, animation lifecycle). For a static corpus, filtering is a pure
+ * view-side function over `viewInputs.groups` — no command round-trip per
+ * keystroke. A parent whose corpus comes from a real search (the inbox's
+ * Search service) passes `prefiltered`, and the view renders the groups in
+ * the order given: re-scoring results a ranker already ordered would drop
+ * exactly the semantic matches that ranker exists to find. Either way the
+ * only DOM work is re-measuring row rects (a Command, same pattern as Menu).
+ * Items are plain strings, so this module mirrors Menu's `create<Item>()`
+ * factory: `update` returns the selected Item as an out-value and closes
+ * itself.
  */
 
 // MODEL
@@ -148,6 +145,9 @@ export type PaletteItemSpec = Readonly<{
   /** Leading 28px avatar image; wins over `icon` when both are set. */
   avatarSrc?: string;
   label: string;
+  /** Muted secondary line beside the label (sender, path, …). Squeezed
+   *  before the label is when space runs out. */
+  detail?: string;
   /** Trailing tag chip (category, kind) — a pill with a small icon. */
   tag?: Readonly<{ icon: IconView; label: string }>;
   /** Extra text the filter matches beyond the label. */
@@ -155,6 +155,7 @@ export type PaletteItemSpec = Readonly<{
 }>;
 
 export type Group<Item extends string> = Readonly<{
+  /** Empty renders no header — the shape for a single unlabeled result list. */
   label: string;
   items: ReadonlyArray<Item>;
 }>;
@@ -163,6 +164,11 @@ export type ViewInputs<Item extends string> = Readonly<{
   groups: ReadonlyArray<Group<Item>>;
   itemSpec: (item: Item) => PaletteItemSpec;
   placeholder?: string;
+  /** The groups are already the result of ranking `model.query`; render them
+   *  as given instead of scoring them again. */
+  prefiltered?: boolean;
+  /** Shown when there are no items — the place a search error surfaces. */
+  emptyLabel?: string;
   /** Surface level of the page under the palette; the panel settles at
    *  `substrate + 4` (dialog convention). */
   substrate: SurfaceLevel;
@@ -177,6 +183,7 @@ const filterGroups = <Item extends string>(
   query: string,
   groups: ReadonlyArray<Group<Item>>,
   itemSpec: (item: Item) => PaletteItemSpec,
+  prefiltered: boolean,
 ): ReadonlyArray<FilteredGroup<Item>> => {
   const q = query.trim().toLowerCase();
   let flatIndex = 0;
@@ -184,15 +191,16 @@ const filterGroups = <Item extends string>(
   for (const group of groups) {
     const items: Array<{ item: Item; flatIndex: number }> = [];
     for (const item of group.items) {
-      const spec = itemSpec(item);
-      const corpus =
-        spec.keywords === undefined
-          ? spec.label
-          : `${spec.label} ${spec.keywords}`;
-      if (matchScore(q, corpus) > 0) {
-        items.push({ item, flatIndex });
-        flatIndex += 1;
+      if (!prefiltered) {
+        const spec = itemSpec(item);
+        const corpus =
+          spec.keywords === undefined
+            ? spec.label
+            : `${spec.label} ${spec.keywords}`;
+        if (matchScore(q, corpus) === 0) continue;
       }
+      items.push({ item, flatIndex });
+      flatIndex += 1;
     }
     if (items.length > 0) filtered.push({ label: group.label, items });
   }
@@ -202,10 +210,6 @@ const filterGroups = <Item extends string>(
 // CREATE
 
 const searchIcon = icon(Search);
-const enterIcon = icon(CornerDownLeft);
-const arrowUpIcon = icon(ArrowUp);
-const arrowDownIcon = icon(ArrowDown);
-const settingsIcon = icon(Settings);
 const commandIcon = icon(CommandKey);
 
 /** Bordered keycap chip (the mock's Kbd): reads as a physical key at any
@@ -338,10 +342,12 @@ export const create = <Item extends string>() => {
         groups,
         itemSpec,
         placeholder = "Search…",
+        prefiltered = false,
+        emptyLabel = "No results",
         substrate,
       } = viewInputs;
 
-      const filtered = filterGroups(model.query, groups, itemSpec);
+      const filtered = filterGroups(model.query, groups, itemSpec, prefiltered);
       const flat = filtered.flatMap((group) => group.items);
       const count = flat.length;
       const activeIndex = Math.min(model.activeIndex, Math.max(0, count - 1));
@@ -445,6 +451,16 @@ export const create = <Item extends string>() => {
               [h.Class("min-w-0 flex-1 truncate text-left")],
               [spec.label],
             ),
+            spec.detail === undefined
+              ? h.empty
+              : h.span(
+                  [
+                    h.Class(
+                      "min-w-0 max-w-[40%] shrink truncate text-[13px] text-muted-foreground",
+                    ),
+                  ],
+                  [spec.detail],
+                ),
             spec.tag === undefined
               ? h.empty
               : h.span(
@@ -473,7 +489,7 @@ export const create = <Item extends string>() => {
         count === 0
           ? h.div(
               [h.Class("px-5 py-10 text-center text-muted-foreground")],
-              ["No results"],
+              [emptyLabel],
             )
           : h.div(
               [
@@ -494,47 +510,22 @@ export const create = <Item extends string>() => {
                           [],
                         ),
                       ]),
-                  h.div(
-                    [
-                      h.Class(
-                        "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
+                  group.label === ""
+                    ? h.empty
+                    : h.div(
+                        [
+                          h.Class(
+                            "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
+                          ),
+                        ],
+                        [group.label],
                       ),
-                    ],
-                    [group.label],
-                  ),
                   ...group.items.map(({ item, flatIndex }) =>
                     itemRow(item, flatIndex),
                   ),
                 ]),
               ],
             );
-
-      const footer = h.div(
-        [
-          h.Class(
-            "flex items-center gap-4 border-t border-border bg-hover px-5 py-2 text-[12px] text-muted-foreground",
-          ),
-        ],
-        [
-          h.span(
-            [h.Class("flex items-center gap-2")],
-            [
-              kbd([arrowUpIcon("h-3.5 w-3.5")]),
-              kbd([arrowDownIcon("h-3.5 w-3.5")]),
-              "navigate",
-            ],
-          ),
-          h.span(
-            [h.Class("flex items-center gap-2")],
-            [kbd([enterIcon("h-3.5 w-3.5")]), "open"],
-          ),
-          h.span([h.Class("flex items-center gap-2")], [kbd(["esc"]), "close"]),
-          h.span(
-            [h.Class("ml-auto")],
-            [settingsIcon("h-[18px] w-[18px] text-muted-foreground/70")],
-          ),
-        ],
-      );
 
       return h.submodel({
         slotId: `${model.dialog.id}-dialog`,
@@ -574,7 +565,7 @@ export const create = <Item extends string>() => {
                           )} ${palettePanel}`,
                         ),
                       ],
-                      [inputRow, results, footer],
+                      [inputRow, results],
                     ),
                   ]
                 : [],

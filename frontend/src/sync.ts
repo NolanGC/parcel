@@ -69,6 +69,13 @@ export type ThreadDetail = typeof ThreadDetail.Type;
 
 // What the SELECTs below return. A mismatch is a bug in our own
 // schema/DDL pair, hence orDie at the call sites.
+//
+// Exported (with its column list and mapper) because search.ts selects the
+// same shape — one definition, so the list and the palette can't drift on
+// how a stored row becomes a ThreadRow.
+export const THREAD_ROW_COLUMNS =
+  "id, subject, snippet, participants, latest_date, is_unread, category";
+
 const DbThreadRow = S.Struct({
   id: ThreadId,
   subject: S.String,
@@ -79,6 +86,26 @@ const DbThreadRow = S.Struct({
   category: ThreadCategory,
 });
 const decodeDbRows = S.decodeUnknownEffect(S.Array(DbThreadRow));
+
+export const decodeThreadRows = (
+  raw: unknown,
+): Effect.Effect<ReadonlyArray<ThreadRow>> =>
+  decodeDbRows(raw).pipe(
+    Effect.orDie,
+    Effect.map((rows) =>
+      rows.map(
+        (row): ThreadRow => ({
+          id: row.id,
+          subject: row.subject,
+          sender: (JSON.parse(row.participants) as string[])[0] ?? "",
+          snippet: row.snippet,
+          date: row.latest_date,
+          unread: row.is_unread !== 0,
+          category: row.category,
+        }),
+      ),
+    ),
+  );
 
 const DbMessageRow = S.Struct({
   id: MessageId,
@@ -175,6 +202,17 @@ const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> => {
 
 const utf8 = new TextDecoder();
 
+const chunk = <A>(
+  items: ReadonlyArray<A>,
+  size: number,
+): ReadonlyArray<ReadonlyArray<A>> => {
+  const groups: Array<ReadonlyArray<A>> = [];
+  for (let index = 0; index < items.length; index += size) {
+    groups.push(items.slice(index, index + size));
+  }
+  return groups;
+};
+
 // MIME TREE WALKING
 
 const headerValue = (message: GmailMessage, name: string): string | undefined =>
@@ -267,10 +305,22 @@ const latestDate = (messages: ReadonlyArray<GmailMessage>): number =>
 const INBOX = LabelId.make("INBOX");
 // The prime page: enough to fill the first screen.
 const PULL_LIMIT = 15;
-// One backfill page. Small enough that progress ticks visibly and a
-// refresh loses at most one page of (idempotent) work.
-const BATCH_SIZE = 25;
-const SYNC_CONCURRENCY = 4;
+// One backfill page of thread stubs. threads.list costs 10 quota units
+// whatever the page size, so small pages are pure overhead — and every
+// page is re-walked by the skip-scan on resume. Held at 100 rather than
+// the 500 maximum only because one CompletedBatch per page is also the
+// progress tick: at the ~19 threads/sec quota ceiling this reports in
+// every ~5s. Going higher wants progress decoupled from paging first.
+const LIST_PAGE_SIZE = 100;
+// How many threads are fetched and then committed together. Bounds how
+// many full thread payloads sit in memory at once; also the transaction
+// size, which is what stops every INSERT paying its own OPFS fsync.
+const SYNC_CHUNK_SIZE = 25;
+// Gmail allows 250 quota units/user/sec and the token bucket in Gmail.ts
+// paces to 200, so the ceiling is ~19 threads/sec (threads.get = 10 units).
+// 20 in flight is what it takes to actually reach it; the bucket — not this
+// number — is what keeps us under the quota.
+const SYNC_CONCURRENCY = 20;
 const HISTORY_PAGE_SIZE = 500;
 // Above this many changed threads, per-thread re-syncs are slower than a
 // fresh skip-scan walk — the machine resets to Priming instead.
@@ -348,8 +398,10 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         });
 
       // Inline image bytes: small ones ride along in the payload, larger
-      // ones need the attachments endpoint.
-      const upsertInlineImages = (message: GmailMessage) =>
+      // ones need the attachments endpoint. Resolved during the fetch phase
+      // so the write phase is pure SQL — a transaction must never be held
+      // open across a network round-trip.
+      const resolveInlineImages = (message: GmailMessage) =>
         Effect.forEach(
           inlineImages(message),
           (image) =>
@@ -362,33 +414,98 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   ? undefined
                   : (yield* gmail.getAttachment(message.id, attachmentId))
                       .data);
-              if (data === undefined) return;
-              yield* sql`INSERT OR REPLACE INTO message_attachments ${sql.insert(
-                [
-                  {
-                    message_id: message.id,
-                    content_id: image.contentId,
-                    mime_type: image.mimeType,
-                    bytes: base64UrlToBytes(data),
-                  },
-                ],
-              )}`;
+              return data === undefined
+                ? []
+                : [
+                    {
+                      message_id: message.id,
+                      content_id: image.contentId,
+                      mime_type: image.mimeType,
+                      bytes: base64UrlToBytes(data),
+                    },
+                  ];
             }),
           { concurrency: 2 },
-        );
+        ).pipe(Effect.map((groups) => groups.flat()));
 
-      const syncThread = (id: ThreadId) =>
+      type FetchedThread = Readonly<{
+        thread: GmailThread;
+        images: ReadonlyArray<{
+          message_id: MessageId;
+          content_id: string;
+          mime_type: string;
+          bytes: Uint8Array;
+        }>;
+      }>;
+
+      // Everything network for one thread. `None` means Gmail 404'd it — the
+      // thread is gone (deleted, or its last message aged out of
+      // Spam/Trash), so the caller drops the local copy.
+      const fetchThread = (
+        id: ThreadId,
+      ): Effect.Effect<Option.Option<FetchedThread>, GmailError> =>
         Effect.gen(function* () {
           const thread = yield* gmail.getThread(id, "full");
+          const images = yield* Effect.forEach(
+            thread.messages ?? [],
+            resolveInlineImages,
+          ).pipe(Effect.map((groups) => groups.flat()));
+          return Option.some<FetchedThread>({ thread, images });
+        }).pipe(
+          Effect.catchTag("GmailNotFound", () =>
+            Effect.succeed(Option.none<FetchedThread>()),
+          ),
+        );
+
+      const persistThread = ({ thread, images }: FetchedThread) =>
+        Effect.gen(function* () {
           yield* upsertThread(thread);
           yield* Effect.forEach(thread.messages ?? [], (message) =>
-            Effect.all([
-              upsertMessage(thread.id, message),
-              upsertBody(message),
-              upsertInlineImages(message),
-            ]),
+            Effect.gen(function* () {
+              yield* upsertMessage(thread.id, message);
+              yield* upsertBody(message);
+            }),
+          );
+          yield* Effect.forEach(
+            images,
+            (image) =>
+              sql`INSERT OR REPLACE INTO message_attachments ${sql.insert([image])}`,
           );
         });
+
+      // Fetch concurrently, then commit in one transaction per chunk.
+      // Splitting the phases is what makes the transaction safe (no network
+      // inside it) and what makes it worth having: previously every INSERT
+      // committed on its own, so a full backfill paid an fsync per statement
+      // rather than per chunk.
+      const syncThreads = (ids: ReadonlyArray<ThreadId>) =>
+        Effect.forEach(
+          chunk(ids, SYNC_CHUNK_SIZE),
+          (group) =>
+            Effect.forEach(
+              group,
+              (id) =>
+                fetchThread(id).pipe(
+                  Effect.map((maybeFetched) => ({ id, maybeFetched })),
+                ),
+              { concurrency: SYNC_CONCURRENCY },
+            ).pipe(
+              Effect.flatMap((fetched) =>
+                sql.withTransaction(
+                  Effect.forEach(
+                    fetched,
+                    ({ id, maybeFetched }) =>
+                      Option.match(maybeFetched, {
+                        onNone: () => deleteThreadLocal(id),
+                        onSome: persistThread,
+                      }),
+                    { discard: true },
+                  ),
+                ),
+              ),
+            ),
+          { discard: true },
+        );
 
       const countLocalThreads = Effect.gen(function* () {
         const raw = yield* sql`SELECT COUNT(*) AS n FROM threads`;
@@ -396,12 +513,24 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         return rows[0]?.n ?? 0;
       });
 
-      // The stubs from a threads.list page that the local store can't
-      // serve current yet. Stubs carry a per-thread historyId, so a page
-      // of already-synced threads costs one local SELECT and no fetches —
-      // this is what makes restarting the backfill walk from the top cheap
+      // The stubs from a threads.list page that the store has never seen.
+      // A page of already-stored threads costs one local SELECT and no
+      // fetches, which is what makes restarting the walk from the top cheap
       // (the resume path after a refresh or an expired page token).
-      const staleThreadIds = (stubs: ReadonlyArray<GmailThread>) =>
+      //
+      // Membership, deliberately — not a historyId comparison. The backfill
+      // exists to *fill*; keeping threads current is applyHistory's job, and
+      // it is already correct by construction: primeInbox captures the
+      // history cursor BEFORE the walk starts, so the first history pass
+      // replays every change that landed during it. Comparing the stub's
+      // historyId against the stored one added no correctness and, when the
+      // two disagreed for any reason, silently re-downloaded the entire
+      // mailbox on every resume while the progress counter sat still.
+      //
+      // Safe because persistThread writes a thread and its messages in one
+      // transaction: a thread row exists only if its messages do, so "we
+      // have this id" can be trusted to mean the thread is complete.
+      const unseenThreadIds = (stubs: ReadonlyArray<GmailThread>) =>
         Effect.gen(function* () {
           if (stubs.length === 0) return [];
           const raw = yield* sql`
@@ -412,13 +541,9 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             )}
           `;
           const rows = yield* decodeDbThreadHistories(raw).pipe(Effect.orDie);
-          const local = new Map(rows.map((row) => [row.id, row.history_id]));
+          const local = new Set(rows.map((row) => row.id));
           return stubs
-            .filter(
-              (stub) =>
-                stub.historyId === undefined ||
-                local.get(stub.id) !== stub.historyId,
-            )
+            .filter((stub) => !local.has(stub.id))
             .map((stub) => stub.id);
         });
 
@@ -432,11 +557,28 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         const rows = yield* decodeDbSyncState(raw).pipe(Effect.orDie);
         const row = rows[0];
         if (row === undefined) return Option.none<SyncCheckpoint>();
+
+        // total_estimate is otherwise only ever written by primeInbox, and a
+        // mailbox resuming mid-backfill never re-primes — so it would keep
+        // whatever number the last prime wrote, including one from before
+        // this counted the INBOX label instead of the whole mailbox.
+        // Refresh it once per boot, best-effort: a progress denominator is
+        // not worth failing a boot over, and Cold has nowhere to fail to.
+        const totalEstimate = yield* gmail.getLabel(INBOX).pipe(
+          Effect.map((label) => label.threadsTotal ?? row.total_estimate),
+          Effect.catchCause(() => Effect.succeed(row.total_estimate)),
+        );
+        if (totalEstimate !== row.total_estimate) {
+          yield* sql`
+            UPDATE sync_state SET total_estimate = ${totalEstimate} WHERE id = 1
+          `;
+        }
+
         return Option.some<SyncCheckpoint>({
           maybeHistoryId: Option.fromNullishOr(row.history_id),
           isBackfillDone: row.backfill_done !== 0,
           syncedCount: row.synced_count,
-          totalEstimate: row.total_estimate,
+          totalEstimate,
         });
       });
 
@@ -448,19 +590,23 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         GmailError | SqlError
       > = Effect.gen(function* () {
         const profile = yield* gmail.getProfile;
+        // The backfill only ever walks INBOX, so the progress denominator
+        // has to be the INBOX label's own count. profile.threadsTotal counts
+        // the entire mailbox — All Mail, Sent, Spam, Trash — which reads as
+        // a bar that stalls at a few percent and then declares itself done.
+        // One extra quota unit for a number that isn't a lie.
+        const inboxLabel = yield* gmail.getLabel(INBOX);
+        const totalEstimate = inboxLabel.threadsTotal ?? profile.threadsTotal;
         const page = yield* gmail.listThreads({
           labelIds: [INBOX],
           maxResults: PULL_LIMIT,
         });
-        const stale = yield* staleThreadIds(page.threads ?? []);
-        yield* Effect.forEach(stale, (id) => syncThread(id), {
-          concurrency: SYNC_CONCURRENCY,
-        });
+        yield* syncThreads(yield* unseenThreadIds(page.threads ?? []));
         const syncedCount = yield* countLocalThreads;
         const syncedAt = yield* Clock.currentTimeMillis;
         yield* sql`
           INSERT INTO sync_state (id, history_id, email, last_synced_at, synced_count, total_estimate, backfill_done)
-          VALUES (1, ${profile.historyId}, ${profile.emailAddress}, ${syncedAt}, ${syncedCount}, ${profile.threadsTotal}, 0)
+          VALUES (1, ${profile.historyId}, ${profile.emailAddress}, ${syncedAt}, ${syncedCount}, ${totalEstimate}, 0)
           ON CONFLICT (id) DO UPDATE SET
             history_id = excluded.history_id,
             email = excluded.email,
@@ -472,37 +618,45 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         return {
           historyId: profile.historyId,
           syncedCount,
-          totalEstimate: profile.threadsTotal,
+          totalEstimate,
         };
       });
 
-      // One backfill page: list BATCH_SIZE stubs, fetch only the stale
+      // One backfill page: list LIST_PAGE_SIZE stubs, fetch only the stale
       // ones, stamp progress. The checkpoint stores counts (knowledge),
       // never the page token (runtime state) — a resumed walk re-lists
       // from the top and skip-scans, see staleThreadIds.
+      //
+      // `previousCount` comes from the machine's own Backfilling state, so
+      // progress advances by addition. The last page reconciles against a
+      // real COUNT(*): additions can drift from the truth if applyHistory
+      // deleted a thread mid-walk, and "done" is the one moment the number
+      // is worth being exact about.
       const syncBatch = (
         maybePageToken: Option.Option<PageToken>,
+        previousCount: number,
       ): Effect.Effect<BatchResult, GmailError | SqlError> =>
         Effect.gen(function* () {
           const page = yield* gmail.listThreads({
             labelIds: [INBOX],
-            maxResults: BATCH_SIZE,
+            maxResults: LIST_PAGE_SIZE,
             ...Option.match(maybePageToken, {
               onNone: () => ({}),
               onSome: (pageToken) => ({ pageToken }),
             }),
           });
-          const stale = yield* staleThreadIds(page.threads ?? []);
-          yield* Effect.forEach(stale, (id) => syncThread(id), {
-            concurrency: SYNC_CONCURRENCY,
-          });
-          const syncedCount = yield* countLocalThreads;
+          const unseen = yield* unseenThreadIds(page.threads ?? []);
+          yield* syncThreads(unseen);
           const maybeNextPageToken = Option.fromNullishOr(page.nextPageToken);
+          const isDone = Option.isNone(maybeNextPageToken);
+          const syncedCount = isDone
+            ? yield* countLocalThreads
+            : previousCount + unseen.length;
           const syncedAt = yield* Clock.currentTimeMillis;
           yield* sql`
             UPDATE sync_state SET
               synced_count = ${syncedCount},
-              backfill_done = ${Option.isNone(maybeNextPageToken) ? 1 : 0},
+              backfill_done = ${isDone ? 1 : 0},
               last_synced_at = ${syncedAt}
             WHERE id = 1
           `;
@@ -569,16 +723,9 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           }
 
           yield* deleteMessagesLocal(deletedMessages);
-          yield* Effect.forEach(
-            [...touched],
-            (id) =>
-              syncThread(id).pipe(
-                // 404: the whole thread is gone (deleted forever, or the
-                // last message aged out of Spam/Trash).
-                Effect.catchTag("GmailNotFound", () => deleteThreadLocal(id)),
-              ),
-            { concurrency: SYNC_CONCURRENCY },
-          );
+          // syncThreads already treats a 404 as "the thread is gone" and
+          // drops the local copy, which is exactly the history case too.
+          yield* syncThreads([...touched]);
 
           const syncedAt = yield* Clock.currentTimeMillis;
           yield* sql`
@@ -605,22 +752,11 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // regardless of length, so the full mailbox rides in the model.
       const selectInbox = Effect.gen(function* () {
         const raw = yield* sql`
-          SELECT id, subject, snippet, participants, latest_date, is_unread, category
+          SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
           FROM threads
           ORDER BY latest_date DESC
         `;
-        const rows = yield* decodeDbRows(raw).pipe(Effect.orDie);
-        return rows.map(
-          (row): ThreadRow => ({
-            id: row.id,
-            subject: row.subject,
-            sender: (JSON.parse(row.participants) as string[])[0] ?? "",
-            snippet: row.snippet,
-            date: row.latest_date,
-            unread: row.is_unread !== 0,
-            category: row.category,
-          }),
-        );
+        return yield* decodeThreadRows(raw);
       });
 
       // Local-first: reads never touch the network. Filling the store is

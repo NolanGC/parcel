@@ -193,15 +193,18 @@ export const PrimeInbox = Command.define(
   }),
 );
 
+// `syncedCount` rides along so the page can advance progress by addition
+// rather than re-counting the whole table (the engine reconciles exactly on
+// the final page).
 export const SyncBatch = Command.define(
   "SyncBatch",
-  { maybePageToken: S.Option(PageToken) },
+  { maybePageToken: S.Option(PageToken), syncedCount: S.Number },
   CompletedBatch,
   FailedSync,
-)(({ maybePageToken }) =>
+)(({ maybePageToken, syncedCount }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    return yield* engine.syncBatch(maybePageToken).pipe(
+    return yield* engine.syncBatch(maybePageToken, syncedCount).pipe(
       Effect.map((result) => CompletedBatch(result)),
       Effect.catch((error) => Effect.succeed(toFailedSync(error))),
     );
@@ -349,7 +352,12 @@ export const syncMachine = Machine.define({
                 maybePageToken: Option.none(),
                 attempt: 0,
               }),
-            () => [SyncBatch({ maybePageToken: Option.none() })],
+            ({ guardValue }) => [
+              SyncBatch({
+                maybePageToken: Option.none(),
+                syncedCount: guardValue.syncedCount,
+              }),
+            ],
           ),
           otherwise(
             to(
@@ -374,7 +382,12 @@ export const syncMachine = Machine.define({
               totalEstimate: message.totalEstimate,
               attempt: 0,
             }),
-          () => [SyncBatch({ maybePageToken: Option.none() })],
+          ({ message }) => [
+            SyncBatch({
+              maybePageToken: Option.none(),
+              syncedCount: message.syncedCount,
+            }),
+          ],
         ),
         FailedSync: [
           when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
@@ -416,8 +429,11 @@ export const syncMachine = Machine.define({
                 syncedCount: () => message.syncedCount,
                 attempt: () => 0,
               }),
-            ({ guardValue }) => [
-              SyncBatch({ maybePageToken: Option.some(guardValue) }),
+            ({ message, guardValue }) => [
+              SyncBatch({
+                maybePageToken: Option.some(guardValue),
+                syncedCount: message.syncedCount,
+              }),
             ],
           ),
           otherwise(
@@ -538,7 +554,10 @@ export const syncMachine = Machine.define({
                 attempt: state.attempt,
               }),
             ({ guardValue }) => [
-              SyncBatch({ maybePageToken: guardValue.maybePageToken }),
+              SyncBatch({
+                maybePageToken: guardValue.maybePageToken,
+                syncedCount: guardValue.syncedCount,
+              }),
             ],
           ),
           when(

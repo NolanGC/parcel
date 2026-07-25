@@ -20,6 +20,17 @@ const commandNames = (
   commands: ReadonlyArray<{ readonly name: string }>,
 ): ReadonlyArray<string> => commands.map((command) => command.name);
 
+// The count a SyncBatch carries into the engine. Progress advances by
+// addition now (no COUNT(*) per page), so this number arriving wrong is a
+// progress bar that silently resets rather than an error anyone would see.
+const syncBatchCount = (
+  commands: ReadonlyArray<{ readonly name: string }>,
+): number => {
+  const command = commands.find((c) => c.name === "SyncBatch");
+  return (command as unknown as { args: { syncedCount: number } }).args
+    .syncedCount;
+};
+
 const checkpoint = (
   overrides: Partial<{
     maybeHistoryId: Option.Option<HistoryId>;
@@ -100,6 +111,54 @@ describe("entry from the checkpoint", () => {
       }),
     );
     expect(state._tag).toBe("Priming");
+  });
+});
+
+// Every path that issues a SyncBatch has to hand the engine the count the
+// walk is actually at. There are four, and they read it from four different
+// places (checkpoint, prime result, batch result, backoff resume), so each
+// one is its own chance to pass a zero and rewind the bar.
+describe("progress carried into each backfill page", () => {
+  test("resuming from a checkpoint carries the checkpoint's count", () => {
+    const [, commands] = SyncMachine.step(
+      SyncMachine.init(),
+      SyncMachine.GotSyncCheckpoint({
+        maybeCheckpoint: Option.some(checkpoint({ syncedCount: 4000 })),
+      }),
+    );
+    expect(syncBatchCount(commands)).toBe(4000);
+  });
+
+  test("the first page after priming carries the prime's count", () => {
+    const [, commands] = SyncMachine.step(
+      SyncMachine.Priming({ attempt: 0 }),
+      SyncMachine.CompletedPrime({
+        historyId: cursor,
+        syncedCount: 15,
+        totalEstimate: 900,
+      }),
+    );
+    expect(syncBatchCount(commands)).toBe(15);
+  });
+
+  test("each further page carries the running count, not the state's", () => {
+    const [, commands] = SyncMachine.step(
+      backfilling,
+      SyncMachine.CompletedBatch({
+        syncedCount: 4100,
+        maybeNextPageToken: Option.some(token),
+      }),
+    );
+    expect(syncBatchCount(commands)).toBe(4100);
+  });
+
+  test("a retry after failure resumes the count, it doesn't restart it", () => {
+    const [failedState] = SyncMachine.step(backfilling, failed());
+    const [, commands] = SyncMachine.step(
+      failedState,
+      SyncMachine.FiredRetry(),
+    );
+    expect(syncBatchCount(commands)).toBe(4000);
   });
 });
 
