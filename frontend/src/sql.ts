@@ -147,5 +147,23 @@ export const SqlLive = SqliteMigrator.layer({
       yield* sql`ALTER TABLE sync_state ADD COLUMN total_estimate INTEGER NOT NULL DEFAULT 0`;
       yield* sql`ALTER TABLE sync_state ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0`;
     }),
+
+    // Whether a thread is still in the INBOX. Without this the list showed
+    // every thread ever synced: archiving in Gmail removes the INBOX label,
+    // which reaches us as a change on the thread, so the row was updated and
+    // happily kept — the local inbox only ever grew.
+    //
+    // Defaults to 1 so nothing disappears on upgrade; existing rows are
+    // corrected as applyHistory touches them.
+    //
+    // Numbered 0004, skipping 0003: the vector-search branch owns
+    // 0003_thread_vectors, and the migrator skips any id <= the highest
+    // already applied — so reusing 0003 would silently no-op on a database
+    // that had run that branch.
+    "0004_thread_inbox_membership": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE threads ADD COLUMN in_inbox INTEGER NOT NULL DEFAULT 1`;
+      yield* sql`CREATE INDEX threads_inbox ON threads (in_inbox, latest_date DESC)`;
+    }),
   } satisfies Record<`${number}_${string}`, any>),
 }).pipe(Layer.provideMerge(ClientLive));

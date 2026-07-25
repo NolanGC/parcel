@@ -259,6 +259,69 @@ describe("the sync spine", () => {
   });
 });
 
+// Three edges that each used to be a dead end: a failed checkpoint read was
+// ignored (the machine sat in Cold forever, rendering nothing), and NeedsAuth
+// had no transitions at all, so one bad token parked sync until a reload.
+describe("no state is a dead end", () => {
+  const failedCheckpoint = (isAuthError = false) =>
+    SyncMachine.FailedCheckpoint({
+      accountEmail: "ada@example.com",
+      isAuthError,
+      maybeRetryAfterMs: Option.none(),
+    });
+
+  test("a failed checkpoint read backs off instead of stalling in Cold", () => {
+    const [state, commands] = SyncMachine.step(
+      SyncMachine.init(),
+      failedCheckpoint(),
+    );
+    expect(state._tag).toBe("Backoff");
+    expect(state._tag === "Backoff" && state.resume._tag).toBe(
+      "ResumeCheckpoint",
+    );
+    expect(commandNames(commands)).toEqual(["WaitRetry"]);
+  });
+
+  test("its retry re-reads the checkpoint for the same account", () => {
+    const [backoff] = SyncMachine.step(SyncMachine.init(), failedCheckpoint());
+    const [state, commands] = SyncMachine.step(
+      backoff,
+      SyncMachine.FiredRetry(),
+    );
+    // Back to Cold, not Priming: priming would re-stamp the checkpoint and
+    // skip the account-ownership check the read performs.
+    expect(state._tag).toBe("Cold");
+    expect(commandNames(commands)).toEqual(["ReadSyncCheckpoint"]);
+    expect(
+      (commands[0] as unknown as { args: { accountEmail: string } }).args
+        .accountEmail,
+    ).toBe("ada@example.com");
+  });
+
+  test("repeated checkpoint failures still escalate the delay", () => {
+    let state = SyncMachine.init();
+    [state] = SyncMachine.step(state, failedCheckpoint());
+    expect(state._tag === "Backoff" && state.delayMs).toBe(2_000);
+    [state] = SyncMachine.step(state, SyncMachine.FiredRetry());
+    [state] = SyncMachine.step(state, failedCheckpoint());
+    expect(state._tag === "Backoff" && state.delayMs).toBe(4_000);
+  });
+
+  test("an auth-shaped checkpoint failure parks rather than retrying", () => {
+    const [state] = SyncMachine.step(SyncMachine.init(), failedCheckpoint(true));
+    expect(state._tag).toBe("NeedsAuth");
+  });
+
+  test("the reconnect click gets the machine out of NeedsAuth", () => {
+    const [state, commands] = SyncMachine.step(
+      SyncMachine.NeedsAuth(),
+      SyncMachine.RetriedAuth(),
+    );
+    expect(state).toEqual(SyncMachine.Priming({ attempt: 0 }));
+    expect(commandNames(commands)).toEqual(["PrimeInbox"]);
+  });
+});
+
 describe("failure edges", () => {
   test("a rate-limited batch backs off at least as long as Gmail asks", () => {
     const [state, commands] = SyncMachine.step(backfilling, failed(30_000));

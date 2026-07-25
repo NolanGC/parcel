@@ -22,6 +22,7 @@ import {
   readStoredSession,
 } from "./auth";
 import { Inbox, Login } from "./page";
+import { landingView, notFoundView } from "./page/landing";
 import {
   AppRoute,
   homeRouter,
@@ -154,10 +155,10 @@ export type AppResources =
 // The inbox page owns its boot (the first local read plus the sync
 // machine's checkpoint read); wrapping its messages here keeps the
 // parent/child message boundary intact.
-const loadInboxCommands = (): ReadonlyArray<
-  Command.Command<Message, never, AppResources>
-> =>
-  Command.mapMessages(Inbox.bootCommands(), (message) =>
+const loadInboxCommands = (
+  accountEmail: string,
+): ReadonlyArray<Command.Command<Message, never, AppResources>> =>
+  Command.mapMessages(Inbox.bootCommands(accountEmail), (message) =>
     GotInboxMessage({ message }),
   );
 
@@ -210,7 +211,7 @@ export const init: Runtime.RoutingApplicationInit<
       // cookie surfaces as the pull's own auth error, not a blank list.
       const optimistic = (route: AppRoute): UpdateReturn => [
         initLoggedIn(route, session),
-        [CheckSession(), ...loadInboxCommands()],
+        [CheckSession(), ...loadInboxCommands(session.email)],
       ];
 
       return M.value(route).pipe(
@@ -219,7 +220,7 @@ export const init: Runtime.RoutingApplicationInit<
           // Nothing to sign into — bounce straight to the inbox.
           Login: () => [
             initLoggedIn(InboxRouteValue, session),
-            [RedirectToInbox(), CheckSession(), ...loadInboxCommands()],
+            [RedirectToInbox(), CheckSession(), ...loadInboxCommands(session.email)],
           ],
           Inbox: optimistic,
           Home: optimistic,
@@ -269,7 +270,7 @@ const RedirectToHome = Command.define(
 // the profile cache, and start the first real pull.
 const enterLoggedIn = (session: Session): UpdateReturn => [
   initLoggedIn(InboxRouteValue, session),
-  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands()],
+  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands(session.email)],
 ];
 
 const leaveLoggedIn = (): UpdateReturn => [
@@ -565,10 +566,10 @@ const loggedOutView = (model: LoggedOut): Document => {
   return M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(false) }),
+      Home: () => ({ title: APP_NAME, body: landingView(false, ClickedSignOut()) }),
       // Redirect in flight; render the landing rather than a flash of the
       // gated inbox.
-      Inbox: () => ({ title: APP_NAME, body: landingView(false) }),
+      Inbox: () => ({ title: APP_NAME, body: landingView(false, ClickedSignOut()) }),
       Login: () => ({
         title: `Sign in — ${APP_NAME}`,
         body: loginView(model),
@@ -601,9 +602,9 @@ const loggedInView = (model: LoggedIn): Document => {
   return M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(true) }),
+      Home: () => ({ title: APP_NAME, body: landingView(true, ClickedSignOut()) }),
       // Redirect to the inbox in flight.
-      Login: () => ({ title: APP_NAME, body: landingView(true) }),
+      Login: () => ({ title: APP_NAME, body: landingView(true, ClickedSignOut()) }),
       // The inbox is a full-window design; no app chrome around it.
       Inbox: () => ({
         title: `Inbox — ${APP_NAME}`,
@@ -617,74 +618,5 @@ const loggedInView = (model: LoggedIn): Document => {
         ),
       }),
     }),
-  );
-};
-
-// The marketing landing: the only public page besides sign-in. Static
-// content served from the SPA bundle.
-const landingView = (isLoggedIn: boolean): Html => {
-  const h = html<Message>();
-
-  return h.main(
-    [h.Class("min-h-screen bg-neutral-950 px-6 py-24 text-neutral-100")],
-    [
-      h.div(
-        [h.Class("mx-auto max-w-xl")],
-        [
-          h.h1([h.Class("text-3xl font-bold")], [APP_NAME]),
-          h.p(
-            [h.Class("mt-3 text-neutral-400")],
-            [
-              "A fast, keyboard-first email client for your Gmail. Sign in with Google and your inbox is ready — nothing to configure.",
-            ],
-          ),
-          h.a(
-            [
-              h.Href(isLoggedIn ? inboxRouter() : loginRouter()),
-              h.Class("mt-8 inline-block underline underline-offset-4"),
-            ],
-            [isLoggedIn ? "Open your inbox →" : "Sign in with Google →"],
-          ),
-          isLoggedIn
-            ? h.button(
-                [
-                  h.Type("button"),
-                  h.OnClick(ClickedSignOut()),
-                  h.Class(
-                    "mt-6 block text-sm text-neutral-400 underline underline-offset-4 hover:text-neutral-200",
-                  ),
-                ],
-                ["Sign out"],
-              )
-            : h.empty,
-        ],
-      ),
-    ],
-  );
-};
-
-const notFoundView = (heading: string, detail: string): Html => {
-  const h = html<Message>();
-
-  return h.section(
-    [h.Class("mx-auto max-w-5xl px-4 py-10")],
-    [
-      h.div(
-        [h.Class("border border-neutral-800 bg-neutral-900 p-4")],
-        [
-          h.h1([h.Class("text-2xl font-bold")], [heading]),
-          h.p([h.Class("mt-2 text-neutral-400")], [detail]),
-          h.a(
-            [
-              h.Href(homeRouter()),
-              h.Class(
-                "mt-4 inline-block border border-neutral-700 bg-neutral-800 px-4 py-2 font-medium text-neutral-100 hover:bg-neutral-700",
-              ),
-            ],
-            ["Back home"],
-          ),
-        ],
-      ),
-    ],
   );
 };

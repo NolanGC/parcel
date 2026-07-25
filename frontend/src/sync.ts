@@ -135,6 +135,7 @@ const decodeDbSubjects = S.decodeUnknownEffect(S.Array(DbSubjectRow));
 
 const DbSyncStateRow = S.Struct({
   history_id: S.NullOr(HistoryId),
+  email: S.NullOr(S.String),
   synced_count: S.Number,
   total_estimate: S.Number,
   backfill_done: S.Number,
@@ -357,6 +358,13 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             )
               ? 1
               : 0,
+            // Archiving is just the removal of this label, so re-reading it
+            // on every sync is what lets a thread leave the local inbox.
+            in_inbox: messages.some((message) =>
+              message.labelIds?.some((id) => id === INBOX),
+            )
+              ? 1
+              : 0,
             category: threadCategory(messages),
           },
         ])}`;
@@ -549,38 +557,73 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
 
       // MACHINE PASSES
 
-      const readCheckpoint = Effect.gen(function* () {
-        const raw = yield* sql`
-          SELECT history_id, synced_count, total_estimate, backfill_done
-          FROM sync_state WHERE id = 1
-        `;
-        const rows = yield* decodeDbSyncState(raw).pipe(Effect.orDie);
-        const row = rows[0];
-        if (row === undefined) return Option.none<SyncCheckpoint>();
+      // Every local table, in foreign-key order. Used when the signed-in
+      // account changes: the store is one mailbox's worth of data keyed by
+      // nothing, so the only safe response to a different owner is to drop
+      // all of it.
+      const deleteAllLocal = sql.withTransaction(
+        Effect.forEach(
+          [
+            "message_attachments",
+            "message_bodies",
+            "message_labels",
+            "messages",
+            "threads",
+            "labels",
+            "outbox",
+            "sync_state",
+          ],
+          (table) => sql`DELETE FROM ${sql.literal(table)}`,
+          { discard: true },
+        ),
+      );
 
-        // total_estimate is otherwise only ever written by primeInbox, and a
-        // mailbox resuming mid-backfill never re-primes — so it would keep
-        // whatever number the last prime wrote, including one from before
-        // this counted the INBOX label instead of the whole mailbox.
-        // Refresh it once per boot, best-effort: a progress denominator is
-        // not worth failing a boot over, and Cold has nowhere to fail to.
-        const totalEstimate = yield* gmail.getLabel(INBOX).pipe(
-          Effect.map((label) => label.threadsTotal ?? row.total_estimate),
-          Effect.catchCause(() => Effect.succeed(row.total_estimate)),
-        );
-        if (totalEstimate !== row.total_estimate) {
-          yield* sql`
-            UPDATE sync_state SET total_estimate = ${totalEstimate} WHERE id = 1
+      // `accountEmail` is the signed-in address, from the session — not from
+      // Gmail. A network call here could fail, and failing open would mean
+      // rendering the previous account's mail to whoever just signed in.
+      //
+      // The OPFS database is per-origin and holds exactly one mailbox with
+      // no owner column, so a mismatch is not a merge problem, it is a
+      // "this data belongs to someone else" problem. Wipe and re-prime.
+      const readCheckpoint = (accountEmail: string) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT history_id, email, synced_count, total_estimate, backfill_done
+            FROM sync_state WHERE id = 1
           `;
-        }
+          const rows = yield* decodeDbSyncState(raw).pipe(Effect.orDie);
+          const row = rows[0];
+          if (row === undefined) return Option.none<SyncCheckpoint>();
 
-        return Option.some<SyncCheckpoint>({
-          maybeHistoryId: Option.fromNullishOr(row.history_id),
-          isBackfillDone: row.backfill_done !== 0,
-          syncedCount: row.synced_count,
-          totalEstimate,
+          if (row.email !== null && row.email !== accountEmail) {
+            yield* Effect.logInfo("mailbox owner changed; clearing local store");
+            yield* deleteAllLocal;
+            return Option.none<SyncCheckpoint>();
+          }
+
+          // total_estimate is otherwise only ever written by primeInbox, and a
+          // mailbox resuming mid-backfill never re-primes — so it would keep
+          // whatever number the last prime wrote, including one from before
+          // this counted the INBOX label instead of the whole mailbox.
+          // Refresh it once per boot, best-effort: a progress denominator is
+          // not worth failing a boot over.
+          const totalEstimate = yield* gmail.getLabel(INBOX).pipe(
+            Effect.map((label) => label.threadsTotal ?? row.total_estimate),
+            Effect.catchCause(() => Effect.succeed(row.total_estimate)),
+          );
+          if (totalEstimate !== row.total_estimate) {
+            yield* sql`
+              UPDATE sync_state SET total_estimate = ${totalEstimate} WHERE id = 1
+            `;
+          }
+
+          return Option.some<SyncCheckpoint>({
+            maybeHistoryId: Option.fromNullishOr(row.history_id),
+            isBackfillDone: row.backfill_done !== 0,
+            syncedCount: row.synced_count,
+            totalEstimate,
+          });
         });
-      });
 
       // The first-screen pass: capture the history cursor BEFORE pulling
       // anything (changes during the long backfill are then replayed by the
@@ -754,6 +797,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         const raw = yield* sql`
           SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
           FROM threads
+          WHERE in_inbox = 1
           ORDER BY latest_date DESC
         `;
         return yield* decodeThreadRows(raw);

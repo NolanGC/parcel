@@ -7,6 +7,8 @@
 //   CatchingUp ──AppliedHistory──► Settled ──TickedPoll──► CatchingUp
 //   CatchingUp ──Expired/Overflowed──► Priming (bounded full resync)
 //   any network pass ──FailedSync──► Backoff (resume-aware) | NeedsAuth
+//   Cold ──FailedCheckpoint──► Backoff ──FiredRetry──► Cold (re-read)
+//   NeedsAuth ──RetriedAuth──► Priming (the toolbar pill is a button)
 //
 // The store answers every read throughout; the machine only makes it more
 // complete. Its state is derived from the SQLite checkpoint at boot — never
@@ -31,7 +33,7 @@ import type { SqlError } from "effect/unstable/sql/SqlError";
 // fresh). A failure lands in Backoff with attempt + 1, and the retry
 // re-enters the pass carrying the count, so repeated failures escalate
 // the delay instead of resetting it.
-export const Cold = ts("Cold");
+export const Cold = ts("Cold", { attempt: S.Number });
 export const Priming = ts("Priming", { attempt: S.Number });
 export const Backfilling = ts("Backfilling", {
   historyId: HistoryId,
@@ -51,6 +53,9 @@ export const Settled = ts("Settled", {
   lastSyncedAt: S.Number,
 });
 
+export const ResumeCheckpoint = ts("ResumeCheckpoint", {
+  accountEmail: S.String,
+});
 export const ResumePrime = ts("ResumePrime");
 export const ResumeBackfill = ts("ResumeBackfill", {
   historyId: HistoryId,
@@ -59,7 +64,12 @@ export const ResumeBackfill = ts("ResumeBackfill", {
   totalEstimate: S.Number,
 });
 export const ResumeHistory = ts("ResumeHistory", { historyId: HistoryId });
-export const Resume = S.Union([ResumePrime, ResumeBackfill, ResumeHistory]);
+export const Resume = S.Union([
+  ResumeCheckpoint,
+  ResumePrime,
+  ResumeBackfill,
+  ResumeHistory,
+]);
 export type Resume = typeof Resume.Type;
 
 export const Backoff = ts("Backoff", {
@@ -80,7 +90,7 @@ export const State = S.Union([
 ]);
 export type State = typeof State.Type;
 
-export const init = (): State => Cold();
+export const init = (): State => Cold({ attempt: 0 });
 
 // MESSAGE
 
@@ -116,8 +126,18 @@ export const FailedSync = m("FailedSync", {
   isAuthError: S.Boolean,
   maybeRetryAfterMs: S.Option(S.Number),
 });
+/** The checkpoint read's own failure. Distinct from FailedSync because it
+ *  is the one pass whose retry needs an argument, and Cold cannot hold the
+ *  account itself — the page is constructed before sign-in is resolved. */
+export const FailedCheckpoint = m("FailedCheckpoint", {
+  accountEmail: S.String,
+  isAuthError: S.Boolean,
+  maybeRetryAfterMs: S.Option(S.Number),
+});
 export const FiredRetry = m("FiredRetry");
 export const TickedPoll = m("TickedPoll");
+/** The "Reconnect Gmail" pill was clicked: try the whole thing again. */
+export const RetriedAuth = m("RetriedAuth");
 
 export const Message = S.Union([
   GotSyncCheckpoint,
@@ -127,8 +147,10 @@ export const Message = S.Union([
   ExpiredHistory,
   OverflowedHistory,
   FailedSync,
+  FailedCheckpoint,
   FiredRetry,
   TickedPoll,
+  RetriedAuth,
 ]);
 export type Message = typeof Message.Type;
 
@@ -167,14 +189,24 @@ const toFailedSync = (error: GmailError | SqlError): typeof FailedSync.Type =>
 
 export const ReadSyncCheckpoint = Command.define(
   "ReadSyncCheckpoint",
+  { accountEmail: S.String },
   GotSyncCheckpoint,
-  FailedSync,
-)(
+  FailedCheckpoint,
+)(({ accountEmail }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    return yield* engine.readCheckpoint.pipe(
+    return yield* engine.readCheckpoint(accountEmail).pipe(
       Effect.map((maybeCheckpoint) => GotSyncCheckpoint({ maybeCheckpoint })),
-      Effect.catch((error) => Effect.succeed(toFailedSync(error))),
+      Effect.catch((error) => {
+        const failure = toFailedSync(error);
+        return Effect.succeed(
+          FailedCheckpoint({
+            accountEmail,
+            isAuthError: failure.isAuthError,
+            maybeRetryAfterMs: failure.maybeRetryAfterMs,
+          }),
+        );
+      }),
     );
   }),
 );
@@ -259,9 +291,11 @@ const WaitPoll = Command.define(
 );
 
 /** Boot: derive the entry state from the persisted checkpoint. */
-export const bootCommands = (): ReadonlyArray<
-  Command.Command<Message, never, SyncEngine>
-> => [ReadSyncCheckpoint()];
+export const bootCommands = (
+  accountEmail: string,
+): ReadonlyArray<Command.Command<Message, never, SyncEngine>> => [
+  ReadSyncCheckpoint({ accountEmail }),
+];
 
 // MACHINE
 
@@ -278,7 +312,7 @@ const backoffDelayMs = (
 
 const isAuthFailure = (
   _state: State,
-  message: typeof FailedSync.Type,
+  message: { readonly isAuthError: boolean },
 ): boolean => message.isAuthError;
 
 // The boot fork, off the persisted checkpoint: a finished backfill goes
@@ -331,7 +365,7 @@ export const syncMachine = Machine.define({
   state: State,
   message: Message,
 })({
-  initial: Cold(),
+  initial: Cold({ attempt: 0 }),
   states: {
     Cold: {
       on: {
@@ -364,6 +398,36 @@ export const syncMachine = Machine.define({
               "Priming",
               () => Priming({ attempt: 0 }),
               () => [PrimeInbox()],
+            ),
+          ),
+        ],
+        // Without this the checkpoint read's own failure message had nowhere
+        // to go: the machine sat in Cold forever, rendering no pill, with
+        // nothing scheduled to try again.
+        FailedCheckpoint: [
+          when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
+          otherwise(
+            to(
+              "Backoff",
+              ({ state, message }) =>
+                Backoff({
+                  attempt: state.attempt + 1,
+                  delayMs: backoffDelayMs(
+                    state.attempt + 1,
+                    message.maybeRetryAfterMs,
+                  ),
+                  resume: ResumeCheckpoint({
+                    accountEmail: message.accountEmail,
+                  }),
+                }),
+              ({ state, message }) => [
+                WaitRetry({
+                  delayMs: backoffDelayMs(
+                    state.attempt + 1,
+                    message.maybeRetryAfterMs,
+                  ),
+                }),
+              ],
             ),
           ),
         ],
@@ -543,6 +607,17 @@ export const syncMachine = Machine.define({
       on: {
         FiredRetry: [
           when(
+            (state) =>
+              state.resume._tag === "ResumeCheckpoint"
+                ? Option.some(state.resume.accountEmail)
+                : Option.none<string>(),
+            "Cold",
+            ({ state }) => Cold({ attempt: state.attempt }),
+            ({ guardValue }) => [
+              ReadSyncCheckpoint({ accountEmail: guardValue }),
+            ],
+          ),
+          when(
             (state) => backfillResume(state, state.resume),
             "Backfilling",
             ({ state, guardValue }) =>
@@ -581,7 +656,18 @@ export const syncMachine = Machine.define({
       },
     },
 
-    NeedsAuth: { on: {} },
+    // Not terminal any more: the toolbar pill is a button, and priming is
+    // the cheapest way to find out whether the grant came back. If it
+    // didn't, the failure lands right back here.
+    NeedsAuth: {
+      on: {
+        RetriedAuth: to(
+          "Priming",
+          () => Priming({ attempt: 0 }),
+          () => [PrimeInbox()],
+        ),
+      },
+    },
   },
 });
 

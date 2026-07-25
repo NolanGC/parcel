@@ -25,16 +25,13 @@ import { Command as CommandKey, Search } from "lucide";
  * - Labels: the active row lifts weight via `weightLabel`, no reflow.
  *
  * Behavior rides @foldkit/ui's Dialog (native <dialog>, focus trap, scroll
- * lock, Esc, animation lifecycle). For a static corpus, filtering is a pure
- * view-side function over `viewInputs.groups` — no command round-trip per
- * keystroke. A parent whose corpus comes from a real search (the inbox's
- * Search service) passes `prefiltered`, and the view renders the groups in
- * the order given: re-scoring results a ranker already ordered would drop
- * exactly the semantic matches that ranker exists to find. Either way the
- * only DOM work is re-measuring row rects (a Command, same pattern as Menu).
- * Items are plain strings, so this module mirrors Menu's `create<Item>()`
- * factory: `update` returns the selected Item as an out-value and closes
- * itself.
+ * lock, Esc, animation lifecycle). This module does no matching: the parent
+ * owns the query (`model.query`) and supplies `groups` already filtered and
+ * ranked for it — the inbox's Search service. The view renders them in the
+ * order given. DOM work is limited to re-measuring row rects (a Command,
+ * same pattern as Menu). Items are plain strings, so this mirrors Menu's
+ * `create<Item>()` factory: `update` returns the selected Item as an
+ * out-value and closes itself.
  */
 
 // MODEL
@@ -119,25 +116,6 @@ const MeasureItemRects = Command.define(
   }),
 );
 
-// FILTERING
-//
-// Pure and cheap: one pass per item per keystroke, no allocation beyond the
-// result arrays. Prefix beats word-boundary beats substring beats
-// subsequence; zero drops the item.
-
-const matchScore = (query: string, text: string): number => {
-  if (query === "") return 1;
-  const t = text.toLowerCase();
-  const foundAt = t.indexOf(query);
-  if (foundAt === 0) return 4;
-  if (foundAt > 0) return t[foundAt - 1] === " " ? 3 : 2;
-  let matched = 0;
-  for (let i = 0; i < t.length && matched < query.length; i++) {
-    if (t[i] === query[matched]) matched += 1;
-  }
-  return matched === query.length ? 1 : 0;
-};
-
 // VIEW INPUTS
 
 export type PaletteItemSpec = Readonly<{
@@ -150,8 +128,6 @@ export type PaletteItemSpec = Readonly<{
   detail?: string;
   /** Trailing tag chip (category, kind) — a pill with a small icon. */
   tag?: Readonly<{ icon: IconView; label: string }>;
-  /** Extra text the filter matches beyond the label. */
-  keywords?: string;
 }>;
 
 export type Group<Item extends string> = Readonly<{
@@ -164,9 +140,6 @@ export type ViewInputs<Item extends string> = Readonly<{
   groups: ReadonlyArray<Group<Item>>;
   itemSpec: (item: Item) => PaletteItemSpec;
   placeholder?: string;
-  /** The groups are already the result of ranking `model.query`; render them
-   *  as given instead of scoring them again. */
-  prefiltered?: boolean;
   /** Shown when there are no items — the place a search error surfaces. */
   emptyLabel?: string;
   /** Surface level of the page under the palette; the panel settles at
@@ -179,32 +152,26 @@ type FilteredGroup<Item extends string> = Readonly<{
   items: ReadonlyArray<Readonly<{ item: Item; flatIndex: number }>>;
 }>;
 
-const filterGroups = <Item extends string>(
-  query: string,
+// Numbers the rows so the overlay, the arrow keys, and ⌘1-9 all agree on
+// what "the third result" means. The palette does no matching of its own —
+// `groups` is already the answer to `model.query`.
+const numberRows = <Item extends string>(
   groups: ReadonlyArray<Group<Item>>,
-  itemSpec: (item: Item) => PaletteItemSpec,
-  prefiltered: boolean,
 ): ReadonlyArray<FilteredGroup<Item>> => {
-  const q = query.trim().toLowerCase();
   let flatIndex = 0;
-  const filtered: Array<FilteredGroup<Item>> = [];
-  for (const group of groups) {
-    const items: Array<{ item: Item; flatIndex: number }> = [];
-    for (const item of group.items) {
-      if (!prefiltered) {
-        const spec = itemSpec(item);
-        const corpus =
-          spec.keywords === undefined
-            ? spec.label
-            : `${spec.label} ${spec.keywords}`;
-        if (matchScore(q, corpus) === 0) continue;
-      }
-      items.push({ item, flatIndex });
-      flatIndex += 1;
-    }
-    if (items.length > 0) filtered.push({ label: group.label, items });
-  }
-  return filtered;
+  return groups.flatMap((group) =>
+    group.items.length === 0
+      ? []
+      : [
+          {
+            label: group.label,
+            items: group.items.map((item) => ({
+              item,
+              flatIndex: flatIndex++,
+            })),
+          },
+        ],
+  );
 };
 
 // CREATE
@@ -342,12 +309,11 @@ export const create = <Item extends string>() => {
         groups,
         itemSpec,
         placeholder = "Search…",
-        prefiltered = false,
         emptyLabel = "No results",
         substrate,
       } = viewInputs;
 
-      const filtered = filterGroups(model.query, groups, itemSpec, prefiltered);
+      const filtered = numberRows(groups);
       const flat = filtered.flatMap((group) => group.items);
       const count = flat.length;
       const activeIndex = Math.min(model.activeIndex, Math.max(0, count - 1));
