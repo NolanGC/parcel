@@ -384,6 +384,18 @@ export interface ModifyLabels {
 const QUOTA_WINDOW = "1 second";
 const QUOTA_UNITS_PER_WINDOW = 200;
 
+/** What one thread costs to fetch (`threads.get`), per Google's table. */
+const THREAD_GET_UNITS = 10;
+
+/** Sustained thread throughput the bucket allows. The bucket — not the
+ *  concurrency setting — is what binds the backfill, so this is the real
+ *  steady-state rate and the honest basis for a sync time estimate.
+ *
+ *  At 200 units/sec this is 20 threads/sec against a possible 25; the
+ *  headroom is deliberate (see above). Raising QUOTA_UNITS_PER_WINDOW moves
+ *  this number and the estimate together. */
+export const THREADS_PER_SECOND = QUOTA_UNITS_PER_WINDOW / THREAD_GET_UNITS;
+
 // Google's per-method quota unit table, keyed by URL shape. Order matters:
 // an attachment URL also contains /messages/.
 const quotaUnits = (request: HttpClientRequest.HttpClientRequest): number => {

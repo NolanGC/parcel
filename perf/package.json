@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "bun src/bench.ts"
+    "bench": "bun src/bench.ts",
+    "sql": "bun src/sql.ts"
   },
   "dependencies": {
     "playwright-core": "^1.50.0"

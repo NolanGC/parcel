@@ -1,7 +1,15 @@
 // The inbox page: its Commands and its update. Re-exports model.ts and
 // view.ts so `Inbox.Model` / `Inbox.view` stay one import for main.ts.
 
-import { Cause, Effect, Match as M, Option, Result, Schema as S } from "effect";
+import {
+  Array as Arr,
+  Cause,
+  Effect,
+  Match as M,
+  Option,
+  Result,
+  Schema as S,
+} from "effect";
 import { AsyncData, Command } from "foldkit";
 import { evo } from "foldkit/struct";
 
@@ -14,20 +22,20 @@ import * as Ui from "../../ui";
 import {
   Appearance,
   CompletedApplyAppearance,
-  CompletedListScroll,
+  CompletedScrollListToRow,
   FailedLoadInbox,
   FailedLoadThread,
+  CompletedCacheImageBatch,
+  FailedCacheImageBatch,
+  FailedReadLocalSize,
   FailedSearch,
   FolderMenu,
   GotAccountPopoverMessage,
   GotFolderMenuMessage,
   GotListMessage,
   GotPaletteMessage,
-  GotSearchResults,
   GotSyncMessage,
   GotTabsMessage,
-  GotThread,
-  GotThreads,
   InboxPalette,
   LIST_ID,
   Message,
@@ -37,6 +45,10 @@ import {
   ROW_HEIGHT,
   ShowingList,
   ShowingThread,
+  SucceededLoadInbox,
+  SucceededLoadThread,
+  SucceededReadLocalSize,
+  SucceededSearch,
 } from "./model";
 
 export * from "./model";
@@ -69,13 +81,13 @@ const ApplyAppearance = Command.define(
 // machine reports enough new rows (see GotSyncMessage).
 export const LoadInbox = Command.define(
   "LoadInbox",
-  GotThreads,
+  SucceededLoadInbox,
   FailedLoadInbox,
 )(
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.loadInbox.pipe(
-      Effect.map((rows) => GotThreads({ rows })),
+      Effect.map((rows) => SucceededLoadInbox({ rows })),
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
       ),
@@ -90,6 +102,8 @@ export const bootCommands = (
   accountEmail: string,
 ): ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>> => [
   LoadInbox(),
+  ReadLocalSize(),
+  CacheImageBatch(),
   ...Command.mapMessages(SyncMachine.bootCommands(accountEmail), (message) =>
     GotSyncMessage({ message }),
   ),
@@ -97,10 +111,10 @@ export const bootCommands = (
 
 // One palette search. `seq` rides through the service untouched so the
 // update can tell a fresh reply from a superseded one.
-const RunSearch = Command.define(
+export const RunSearch = Command.define(
   "RunSearch",
   { seq: S.Number, text: S.String },
-  GotSearchResults,
+  SucceededSearch,
   FailedSearch,
 )(({ seq, text }) =>
   Effect.gen(function* () {
@@ -108,11 +122,67 @@ const RunSearch = Command.define(
     return yield* search
       .search({ text, limit: PALETTE_RESULT_LIMIT })
       .pipe(
-        Effect.map((rows) => GotSearchResults({ seq, rows })),
+        Effect.map((rows) => SucceededSearch({ seq, rows })),
         Effect.catchCause((cause) =>
           Effect.succeed(FailedSearch({ seq, error: Cause.pretty(cause) })),
         ),
       );
+  }),
+);
+
+// The store's on-disk size, for the sync pill's detail. Read at boot and
+// again whenever the machine reports progress worth repainting for, so the
+// number tracks a running backfill instead of going stale at whatever it was
+// when the app opened.
+export const ReadLocalSize = Command.define(
+  "ReadLocalSize",
+  SucceededReadLocalSize,
+  FailedReadLocalSize,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.localSizeBytes.pipe(
+      Effect.map((bytes) => SucceededReadLocalSize({ bytes })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedReadLocalSize({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+// One turn of the image prefetch loop, re-issued from its own result (see
+// the CompletedCacheImageBatch handler). Deliberately separate from the sync
+// machine and running alongside it: the backfill is bound by Gmail's quota
+// bucket and this by the image proxy, so sequencing them would leave one of
+// the two resources idle for the whole sync.
+//
+// The idle wait lives inside the Command rather than in a Subscription
+// because idleness is a fact the engine discovers, not a schedule: an empty
+// queue mid-backfill means "ask again shortly", and once everything is
+// cached it means "ask again much less often". Both are the same loop.
+const IMAGE_IDLE_WAIT = "4 seconds";
+const IMAGE_RETRY_WAIT = "15 seconds";
+
+export const CacheImageBatch = Command.define(
+  "CacheImageBatch",
+  CompletedCacheImageBatch,
+  FailedCacheImageBatch,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.cacheImageBatch.pipe(
+      Effect.tap(({ isIdle }) =>
+        isIdle ? Effect.sleep(IMAGE_IDLE_WAIT) : Effect.void,
+      ),
+      Effect.map(({ isRecentReady }) =>
+        CompletedCacheImageBatch({ isRecentReady }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.sleep(IMAGE_RETRY_WAIT).pipe(
+          Effect.as(FailedCacheImageBatch({ error: Cause.pretty(cause) })),
+        ),
+      ),
+    );
   }),
 );
 
@@ -121,13 +191,13 @@ const RunSearch = Command.define(
 export const LoadThread = Command.define(
   "LoadThread",
   { id: ThreadId },
-  GotThread,
+  SucceededLoadThread,
   FailedLoadThread,
 )(({ id }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.loadThread(id).pipe(
-      Effect.map((detail) => GotThread({ detail })),
+      Effect.map((detail) => SucceededLoadThread({ detail })),
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadThread({ error: Cause.pretty(cause) })),
       ),
@@ -138,10 +208,10 @@ export const LoadThread = Command.define(
 // Keeps the keyboard cursor on screen. Row positions are known from the fixed
 // row height, so this scrolls the container directly — the target row need
 // not be mounted (it usually isn't, which is why scrollIntoView won't do).
-const ScrollListToRow = Command.define(
+export const ScrollListToRow = Command.define(
   "ScrollListToRow",
   { index: S.Number },
-  CompletedListScroll,
+  CompletedScrollListToRow,
 )(({ index }) =>
   Effect.sync(() => {
     const element = document.getElementById(LIST_ID);
@@ -154,7 +224,7 @@ const ScrollListToRow = Command.define(
         element.scrollTop = bottom - element.clientHeight;
       }
     }
-    return CompletedListScroll();
+    return CompletedScrollListToRow();
   }),
 );
 
@@ -180,18 +250,28 @@ const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
 // so backfill progress refreshes the list on a stride, not per batch.
 const REFRESH_STRIDE = 200;
 
+// The newest threads the user is owed promptly. The backfill already walks
+// newest-first, so these are the first ones fetched — but at a 200 stride a
+// fresh mailbox sits on the prime's handful of rows for the first two pages.
+// Under this many synced, every page repaints, so the list fills visibly
+// (100 rows at a time) instead of jumping once. Above it the stride takes
+// over and the cost of re-decoding the store is amortised again.
+export const PRIORITY_WINDOW = 500;
+
 // Whether a sync-machine fact means the store has enough new rows to be
-// worth re-reading: the prime (first screen), a strided slice of the
-// backfill, the backfill's end, or an incremental pass that changed rows.
+// worth re-reading: the prime (first screen), the priority window, a strided
+// slice of the backfill, the backfill's end, or an incremental pass that
+// changed rows.
 const shouldRefreshRows = (
   before: SyncMachine.State,
   message: SyncMachine.Message,
 ): boolean =>
   M.value(message).pipe(
     M.tags({
-      CompletedPrime: () => true,
-      CompletedBatch: ({ syncedCount, maybeNextPageToken }) => {
+      CompletedPrimeInbox: () => true,
+      CompletedSyncBatch: ({ syncedCount, maybeNextPageToken }) => {
         if (Option.isNone(maybeNextPageToken)) return true;
+        if (syncedCount <= PRIORITY_WINDOW) return true;
         const previousCount =
           before._tag === "Backfilling" ? before.syncedCount : 0;
         return (
@@ -200,19 +280,25 @@ const shouldRefreshRows = (
         );
       },
       AppliedHistory: ({ changedCount }) => changedCount > 0,
+      // The whole point of interleaving history into the backfill: mail that
+      // arrives mid-sync reaches the list now, not when the walk finishes.
+      RefreshedDuringBackfill: ({ changedCount }) => changedCount > 0,
     }),
     M.orElse(() => false),
   );
 
-// Row clicks and the Enter key both funnel here: move the cursor to the row
-// and, unless its thread is already open, load it.
-const openThread = (model: Model, index: number): UpdateReturn => {
-  const id = listedRows(model)[index]?.id;
+// The one open path. The thread is named by id, never by position: the row
+// list is replaced wholesale on strided backfill refreshes and on history
+// passes, so an index captured at paint time can address a different thread
+// by the time the click or keypress lands. `index` only parks the cursor, so
+// closing the thread returns the overlay to the row in place.
+const openThread = (
+  model: Model,
+  id: ThreadId,
+  index: number,
+): UpdateReturn => {
   const base = evo(model, { selected: () => Option.some(index) });
-  if (
-    id === undefined ||
-    (base.screen._tag === "ShowingThread" && base.screen.detail.id === id)
-  ) {
+  if (base.screen._tag === "ShowingThread" && base.screen.detail.id === id) {
     return [base, []];
   }
   return [
@@ -221,12 +307,19 @@ const openThread = (model: Model, index: number): UpdateReturn => {
   ];
 };
 
-// Picking a palette result: the item is a thread id, so resolve it back to
-// its list index and reuse the ordinary open path — the cursor lands on the
-// row, so closing the thread returns to it in place.
+// Opening from a position — the j/k cursor and Enter. Resolves the row first
+// so the id, not the index, is what reaches openThread.
+const openRowAt = (model: Model, index: number): UpdateReturn => {
+  const row = listedRows(model)[index];
+  return row === undefined ? [model, []] : openThread(model, row.id, index);
+};
+
+// Picking a palette result: the item is a thread id. The cursor follows it
+// into the list when the thread is on screen, and simply stays put when the
+// search surfaced something the current list doesn't contain.
 const openThreadId = (model: Model, id: string): UpdateReturn => {
   const index = listedRows(model).findIndex((row) => row.id === id);
-  return index === -1 ? [model, []] : openThread(model, index);
+  return index === -1 ? [model, []] : openRowAt(model, index);
 };
 
 const closeThread = (model: Model): UpdateReturn => [
@@ -299,13 +392,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       // The cursor is kept so the overlay fades out in place (data-hidden)
       // and Enter still opens the last-hovered row.
-      LeftList: () => [evo(model, { isPointerInside: () => false }), []],
+      ExitedList: () => [evo(model, { isPointerInside: () => false }), []],
 
-      OpenedRow: ({ index }) => openThread(model, index),
+      ClickedRow: ({ id, index }) => openThread(model, id, index),
 
       // Opening runs the empty search, so the palette paints its "recent"
       // list in the same frame the dialog appears rather than a beat later.
-      OpenedPalette: () => {
+      ToggledPalette: () => {
         const [palette, commands] = InboxPalette.toggle(model.palette);
         const opened = evo(model, { palette: () => palette });
         const paletteCommands = Command.mapMessages(commands, (message) =>
@@ -345,7 +438,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       // Stale replies lost a race to a later keystroke; showing them would
       // flash results for a query the user has already moved past.
-      GotSearchResults: ({ seq, rows }) =>
+      SucceededSearch: ({ seq, rows }) =>
         seq !== model.searchSeq
           ? [model, []]
           : [
@@ -383,7 +476,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // settle folds the fetch outcome into whatever state threads is in:
       // success replaces the rows; failure keeps any previous rows (Stale)
       // or lands on Failure when there were none.
-      GotThreads: ({ rows }) => [
+      SucceededLoadInbox: ({ rows }) => [
         evo(model, {
           threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
             Result.succeed(rows),
@@ -400,10 +493,42 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             ...Command.mapMessages(commands, (message) =>
               GotSyncMessage({ message }),
             ),
-            ...(shouldRefreshRows(model.sync, message) ? [LoadInbox()] : []),
+            ...(shouldRefreshRows(model.sync, message)
+              ? [LoadInbox(), ReadLocalSize()]
+              : []),
           ],
         ];
       },
+
+      SucceededReadLocalSize: ({ bytes }) => [
+        evo(model, { maybeLocalBytes: () => Option.some(bytes) }),
+        [],
+      ],
+
+      // A size read is decoration; failing it leaves the previous number (or
+      // nothing) rather than disturbing anything the user is looking at.
+      FailedReadLocalSize: () => [model, []],
+
+      // The loop's only turn: ask for the next batch. It never terminates by
+      // design — new mail arriving in a settled mailbox needs its images too,
+      // and the engine's own idle wait is what keeps a fully-cached store
+      // down to one cheap query every few seconds.
+      //
+      // Prefetching is an optimization, so a failure re-arms the loop just
+      // the same: the Command has already waited out its backoff before
+      // either message arrives, which is what stops this from spinning.
+      // Latched, never cleared: new mail lands in the hot window with its
+      // images seconds behind, which would flicker the milestone off and on
+      // every time a message arrives. "Your recent mail is ready offline"
+      // does not stop being true because one email's images are three
+      // seconds late.
+      CompletedCacheImageBatch: ({ isRecentReady }) => [
+        evo(model, {
+          isRecentReady: (was) => was || isRecentReady,
+        }),
+        [CacheImageBatch()],
+      ],
+      FailedCacheImageBatch: () => [model, [CacheImageBatch()]],
 
       FailedLoadInbox: ({ error }) => [
         evo(model, {
@@ -414,7 +539,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [],
       ],
 
-      GotThread: ({ detail }) => {
+      SucceededLoadThread: ({ detail }) => {
         // Only the load we're still waiting for counts — anything else is a
         // superseded open whose row the cursor left.
         if (
@@ -441,17 +566,22 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         if (key === "Enter") {
           return Option.match(model.selected, {
             onNone: (): UpdateReturn => [model, []],
-            onSome: (index) => openThread(model, index),
+            onSome: (index) => openRowAt(model, index),
           });
         }
 
-        const rowCount = listedRows(model).length;
-        if (rowCount === 0) return [model, []];
-        const current = Option.getOrElse(model.selected, () => -1);
-        const index =
-          key === "j"
-            ? Math.min(current + 1, rowCount - 1)
-            : Math.max(current - 1, 0);
+        const rows = listedRows(model);
+        if (Arr.isReadonlyArrayEmpty(rows)) return [model, []];
+        const lastIndex = rows.length - 1;
+        // With no cursor yet, either key lands on the first row — stated
+        // outright rather than falling out of arithmetic on a -1 sentinel.
+        const index = Option.match(model.selected, {
+          onNone: () => 0,
+          onSome: (current) =>
+            key === "j"
+              ? Math.min(current + 1, lastIndex)
+              : Math.max(current - 1, 0),
+        });
         return [
           evo(model, {
             selected: () => Option.some(index),
@@ -470,7 +600,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       ClickedBack: () => closeThread(model),
 
-      CompletedListScroll: () => [model, []],
+      CompletedScrollListToRow: () => [model, []],
 
       // The actual sign-out is main.ts's job; this page just folds the
       // popover shut behind it.

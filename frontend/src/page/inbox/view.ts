@@ -2,17 +2,17 @@
 // interaction is a Message from there. Nothing in here reaches for a
 // Command or the update logic.
 
-import { Match as M, Option } from "effect";
+import { Array as Arr, Match as M, Option } from "effect";
 import { AsyncData, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 
 import * as Icon from "../../icons";
+import { ThreadId } from "../../Gmail";
 import { ThreadDetail, ThreadRow, type MessageDetail } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
 
 import {
-  GotSyncMessage,
   AVATAR_BG,
   AVATAR_FG,
   Appearance,
@@ -22,8 +22,10 @@ import {
   type Category,
   ClickedAppearance,
   ClickedBack,
+  ClickedRow,
   ClickedSignOut,
   EnteredList,
+  ExitedList,
   FOLDERS,
   FOLDER_LABELS,
   FolderMenu,
@@ -31,19 +33,22 @@ import {
   GotFolderMenuMessage,
   GotListMessage,
   GotPaletteMessage,
+  GotSyncMessage,
   GotTabsMessage,
   HoveredRow,
   InboxPalette,
   LIST_ID,
   LIST_OVERSCAN,
-  LeftList,
   Message,
   Model,
-  OpenedPalette,
-  OpenedRow,
   PAGE_SURFACE,
   ROW_HEIGHT,
   TAB_LABELS,
+  ToggledPalette,
+  formatBytes,
+  formatProgress,
+  progressPercent,
+  recentReadyLine,
   formatTime,
   tabSpec,
   threadItemSpec,
@@ -146,58 +151,233 @@ const accountPanelView = (
   );
 };
 
-// The sync pill: the machine's state rendered directly — no parallel
-// status struct to keep honest. Because the machine's entry state is
-// derived from the persisted checkpoint, a refresh mid-backfill shows real
-// progress from first paint.
-const syncPillView = (sync: SyncMachine.State): Html => {
-  const h = html<Message>();
+// What the pill says, per machine state: a short label for the pill itself
+// and a fuller sentence for the hover detail. Cold is deliberately not empty
+// — the machine boots Cold, so rendering nothing there made the pill appear a
+// beat after first paint and shove the toolbar sideways.
+type SyncSummary = Readonly<{
+  /** The pill itself. */
+  label: string;
+  /** The panel's headline — the stage, named. */
+  stage: string;
+  /** The line under the bar: counts and time when we have them, a plain
+   *  explanation of the stage when we don't. */
+  detail: string;
+  /** Some only while backfilling, which is the one stage with a real
+   *  denominator to draw a bar against. */
+  maybeProgress: Option.Option<
+    Readonly<{ syncedCount: number; totalEstimate: number }>
+  >;
+}>;
 
-  const pill = (children: ReadonlyArray<Html | string>): Html =>
-    h.div(
-      [
-        h.Class(
-          "flex h-7 shrink-0 items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] tabular-nums text-muted-foreground",
-        ),
-        h.Role("status"),
-      ],
-      children,
-    );
-
-  const workingDot = h.span(
-    [h.Class("animate-pulse")],
-    [Ui.badgeDot({ color: "indigo" })],
+const syncSummary = (sync: SyncMachine.State): SyncSummary =>
+  M.value(sync).pipe(
+    M.withReturnType<SyncSummary>(),
+    M.tagsExhaustive({
+      Cold: () => ({
+        label: "Starting…",
+        stage: "Starting",
+        detail: "Reading your local mailbox.",
+        maybeProgress: Option.none(),
+      }),
+      Priming: () => ({
+        label: "Syncing…",
+        stage: "Priming",
+        detail: "Fetching your most recent mail.",
+        maybeProgress: Option.none(),
+      }),
+      Backfilling: ({ syncedCount, totalEstimate }) => ({
+        label: `Syncing ${syncedCount.toLocaleString()} of ~${totalEstimate.toLocaleString()}`,
+        stage: "Backfilling",
+        detail: formatProgress(syncedCount, totalEstimate),
+        maybeProgress: Option.some({ syncedCount, totalEstimate }),
+      }),
+      CatchingUp: () => ({
+        label: "Checking…",
+        stage: "Checking",
+        detail: "Looking for anything that changed since the last sync.",
+        maybeProgress: Option.none(),
+      }),
+      Settled: () => ({
+        label: "Synced",
+        stage: "Synced",
+        detail: "Your mailbox is up to date on this device.",
+        maybeProgress: Option.none(),
+      }),
+      Backoff: () => ({
+        label: "Retrying…",
+        stage: "Retrying",
+        detail: "Gmail asked us to slow down. Retrying shortly.",
+        maybeProgress: Option.none(),
+      }),
+      NeedsAuth: () => ({
+        label: "Reconnect Gmail",
+        stage: "Disconnected",
+        detail: "Your Gmail session expired. Click to sign in again.",
+        maybeProgress: Option.none(),
+      }),
+    }),
   );
 
-  return M.value(sync).pipe(
-    M.tagsExhaustive({
-      Cold: () => h.empty,
-      Priming: () => pill([workingDot, "Syncing…"]),
-      Backfilling: ({ syncedCount, totalEstimate }) =>
-        pill([
-          workingDot,
-          `Syncing ${syncedCount.toLocaleString()} of ~${totalEstimate.toLocaleString()}`,
-        ]),
-      CatchingUp: () => pill([workingDot, "Checking…"]),
-      Settled: () => pill([Icon.check("h-3.5 w-3.5"), "Synced"]),
-      Backoff: () => pill([Ui.badgeDot({ color: "amber" }), "Retrying…"]),
-      // The one pill that is a control: the machine parks here and cannot
-      // leave on its own, so without a click there is no way back short of
-      // reloading the page.
-      NeedsAuth: () =>
-        h.button(
+// The sync pill: the machine's state rendered directly — no parallel status
+// struct to keep honest. Because the machine's entry state is derived from
+// the persisted checkpoint, a refresh mid-backfill shows real progress from
+// first paint.
+//
+// Hovering reveals the detail and the store's on-disk size: a local-first
+// client that quietly grows to a gigabyte should say so somewhere visible.
+const syncPillView = (
+  sync: SyncMachine.State,
+  maybeLocalBytes: Option.Option<number>,
+  isRecentReady: boolean,
+): Html => {
+  const h = html<Message>();
+  const { label, stage, detail, maybeProgress } = syncSummary(sync);
+  const isWorking =
+    sync._tag === "Cold" ||
+    sync._tag === "Priming" ||
+    sync._tag === "Backfilling" ||
+    sync._tag === "CatchingUp";
+
+  // A function, not a value: the glyph appears in both the pill and the
+  // panel header, and a vnode is not reusable across two positions in the
+  // tree — snabbdom patches through the same object twice.
+  const leading = (): Html =>
+    sync._tag === "Settled"
+      ? Icon.check("h-3.5 w-3.5")
+      : sync._tag === "Backoff"
+        ? Ui.badgeDot({ color: "amber" })
+        : sync._tag === "NeedsAuth"
+          ? Ui.badgeDot({ color: "red" })
+          : Ui.brailleLoader("text-[13px] text-muted-foreground");
+
+  const progressRows: ReadonlyArray<Html> = Option.match(maybeProgress, {
+    onNone: () => [],
+    onSome: ({ syncedCount, totalEstimate }) => {
+      const percent = progressPercent(syncedCount, totalEstimate);
+      return [
+        // The bar is decorative — the exact fraction is in the detail line
+        // right below it, and that is what a screen reader reads.
+        h.div(
           [
-            h.Type("button"),
-            h.OnClick(
-              GotSyncMessage({ message: SyncMachine.RetriedAuth() }),
-            ),
-            h.Class(
-              `flex h-7 shrink-0 cursor-pointer items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+            h.Class("mt-2 h-1 w-full overflow-hidden rounded-full bg-active"),
+            h.AriaHidden(true),
+          ],
+          [
+            h.div(
+              [
+                h.Class("h-full rounded-full bg-foreground/70"),
+                h.Style({ width: `${percent}%` }),
+              ],
+              [],
             ),
           ],
-          [Ui.badgeDot({ color: "red" }), "Reconnect Gmail"],
         ),
+      ];
+    },
+  });
+
+  // The header's right edge carries both numbers that are true of every
+  // state: how far along we are, and how much is on disk. Neither earns its
+  // own row — the size in particular is a standing fact, not a step, and a
+  // labelled "On disk" row gave it more weight than the progress it sits next
+  // to.
+  const trailing = [
+    ...Option.match(maybeLocalBytes, {
+      onNone: () => [],
+      onSome: (bytes) => [formatBytes(bytes)],
     }),
+    ...Option.match(maybeProgress, {
+      onNone: () => [],
+      onSome: ({ syncedCount, totalEstimate }) => [
+        `${progressPercent(syncedCount, totalEstimate)}%`,
+      ],
+    }),
+  ].join(" · ");
+
+  // The one genuinely interesting thing the app has to say mid-sync: your
+  // recent mail is entirely local — bodies, images, offline — while the rest
+  // of the mailbox is still coming down. Shown only while backfilling; once
+  // the walk is done the whole mailbox is local and the claim is redundant.
+  const milestoneRows: ReadonlyArray<Html> =
+    isRecentReady && Option.isSome(maybeProgress)
+      ? [
+          h.div(
+            [h.Class("mt-2 flex items-start gap-1.5 text-foreground")],
+            [
+              Icon.check("mt-0.5 h-3.5 w-3.5 shrink-0"),
+              h.span([], [recentReadyLine()]),
+            ],
+          ),
+        ]
+      : [];
+
+  // Hover-only, no state: the panel is always in the DOM for screen readers
+  // and is revealed by the group. Cheaper than a Popover for something with
+  // no interaction inside it.
+  const detailPanel = h.div(
+    [
+      h.Class(
+        `pointer-events-none absolute right-0 top-full z-50 mt-1.5 w-72 rounded-xl border border-border p-3 text-left text-[12px] leading-relaxed opacity-0 transition-opacity group-hover:opacity-100 ${Ui.surface(
+          Ui.elevate(PAGE_SURFACE, 3),
+          3,
+        )}`,
+      ),
+    ],
+    [
+      h.div(
+        [h.Class("flex items-center justify-between gap-3")],
+        [
+          h.span(
+            [h.Class("flex items-center gap-2 text-foreground")],
+            [leading(), stage],
+          ),
+          h.span([h.Class("shrink-0 text-muted-foreground")], [trailing]),
+        ],
+      ),
+      ...progressRows,
+      h.div([h.Class("mt-2 text-muted-foreground")], [detail]),
+      ...milestoneRows,
+    ],
+  );
+
+  const body: ReadonlyArray<Html> = [leading(), h.span([], [label])];
+  const pillClass =
+    "flex h-7 shrink-0 items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] tabular-nums text-muted-foreground";
+
+  // NeedsAuth is the one pill that is a control: the machine parks there and
+  // cannot leave on its own, so without a click there is no way back short
+  // of reloading the page.
+  return h.div(
+    [h.Class("group relative")],
+    [
+      sync._tag === "NeedsAuth"
+        ? h.button(
+            [
+              h.Type("button"),
+              h.OnClick(
+                GotSyncMessage({ message: SyncMachine.ClickedReconnect() }),
+              ),
+              h.Class(
+                `${pillClass} cursor-pointer outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+              ),
+            ],
+            body,
+          )
+        : h.div(
+            [
+              h.Class(pillClass),
+              h.Role("status"),
+              // The pill text alone is terse; the detail is what actually
+              // explains the state, so it rides along for screen readers
+              // rather than living only in a hover affordance.
+              h.AriaLabel(`${label}. ${detail}`),
+              ...(isWorking ? [h.AriaLive("polite")] : []),
+            ],
+            body,
+          ),
+      detailPanel,
+    ],
   );
 };
 
@@ -239,7 +419,11 @@ const toolbarView = (model: Model, profile: Profile): Html => {
                 slotId: "inbox-tabs",
                 model: model.tabs,
                 view: Ui.Tabs.view,
-                viewInputs: { tabs: TAB_LABELS, tabSpec },
+                viewInputs: {
+                  tabs: TAB_LABELS,
+                  tabSpec,
+                  ariaLabel: "Mail categories",
+                },
                 toParentMessage: (message) => GotTabsMessage({ message }),
               }),
               Ui.button(
@@ -256,12 +440,12 @@ const toolbarView = (model: Model, profile: Profile): Html => {
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
-          syncPillView(model.sync),
+          syncPillView(model.sync, model.maybeLocalBytes, model.isRecentReady),
           h.button(
             [
               h.Type("button"),
               h.AriaLabel("Search"),
-              h.OnClick(OpenedPalette()),
+              h.OnClick(ToggledPalette()),
               h.Class(
                 `flex h-7 cursor-pointer items-center gap-2 rounded-lg bg-hover px-2.5 text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
               ),
@@ -336,10 +520,14 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
 
   return h.div(
     [
-      h.OnClick(OpenedRow({ index })),
+      h.OnClick(ClickedRow({ id: row.id, index })),
       h.OnMouseEnter(HoveredRow({ index })),
       h.Class(
-        "flex h-full cursor-pointer items-center gap-4 border-b border-border px-4",
+        // overflow-hidden so a row can never widen the list: the sender and
+        // meta clusters are shrink-0, so without it their combined
+        // min-content width becomes the row's, and the container scrolls
+        // sideways instead of the snippet truncating.
+        "flex h-full cursor-pointer items-center gap-4 overflow-hidden border-b border-border px-4",
       ),
     ],
     [
@@ -348,7 +536,13 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
         [h.Class("flex w-56 shrink-0 items-center gap-3 md:w-64")],
         [
           senderTile((row.sender.slice(0, 1) || "?").toUpperCase()),
-          h.span([h.Class(`truncate font-semibold ${tone}`)], [row.sender]),
+          // min-w-0: a flex item defaults to min-width:auto, which refuses to
+          // shrink below its text, so `truncate` alone never fires and a long
+          // sender pushes past the fixed w-56.
+          h.span(
+            [h.Class(`min-w-0 truncate font-semibold ${tone}`)],
+            [row.sender],
+          ),
         ],
       ),
 
@@ -460,7 +654,7 @@ const virtualListView = (
     [
       h.Class("relative min-h-0 flex-1 overflow-clip"),
       h.OnMouseEnter(EnteredList()),
-      h.OnMouseLeave(LeftList()),
+      h.OnMouseLeave(ExitedList()),
     ],
     [
       listOverlayView(model),
@@ -493,15 +687,17 @@ const listBodyView = (
     onNone: (): ReadonlyArray<Html> => [],
     onSome: (message) => [statusRowView(message)],
   }),
-  rows.length === 0
-    ? statusRowView(
+  Arr.match(rows, {
+    onEmpty: () =>
+      statusRowView(
         // A cold store while the machine is still filling it isn't empty,
         // it's early — the first primed rows land within a second or two.
         isSyncFilling(model.sync)
           ? "Syncing your inbox…"
           : "Your inbox is empty.",
-      )
-    : virtualListView(model, rows),
+      ),
+    onNonEmpty: () => virtualListView(model, rows),
+  }),
 ];
 
 const isSyncFilling = (sync: SyncMachine.State): boolean =>
@@ -665,7 +861,7 @@ const threadDetailView = (detail: ThreadDetail): Html => {
 const paletteView = (model: Model): Html => {
   const h = html<Message>();
   const specs = new Map(
-    model.searchResults.map((row) => [row.id as string, threadItemSpec(row)]),
+    model.searchResults.map((row) => [row.id, threadItemSpec(row)]),
   );
 
   return h.submodel({
@@ -677,10 +873,10 @@ const paletteView = (model: Model): Html => {
       groups: [
         {
           label: "",
-          items: model.searchResults.map((row) => row.id as string),
+          items: model.searchResults.map((row) => row.id),
         },
       ],
-      itemSpec: (item: string) => specs.get(item) ?? { label: item },
+      itemSpec: (item: ThreadId) => specs.get(item) ?? { label: item },
       placeholder: "Search your mail…",
       emptyLabel: Option.getOrElse(model.searchError, () => "No results"),
       substrate: PAGE_SURFACE,
@@ -699,19 +895,46 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
         toolbarView(model, profile),
         // The list and the open thread share this centered column, so opening
         // a thread never moves the column.
+        //
+        // The open thread is painted OVER the list rather than replacing it,
+        // and the list stays mounted the whole time. Swapping the subtree
+        // destroyed the VirtualList and rebuilt it on every close, which is
+        // cheap near the top and brutal further down: the rebuilt container
+        // starts at scrollTop 0 with a spacer as tall as everything above the
+        // window (tens of thousands of rows worth), and the component only
+        // re-applies scroll when it was Unmeasured — which a surviving model
+        // is not. Keeping it mounted preserves its DOM, its measurement, and
+        // its scroll position, so closing is free.
         h.div(
           [
-            h.Class(
-              "mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-6",
-            ),
+            h.Class("relative mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col"),
           ],
           [
-            M.value(model.screen).pipe(
-              M.withReturnType<Html>(),
+            h.div(
+              [
+                h.Class("flex min-h-0 flex-1 flex-col px-6"),
+                // Still mounted under the open thread, so it has to be
+                // hidden from screen readers or the list is announced
+                // through the thread covering it.
+                h.AriaHidden(model.screen._tag === "ShowingThread"),
+              ],
+              [listSectionView(model)],
+            ),
+            ...M.value(model.screen).pipe(
+              M.withReturnType<ReadonlyArray<Html>>(),
               M.tagsExhaustive({
-                ShowingList: () => listSectionView(model),
-                OpeningThread: () => listSectionView(model),
-                ShowingThread: ({ detail }) => threadDetailView(detail),
+                ShowingList: () => [],
+                OpeningThread: () => [],
+                ShowingThread: ({ detail }) => [
+                  h.div(
+                    [
+                      h.Class(
+                        "absolute inset-0 z-10 flex min-h-0 flex-col bg-background px-6",
+                      ),
+                    ],
+                    [threadDetailView(detail)],
+                  ),
+                ],
               }),
             ),
           ],

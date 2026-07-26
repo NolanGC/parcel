@@ -165,5 +165,67 @@ export const SqlLive = SqliteMigrator.layer({
       yield* sql`ALTER TABLE threads ADD COLUMN in_inbox INTEGER NOT NULL DEFAULT 1`;
       yield* sql`CREATE INDEX threads_inbox ON threads (in_inbox, latest_date DESC)`;
     }),
+
+    // Bodies become gzip bytes: they are ~91% of the store and compress
+    // ~6.5x, which is what makes keeping every body — and so reading the
+    // whole mailbox offline — affordable. See docs/caching.md.
+    //
+    // SQLite can't retype a column, hence the rebuild. Existing rows are
+    // carried over as codec 'none': CAST(body AS BLOB) yields the text's
+    // UTF-8 bytes, so they decode through exactly the same path as new rows
+    // and no legacy branch is needed anywhere in the read path. They turn
+    // into gzip naturally as threads re-sync.
+    "0005_compress_message_bodies": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        CREATE TABLE message_bodies_v2 (
+          message_id TEXT PRIMARY KEY REFERENCES messages (id),
+          mime_type TEXT NOT NULL,
+          data BLOB NOT NULL,
+          codec TEXT NOT NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO message_bodies_v2 (message_id, mime_type, data, codec)
+        SELECT message_id, mime_type, CAST(body AS BLOB), 'none'
+        FROM message_bodies
+      `;
+      yield* sql`DROP TABLE message_bodies`;
+      yield* sql`ALTER TABLE message_bodies_v2 RENAME TO message_bodies`;
+    }),
+
+    // Remote images, cached so mail renders instantly and offline — and so
+    // opening a mail stops firing its tracking pixels. Distinct from
+    // message_attachments: those are inline MIME parts that arrive with the
+    // message, these are urls fetched from the sender's CDN through the API
+    // worker's proxy. See images.ts and docs/caching.md.
+    //
+    // Unlike bodies, these are tiered: hydrating every image in the mailbox
+    // is ~280,000 fetches and several gigabytes, so only the newest
+    // HOT_THREAD_COUNT threads are prefetched and opened threads are kept
+    // under an LRU. The two thread columns are what make that decidable
+    // without a second table — images_cached_at is the work queue
+    // (0 = pending) and images_used_at is the LRU stamp (0 = never opened).
+    "0006_remote_images": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        CREATE TABLE message_images (
+          message_id TEXT NOT NULL REFERENCES messages (id),
+          url TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          bytes BLOB NOT NULL,
+          PRIMARY KEY (message_id, url)
+        )
+      `;
+      yield* sql`ALTER TABLE threads ADD COLUMN images_cached_at INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE threads ADD COLUMN images_used_at INTEGER NOT NULL DEFAULT 0`;
+      // The image pass's queue query, in one index: pending threads, newest
+      // first. Without it every batch is a full scan of the threads table
+      // against a column that is 0 for almost every row.
+      yield* sql`
+        CREATE INDEX threads_images_pending
+        ON threads (images_cached_at, latest_date DESC)
+      `;
+    }),
   } satisfies Record<`${number}_${string}`, any>),
 }).pipe(Layer.provideMerge(ClientLive));

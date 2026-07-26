@@ -88,6 +88,13 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                         ...render.panel,
                         // z-50: anchored panels portal ahead of the app root
                         // and would paint under it otherwise.
+                        //
+                        // NOTE: outline-none with no focus-visible: partner is
+                        // deliberate. The panel is a tabindex="-1" container
+                        // that the base popover focuses programmatically on
+                        // open; it is never a keyboard tab stop, so a ring on
+                        // it would mark focus the user didn't move there. The
+                        // controls inside keep their own rings.
                         h.Class(
                           `z-50 ${widthClassName} rounded-xl p-1 outline-none ${surface(
                             elevate(substrate, POPOUT_OFFSET),

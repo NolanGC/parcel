@@ -1,5 +1,5 @@
 import { Dialog as BaseDialog } from "@foldkit/ui";
-import { Effect, Option, Schema as S } from "effect";
+import { Array as Arr, Effect, Match as M, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
@@ -80,7 +80,7 @@ export const MovedActive = m("PaletteMovedActive", {
 export const PointedItem = m("PalettePointedItem", { index: S.Number });
 /** Click or Enter. The view resolves `activeIndex` to the concrete item, so
  *  update never needs to re-run the filter. */
-export const PickedItem = m("PalettePickedItem", { item: S.String });
+export const SelectedItem = m("PaletteSelectedItem", { item: S.String });
 export const GotItemRects = m("PaletteGotItemRects", {
   rects: S.Array(Rect),
 });
@@ -90,7 +90,7 @@ export const Message = S.Union([
   ChangedQuery,
   MovedActive,
   PointedItem,
-  PickedItem,
+  SelectedItem,
   GotItemRects,
 ]);
 export type Message = typeof Message.Type;
@@ -100,7 +100,7 @@ export type Message = typeof Message.Type;
 // Measures the rendered result rows relative to the results container (the
 // offsetParent). Row count is discovered by probing ids, so the command
 // doesn't need to know the filter's output length.
-const MeasureItemRects = Command.define(
+export const MeasureItemRects = Command.define(
   "MeasurePaletteItemRects",
   { id: S.String },
   GotItemRects,
@@ -160,7 +160,7 @@ const numberRows = <Item extends string>(
 ): ReadonlyArray<FilteredGroup<Item>> => {
   let flatIndex = 0;
   return groups.flatMap((group) =>
-    group.items.length === 0
+    Arr.isReadonlyArrayEmpty(group.items)
       ? []
       : [
           {
@@ -229,78 +229,76 @@ export const create = <Item extends string>() => {
           BaseDialog.open(model.dialog),
         );
 
-  const update = (model: Model, message: Message): UpdateReturn => {
-    switch (message._tag) {
-      case "PaletteGotDialogMessage": {
-        const [dialog, commands] = BaseDialog.update(
-          model.dialog,
-          message.message,
-        );
-        // Rows exist in the DOM once the show command completes; that's the
-        // earliest correct moment to measure (same trigger discipline as
-        // Menu's CompletedAnchorMenu).
-        const isPanelReady = message.message._tag === "CompletedShowDialog";
-        return [
-          evo(model, { dialog: () => dialog }),
-          [
-            ...Command.mapMessages(commands, (message) =>
-              GotDialogMessage({ message }),
-            ),
-            ...(isPanelReady
-              ? [MeasureItemRects({ id: model.dialog.id })]
-              : []),
-          ],
-          Option.none(),
-        ];
-      }
+  const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
-      case "PaletteChangedQuery":
-        return [
+  const update = (model: Model, message: Message): UpdateReturn =>
+    M.value(message).pipe(
+      withUpdateReturn,
+      M.tagsExhaustive({
+        PaletteGotDialogMessage: ({ message }) => {
+          const [dialog, commands] = BaseDialog.update(model.dialog, message);
+          // Rows exist in the DOM once the show command completes; that's the
+          // earliest correct moment to measure (same trigger discipline as
+          // Menu's CompletedAnchorMenu).
+          const isPanelReady = message._tag === "CompletedShowDialog";
+          return [
+            evo(model, { dialog: () => dialog }),
+            [
+              ...Command.mapMessages(commands, (message) =>
+                GotDialogMessage({ message }),
+              ),
+              ...(isPanelReady
+                ? [MeasureItemRects({ id: model.dialog.id })]
+                : []),
+            ],
+            Option.none(),
+          ];
+        },
+
+        PaletteChangedQuery: ({ query }) => [
           evo(model, {
-            query: () => message.query,
+            query: () => query,
             activeIndex: () => 0,
           }),
           // Re-measure after the filtered list re-renders.
           [MeasureItemRects({ id: model.dialog.id })],
           Option.none(),
-        ];
+        ],
 
-      case "PaletteMovedActive": {
-        if (message.count === 0) return [model, [], Option.none()];
-        // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
-        // still rather than jumping to the opposite end.
-        const next = Math.max(
-          0,
-          Math.min(message.count - 1, model.activeIndex + message.delta),
-        );
-        return [evo(model, { activeIndex: () => next }), [], Option.none()];
-      }
+        PaletteMovedActive: ({ count, delta }) => {
+          if (count === 0) return [model, [], Option.none()];
+          // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
+          // still rather than jumping to the opposite end.
+          const next = Math.max(
+            0,
+            Math.min(count - 1, model.activeIndex + delta),
+          );
+          return [evo(model, { activeIndex: () => next }), [], Option.none()];
+        },
 
-      case "PalettePointedItem":
-        return [
-          evo(model, { activeIndex: () => message.index }),
+        PalettePointedItem: ({ index }) => [
+          evo(model, { activeIndex: () => index }),
           [],
           Option.none(),
-        ];
+        ],
 
-      case "PalettePickedItem": {
-        const [next, commands] = delegateDialog(
-          model,
-          BaseDialog.close(model.dialog),
-        );
-        // Items originate from viewInputs.groups, so the string is a
-        // round-tripped Item by construction.
-        return [next, commands, Option.some(message.item as Item)];
-      }
+        PaletteSelectedItem: ({ item }) => {
+          const [next, commands] = delegateDialog(
+            model,
+            BaseDialog.close(model.dialog),
+          );
+          // Items originate from viewInputs.groups, so the string is a
+          // round-tripped Item by construction.
+          return [next, commands, Option.some(item as Item)];
+        },
 
-      case "PaletteGotItemRects":
-        return [
-          evo(model, { rects: () => [...message.rects] }),
+        PaletteGotItemRects: ({ rects }) => [
+          evo(model, { rects: () => Arr.copy(rects) }),
           [],
           Option.none(),
-        ];
-    }
-  };
+        ],
+      }),
+    );
 
   const view = Submodel.defineView<Model, Message, ViewInputs<Item>>(
     (model, viewInputs): Html => {
@@ -318,6 +316,10 @@ export const create = <Item extends string>() => {
       const count = flat.length;
       const activeIndex = Math.min(model.activeIndex, Math.max(0, count - 1));
 
+      const listboxId = `${model.dialog.id}-results`;
+      const activeItemId =
+        count === 0 ? undefined : itemId(model.dialog.id, activeIndex);
+
       const inputRow = h.div(
         [h.Class("flex h-12 items-center gap-3 border-b border-border px-5")],
         [
@@ -328,10 +330,24 @@ export const create = <Item extends string>() => {
             h.Value(model.query),
             h.Placeholder(placeholder),
             h.Autocomplete("off"),
+            // Combobox semantics: the input owns the results list and
+            // publishes which row the arrow keys have landed on. The visual
+            // cue is the traveling overlay, which a screen reader can't see —
+            // activedescendant is what makes the same state audible.
+            h.Role("combobox"),
+            h.AriaLabel(placeholder),
+            h.AriaExpanded(count > 0),
+            h.AriaControls(listboxId),
+            h.AriaAutocomplete("list"),
+            ...(activeItemId === undefined
+              ? []
+              : [h.AriaActiveDescendant(activeItemId)]),
             h.Class(
               // h-full + a fixed 24px line box: the caret's height is the
               // line-height, so an explicit leading well above the font size
               // keeps it from clipping regardless of the body's 100% leading.
+              // outline-none is safe here: the dialog traps focus into this
+              // input, so it is the only focusable thing on screen.
               "h-full w-full bg-transparent leading-6 text-foreground outline-none placeholder:text-muted-foreground/60",
             ),
             h.OnInput((query) => ChangedQuery({ query })),
@@ -344,11 +360,11 @@ export const create = <Item extends string>() => {
               if (modifiers.metaKey && key >= "1" && key <= "9") {
                 const target = flat[Number(key) - 1];
                 if (target !== undefined)
-                  return Option.some(PickedItem({ item: target.item }));
+                  return Option.some(SelectedItem({ item: target.item }));
               }
               const active = flat[activeIndex];
               if (key === "Enter" && active !== undefined)
-                return Option.some(PickedItem({ item: active.item }));
+                return Option.some(SelectedItem({ item: active.item }));
               return Option.none();
             }),
           ]),
@@ -366,6 +382,7 @@ export const create = <Item extends string>() => {
           // the same key, so travel between rows still glides.
           `overlay-${model.session}-${model.query}`,
           [
+            h.Role("presentation"),
             h.Class("fk-hover-overlay rounded-lg"),
             h.Style({
               top: `${rect.top}px`,
@@ -405,11 +422,13 @@ export const create = <Item extends string>() => {
         return h.div(
           [
             h.Id(itemId(model.dialog.id, flatIndex)),
+            h.Role("option"),
+            h.AriaSelected(flatIndex === activeIndex),
             h.Class(
               "flex cursor-default items-center gap-3 rounded-lg px-3 py-1 text-foreground",
             ),
             h.OnMouseEnter(PointedItem({ index: flatIndex })),
-            h.OnClick(PickedItem({ item })),
+            h.OnClick(SelectedItem({ item })),
           ],
           [
             leading,
@@ -451,47 +470,65 @@ export const create = <Item extends string>() => {
         );
       };
 
-      const results =
-        count === 0
-          ? h.div(
-              [h.Class("px-5 py-10 text-center text-muted-foreground")],
-              [emptyLabel],
-            )
-          : h.div(
-              [
-                h.Class(
-                  "relative max-h-[min(480px,55vh)] overflow-y-auto px-2 pb-1.5 pt-1.5",
-                ),
-              ],
-              [
-                overlay,
-                ...filtered.flatMap((group, groupIndex) => [
-                  // Groups after the first separate with a hairline rather
-                  // than stacking two labels against each other.
-                  ...(groupIndex === 0
-                    ? []
-                    : [
-                        h.div(
-                          [h.Class("mx-3 my-1.5 border-t border-border")],
-                          [],
-                        ),
-                      ]),
-                  group.label === ""
-                    ? h.empty
-                    : h.div(
+      // The listbox is rendered in both branches so `aria-controls` always
+      // resolves to a live element; empty simply carries no options and the
+      // status line announces why.
+      const results = Arr.match(flat, {
+        onEmpty: () =>
+          h.div(
+            [h.Class("px-5 py-10 text-center text-muted-foreground")],
+            [
+              h.div(
+                [h.Id(listboxId), h.Role("listbox"), h.AriaLabel(placeholder)],
+                [],
+              ),
+              h.div([h.Role("status")], [emptyLabel]),
+            ],
+          ),
+        onNonEmpty: () =>
+          h.div(
+            [
+              h.Id(listboxId),
+              h.Role("listbox"),
+              h.AriaLabel(placeholder),
+              h.Class(
+                "relative max-h-[min(480px,55vh)] overflow-y-auto px-2 pb-1.5 pt-1.5",
+              ),
+            ],
+            [
+              overlay,
+              ...filtered.flatMap((group, groupIndex) => [
+                // Groups after the first separate with a hairline rather
+                // than stacking two labels against each other.
+                ...(groupIndex === 0
+                  ? []
+                  : [
+                      h.div(
                         [
-                          h.Class(
-                            "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
-                          ),
+                          h.Role("presentation"),
+                          h.Class("mx-3 my-1.5 border-t border-border"),
                         ],
-                        [group.label],
+                        [],
                       ),
-                  ...group.items.map(({ item, flatIndex }) =>
-                    itemRow(item, flatIndex),
-                  ),
-                ]),
-              ],
-            );
+                    ]),
+                group.label === ""
+                  ? h.empty
+                  : h.div(
+                      [
+                        h.Role("presentation"),
+                        h.Class(
+                          "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
+                        ),
+                      ],
+                      [group.label],
+                    ),
+                ...group.items.map(({ item, flatIndex }) =>
+                  itemRow(item, flatIndex),
+                ),
+              ]),
+            ],
+          ),
+      });
 
       return h.submodel({
         slotId: `${model.dialog.id}-dialog`,
@@ -502,6 +539,11 @@ export const create = <Item extends string>() => {
             h.dialog(
               [
                 ...render.dialog,
+                // NOTE: outline-none without a focus-visible: partner is
+                // deliberate. The native <dialog> takes focus on open before
+                // handing it to the query input; it is not a tab stop, so a
+                // ring here would flash on open without marking anything the
+                // user navigated to.
                 h.Class("h-full w-full bg-transparent p-0 outline-none"),
               ],
               render.isVisible

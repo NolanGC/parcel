@@ -27,7 +27,8 @@
     "lint": "oxlint --disable-nested-config .",
     "lint:fix": "oxlint --disable-nested-config --fix .",
     "test": "bun run --cwd frontend test",
-    "test:integ": "INTEG=1 bun test test/integ.test.ts"
+    "test:integ": "INTEG=1 bun test test/integ.test.ts",
+    "sql": "bun perf/src/sql.ts"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^4.20250805.0",

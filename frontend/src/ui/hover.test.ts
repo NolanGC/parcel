@@ -101,14 +101,14 @@ describe("Inbox list hover session", () => {
 
   // A list with real rows, pointer inside, cursor mouse-held at `index`.
   const hoveredAt = (index: number): Inbox.Model => {
-    const [loaded] = Inbox.update(Inbox.init(), Inbox.GotThreads({ rows }));
+    const [loaded] = Inbox.update(Inbox.init(), Inbox.SucceededLoadInbox({ rows }));
     const [entered] = Inbox.update(loaded, Inbox.EnteredList());
     const [next] = Inbox.update(entered, Inbox.HoveredRow({ index }));
     return next;
   };
 
   test("entering the list starts a fresh session with no cursor", () => {
-    const [left] = Inbox.update(hoveredAt(1), Inbox.LeftList());
+    const [left] = Inbox.update(hoveredAt(1), Inbox.ExitedList());
     const [next] = Inbox.update(left, Inbox.EnteredList());
     // Remounts the overlay (snap + fade-in) instead of sliding from row 1.
     expect(next.hoverSession).toBe(left.hoverSession + 1);
@@ -117,7 +117,7 @@ describe("Inbox list hover session", () => {
   });
 
   test("leaving keeps the cursor so the overlay fades out in place", () => {
-    const [next] = Inbox.update(hoveredAt(1), Inbox.LeftList());
+    const [next] = Inbox.update(hoveredAt(1), Inbox.ExitedList());
     expect(next.selected).toEqual(Option.some(1));
     expect(next.isPointerInside).toBe(false);
   });

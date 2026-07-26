@@ -1,14 +1,14 @@
 // The sync machine: the state machine that fills and freshens the local
 // store, on foldkit's experimental Machine (the checkout-machine shape).
 //
-//   Cold ──GotSyncCheckpoint──► Priming | Backfilling | CatchingUp
-//   Priming ──CompletedPrime──► Backfilling
-//   Backfilling ──CompletedBatch──► Backfilling (next page) | CatchingUp
+//   Cold ──SucceededReadSyncCheckpoint──► Priming | Backfilling | CatchingUp
+//   Priming ──CompletedPrimeInbox──► Backfilling
+//   Backfilling ──CompletedSyncBatch──► Backfilling (next page) | CatchingUp
 //   CatchingUp ──AppliedHistory──► Settled ──TickedPoll──► CatchingUp
 //   CatchingUp ──Expired/Overflowed──► Priming (bounded full resync)
 //   any network pass ──FailedSync──► Backoff (resume-aware) | NeedsAuth
-//   Cold ──FailedCheckpoint──► Backoff ──FiredRetry──► Cold (re-read)
-//   NeedsAuth ──RetriedAuth──► Priming (the toolbar pill is a button)
+//   Cold ──FailedReadSyncCheckpoint──► Backoff ──CompletedWaitRetry──► Cold (re-read)
+//   NeedsAuth ──ClickedReconnect──► Priming (the toolbar pill is a button)
 //
 // The store answers every read throughout; the machine only makes it more
 // complete. Its state is derived from the SQLite checkpoint at boot — never
@@ -94,7 +94,7 @@ export const init = (): State => Cold({ attempt: 0 });
 
 // MESSAGE
 
-export const GotSyncCheckpoint = m("GotSyncCheckpoint", {
+export const SucceededReadSyncCheckpoint = m("SucceededReadSyncCheckpoint", {
   maybeCheckpoint: S.Option(
     S.Struct({
       maybeHistoryId: S.Option(HistoryId),
@@ -104,12 +104,12 @@ export const GotSyncCheckpoint = m("GotSyncCheckpoint", {
     }),
   ),
 });
-export const CompletedPrime = m("CompletedPrime", {
+export const CompletedPrimeInbox = m("CompletedPrimeInbox", {
   historyId: HistoryId,
   syncedCount: S.Number,
   totalEstimate: S.Number,
 });
-export const CompletedBatch = m("CompletedBatch", {
+export const CompletedSyncBatch = m("CompletedSyncBatch", {
   syncedCount: S.Number,
   maybeNextPageToken: S.Option(PageToken),
 });
@@ -117,6 +117,17 @@ export const AppliedHistory = m("AppliedHistory", {
   historyId: HistoryId,
   changedCount: S.Number,
   syncedAt: S.Number,
+});
+/** A history pass that ran *during* the backfill. Deliberately a separate
+ *  fact from AppliedHistory, with no failure variant: an interleaved refresh
+ *  is an optimization on top of a walk that is already correct, so every way
+ *  it can go wrong — a failed request, an expired cursor, more changes than
+ *  HISTORY_RESYNC_CAP — collapses to `maybeHistoryId: None` and the backfill
+ *  carries on undisturbed. Routing it through FailedSync instead would let a
+ *  transient network blip knock a 25-minute backfill into Backoff. */
+export const RefreshedDuringBackfill = m("RefreshedDuringBackfill", {
+  maybeHistoryId: S.Option(HistoryId),
+  changedCount: S.Number,
 });
 /** Gmail expired the cursor (~a week of history): full resync. */
 export const ExpiredHistory = m("ExpiredHistory");
@@ -129,28 +140,29 @@ export const FailedSync = m("FailedSync", {
 /** The checkpoint read's own failure. Distinct from FailedSync because it
  *  is the one pass whose retry needs an argument, and Cold cannot hold the
  *  account itself — the page is constructed before sign-in is resolved. */
-export const FailedCheckpoint = m("FailedCheckpoint", {
+export const FailedReadSyncCheckpoint = m("FailedReadSyncCheckpoint", {
   accountEmail: S.String,
   isAuthError: S.Boolean,
   maybeRetryAfterMs: S.Option(S.Number),
 });
-export const FiredRetry = m("FiredRetry");
+export const CompletedWaitRetry = m("CompletedWaitRetry");
 export const TickedPoll = m("TickedPoll");
 /** The "Reconnect Gmail" pill was clicked: try the whole thing again. */
-export const RetriedAuth = m("RetriedAuth");
+export const ClickedReconnect = m("ClickedReconnect");
 
 export const Message = S.Union([
-  GotSyncCheckpoint,
-  CompletedPrime,
-  CompletedBatch,
+  SucceededReadSyncCheckpoint,
+  CompletedPrimeInbox,
+  CompletedSyncBatch,
   AppliedHistory,
+  RefreshedDuringBackfill,
   ExpiredHistory,
   OverflowedHistory,
   FailedSync,
-  FailedCheckpoint,
-  FiredRetry,
+  FailedReadSyncCheckpoint,
+  CompletedWaitRetry,
   TickedPoll,
-  RetriedAuth,
+  ClickedReconnect,
 ]);
 export type Message = typeof Message.Type;
 
@@ -190,17 +202,17 @@ const toFailedSync = (error: GmailError | SqlError): typeof FailedSync.Type =>
 export const ReadSyncCheckpoint = Command.define(
   "ReadSyncCheckpoint",
   { accountEmail: S.String },
-  GotSyncCheckpoint,
-  FailedCheckpoint,
+  SucceededReadSyncCheckpoint,
+  FailedReadSyncCheckpoint,
 )(({ accountEmail }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.readCheckpoint(accountEmail).pipe(
-      Effect.map((maybeCheckpoint) => GotSyncCheckpoint({ maybeCheckpoint })),
+      Effect.map((maybeCheckpoint) => SucceededReadSyncCheckpoint({ maybeCheckpoint })),
       Effect.catch((error) => {
         const failure = toFailedSync(error);
         return Effect.succeed(
-          FailedCheckpoint({
+          FailedReadSyncCheckpoint({
             accountEmail,
             isAuthError: failure.isAuthError,
             maybeRetryAfterMs: failure.maybeRetryAfterMs,
@@ -213,13 +225,13 @@ export const ReadSyncCheckpoint = Command.define(
 
 export const PrimeInbox = Command.define(
   "PrimeInbox",
-  CompletedPrime,
+  CompletedPrimeInbox,
   FailedSync,
 )(
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.primeInbox.pipe(
-      Effect.map((result) => CompletedPrime(result)),
+      Effect.map((result) => CompletedPrimeInbox(result)),
       Effect.catch((error) => Effect.succeed(toFailedSync(error))),
     );
   }),
@@ -231,13 +243,13 @@ export const PrimeInbox = Command.define(
 export const SyncBatch = Command.define(
   "SyncBatch",
   { maybePageToken: S.Option(PageToken), syncedCount: S.Number },
-  CompletedBatch,
+  CompletedSyncBatch,
   FailedSync,
 )(({ maybePageToken, syncedCount }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.syncBatch(maybePageToken, syncedCount).pipe(
-      Effect.map((result) => CompletedBatch(result)),
+      Effect.map((result) => CompletedSyncBatch(result)),
       Effect.catch((error) => Effect.succeed(toFailedSync(error))),
     );
   }),
@@ -269,14 +281,53 @@ export const ApplyHistory = Command.define(
   }),
 );
 
+// The interleaved refresh. Same engine pass as ApplyHistory, but every
+// outcome — including failure — becomes one infallible fact, because the
+// backfill must not be interrupted by it.
+//
+// An expired cursor reports None and so keeps the old one, which means the
+// remaining interleaved passes during this backfill are wasted requests and
+// the full resync happens once at CatchingUp. That is the right trade: an
+// expired cursor is rare, and handling it here would mean tearing down a
+// backfill that is already most of the way through the same work.
+export const RefreshDuringBackfill = Command.define(
+  "RefreshDuringBackfill",
+  { historyId: HistoryId },
+  RefreshedDuringBackfill,
+)(({ historyId }) =>
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    const stale = RefreshedDuringBackfill({
+      maybeHistoryId: Option.none(),
+      changedCount: 0,
+    });
+    return yield* engine.applyHistory(historyId).pipe(
+      Effect.map((result) =>
+        M.value(result).pipe(
+          M.tagsExhaustive({
+            Applied: ({ historyId, changedCount }) =>
+              RefreshedDuringBackfill({
+                maybeHistoryId: Option.some(historyId),
+                changedCount,
+              }),
+            Expired: () => stale,
+            Overflowed: () => stale,
+          }),
+        ),
+      ),
+      Effect.catch(() => Effect.succeed(stale)),
+    );
+  }),
+);
+
 const WaitRetry = Command.define(
   "WaitRetry",
   { delayMs: S.Number },
-  FiredRetry,
+  CompletedWaitRetry,
 )(({ delayMs }) =>
   Effect.gen(function* () {
     yield* Effect.sleep(delayMs);
-    return FiredRetry();
+    return CompletedWaitRetry();
   }),
 );
 
@@ -321,7 +372,7 @@ const isAuthFailure = (
 // else primes from scratch.
 const doneCheckpointCursor = (
   _cold: typeof Cold.Type,
-  message: typeof GotSyncCheckpoint.Type,
+  message: typeof SucceededReadSyncCheckpoint.Type,
 ): Option.Option<HistoryId> =>
   Option.flatMap(message.maybeCheckpoint, (checkpoint) =>
     checkpoint.isBackfillDone ? checkpoint.maybeHistoryId : Option.none(),
@@ -329,7 +380,7 @@ const doneCheckpointCursor = (
 
 const partialCheckpoint = (
   _cold: typeof Cold.Type,
-  message: typeof GotSyncCheckpoint.Type,
+  message: typeof SucceededReadSyncCheckpoint.Type,
 ): Option.Option<{
   historyId: HistoryId;
   syncedCount: number;
@@ -369,7 +420,7 @@ export const syncMachine = Machine.define({
   states: {
     Cold: {
       on: {
-        GotSyncCheckpoint: [
+        SucceededReadSyncCheckpoint: [
           when(
             doneCheckpointCursor,
             "CatchingUp",
@@ -404,7 +455,7 @@ export const syncMachine = Machine.define({
         // Without this the checkpoint read's own failure message had nowhere
         // to go: the machine sat in Cold forever, rendering no pill, with
         // nothing scheduled to try again.
-        FailedCheckpoint: [
+        FailedReadSyncCheckpoint: [
           when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
           otherwise(
             to(
@@ -436,7 +487,7 @@ export const syncMachine = Machine.define({
 
     Priming: {
       on: {
-        CompletedPrime: to(
+        CompletedPrimeInbox: to(
           "Backfilling",
           ({ message }) =>
             Backfilling({
@@ -483,7 +534,7 @@ export const syncMachine = Machine.define({
 
     Backfilling: {
       on: {
-        CompletedBatch: [
+        CompletedSyncBatch: [
           when(
             (_state, message) => message.maybeNextPageToken,
             "Backfilling",
@@ -493,11 +544,21 @@ export const syncMachine = Machine.define({
                 syncedCount: () => message.syncedCount,
                 attempt: () => 0,
               }),
-            ({ message, guardValue }) => [
+            // Two commands, running concurrently: the next page of the walk,
+            // and a history pass so mail arriving mid-backfill shows up
+            // within a page rather than at the end of a ~25 minute sync.
+            //
+            // Every page, with no stride: one history.list is 2 quota units
+            // against a 250/sec budget and a page takes ~5s, so this is under
+            // 0.2% of the backfill's own quota spend. A counter to fire it
+            // every Nth page would be more machine state to carry and resume
+            // than the requests it saves are worth.
+            ({ state, message, guardValue }) => [
               SyncBatch({
                 maybePageToken: Option.some(guardValue),
                 syncedCount: message.syncedCount,
               }),
+              RefreshDuringBackfill({ historyId: state.historyId }),
             ],
           ),
           otherwise(
@@ -509,6 +570,20 @@ export const syncMachine = Machine.define({
             ),
           ),
         ],
+        // Stays in Backfilling and issues nothing: the walk already has its
+        // next page in flight, and this pass exists only to fold newly
+        // arrived mail into the store. Advancing the cursor when the pass
+        // succeeded is what stops the next refresh re-reporting the same
+        // changes; a None leaves the cursor exactly where it was.
+        RefreshedDuringBackfill: to(
+          "Backfilling",
+          ({ state, message }) =>
+            evo(state, {
+              historyId: () =>
+                Option.getOrElse(message.maybeHistoryId, () => state.historyId),
+            }),
+          () => [],
+        ),
         FailedSync: [
           when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
           otherwise(
@@ -605,7 +680,7 @@ export const syncMachine = Machine.define({
     // next failure escalates instead of resetting the delay.
     Backoff: {
       on: {
-        FiredRetry: [
+        CompletedWaitRetry: [
           when(
             (state) =>
               state.resume._tag === "ResumeCheckpoint"
@@ -661,7 +736,7 @@ export const syncMachine = Machine.define({
     // didn't, the failure lands right back here.
     NeedsAuth: {
       on: {
-        RetriedAuth: to(
+        ClickedReconnect: to(
           "Priming",
           () => Priming({ attempt: 0 }),
           () => [PrimeInbox()],

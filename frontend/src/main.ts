@@ -15,7 +15,7 @@ import {
   CompletedSessionPersistence,
   CompletedSignOut,
   FailedCheckSession,
-  GotSession,
+  SucceededCheckSession,
   SaveSession,
   Session,
   SignOut,
@@ -81,7 +81,7 @@ export const Message = S.Union([
   GotLoginMessage,
   GotInboxMessage,
   ClickedSignOut,
-  GotSession,
+  SucceededCheckSession,
   FailedCheckSession,
   CompletedSignOut,
   CompletedSessionPersistence,
@@ -173,7 +173,7 @@ export const init: Runtime.RoutingApplicationInit<
   // Pure: returns the starting model plus command *descriptions* — the
   // runtime executes them after boot. Every branch revalidates with
   // CheckSession because the cached session is only an optimistic first
-  // paint; the cookie's verdict arrives later as GotSession.
+  // paint; the cookie's verdict arrives later as SucceededCheckSession.
   return Option.match(flags.maybeSession, {
     onNone: () => {
       // No cached session: render the route logged out, with the session
@@ -205,7 +205,7 @@ export const init: Runtime.RoutingApplicationInit<
       );
     },
     onSome: (session) => {
-      // Cached session: paint logged-in immediately; GotSession later
+      // Cached session: paint logged-in immediately; SucceededCheckSession later
       // confirms or evicts (the "cached profile lied" transition in
       // update). The inbox pull starts on the optimistic session — a stale
       // cookie surfaces as the pull's own auth error, not a blank list.
@@ -220,7 +220,11 @@ export const init: Runtime.RoutingApplicationInit<
           // Nothing to sign into — bounce straight to the inbox.
           Login: () => [
             initLoggedIn(InboxRouteValue, session),
-            [RedirectToInbox(), CheckSession(), ...loadInboxCommands(session.email)],
+            [
+              RedirectToInbox(),
+              CheckSession(),
+              ...loadInboxCommands(session.email),
+            ],
           ],
           Inbox: optimistic,
           Home: optimistic,
@@ -270,7 +274,11 @@ const RedirectToHome = Command.define(
 // the profile cache, and start the first real pull.
 const enterLoggedIn = (session: Session): UpdateReturn => [
   initLoggedIn(InboxRouteValue, session),
-  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands(session.email)],
+  [
+    SaveSession({ session }),
+    RedirectToInbox(),
+    ...loadInboxCommands(session.email),
+  ],
 ];
 
 const leaveLoggedIn = (): UpdateReturn => [
@@ -343,7 +351,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         );
       },
 
-      GotSession: ({ maybeSession }) =>
+      SucceededCheckSession: ({ maybeSession }) =>
         M.value(model).pipe(
           withUpdateReturn,
           M.tagsExhaustive({
@@ -405,7 +413,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             },
             // Sign-in completes via a full-page OAuth redirect, not a
             // submodel message: the returning visit's boot-time
-            // CheckSession performs the logged-in transition (GotSession
+            // CheckSession performs the logged-in transition (SucceededCheckSession
             // above).
             LoggedIn: (loggedIn) => [loggedIn, []],
           }),
@@ -459,7 +467,7 @@ const keyboardSubscriptions = Subscription.make<Model, Message>()((entry) => ({
               if ((event.metaKey || event.ctrlKey) && event.key === "k") {
                 event.preventDefault();
                 return Option.some(
-                  GotInboxMessage({ message: Inbox.OpenedPalette() }),
+                  GotInboxMessage({ message: Inbox.ToggledPalette() }),
                 );
               }
               return Option.none();
@@ -560,30 +568,41 @@ const inboxView = (inboxPage: Inbox.Model, session: Session): Html => {
   });
 };
 
-const loggedOutView = (model: LoggedOut): Document => {
+// The 404 renders identically whether or not there's a session, so both
+// route matchers land here rather than each carrying a copy.
+const notFoundDocument = (path: string): Document => {
   const h = html<Message>();
 
-  return M.value(model.route).pipe(
+  return {
+    title: "Not Found",
+    body: h.div(
+      [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
+      [notFoundView("Page not found", `No route for ${path}.`)],
+    ),
+  };
+};
+
+const loggedOutView = (model: LoggedOut): Document =>
+  M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(false, ClickedSignOut()) }),
+      Home: () => ({
+        title: APP_NAME,
+        body: landingView(false, ClickedSignOut()),
+      }),
       // Redirect in flight; render the landing rather than a flash of the
       // gated inbox.
-      Inbox: () => ({ title: APP_NAME, body: landingView(false, ClickedSignOut()) }),
+      Inbox: () => ({
+        title: APP_NAME,
+        body: landingView(false, ClickedSignOut()),
+      }),
       Login: () => ({
         title: `Sign in — ${APP_NAME}`,
         body: loginView(model),
       }),
-      NotFound: ({ path }) => ({
-        title: "Not Found",
-        body: h.div(
-          [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
-          [notFoundView("Page not found", `No route for ${path}.`)],
-        ),
-      }),
+      NotFound: ({ path }) => notFoundDocument(path),
     }),
   );
-};
 
 const loginView = (model: LoggedOut): Html => {
   const h = html<Message>();
@@ -596,27 +615,24 @@ const loginView = (model: LoggedOut): Html => {
   });
 };
 
-const loggedInView = (model: LoggedIn): Document => {
-  const h = html<Message>();
-
-  return M.value(model.route).pipe(
+const loggedInView = (model: LoggedIn): Document =>
+  M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(true, ClickedSignOut()) }),
+      Home: () => ({
+        title: APP_NAME,
+        body: landingView(true, ClickedSignOut()),
+      }),
       // Redirect to the inbox in flight.
-      Login: () => ({ title: APP_NAME, body: landingView(true, ClickedSignOut()) }),
+      Login: () => ({
+        title: APP_NAME,
+        body: landingView(true, ClickedSignOut()),
+      }),
       // The inbox is a full-window design; no app chrome around it.
       Inbox: () => ({
         title: `Inbox — ${APP_NAME}`,
         body: inboxView(model.inboxPage, model.session),
       }),
-      NotFound: ({ path }) => ({
-        title: "Not Found",
-        body: h.div(
-          [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
-          [notFoundView("Page not found", `No route for ${path}.`)],
-        ),
-      }),
+      NotFound: ({ path }) => notFoundDocument(path),
     }),
   );
-};

@@ -10,7 +10,8 @@ import { m } from "foldkit/message";
 import { ts } from "foldkit/schema";
 
 import * as Icon from "../../icons";
-import { ThreadId } from "../../Gmail";
+import { HOT_THREAD_COUNT } from "../../tiers";
+import { THREADS_PER_SECOND, ThreadId } from "../../Gmail";
 import { ThreadDetail, ThreadRow, type ThreadCategory } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
@@ -69,6 +70,52 @@ export const formatTime = (epochMs: number): string => {
     date.getFullYear(),
   ).slice(2)}`;
 };
+
+// Remaining sync time at the quota bucket's sustained rate. That rate — not
+// concurrency — is what binds the backfill, so it is the honest basis for an
+// estimate; see THREADS_PER_SECOND. Rounded coarsely on purpose: a number
+// that ticks every second reads as precision the estimate does not have.
+export const formatEta = (remainingThreads: number): string => {
+  const seconds = Math.ceil(remainingThreads / THREADS_PER_SECOND);
+  if (seconds < 60) return "under a minute";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `about ${minutes} min`;
+  const hours = Math.round(seconds / 3600);
+  return `about ${hours} hr`;
+};
+
+// The backfill line: where the walk is and how much longer, in one row.
+export const formatProgress = (
+  syncedCount: number,
+  totalEstimate: number,
+): string =>
+  `${syncedCount.toLocaleString()} of ${totalEstimate.toLocaleString()} threads · ` +
+  `${formatEta(Math.max(0, totalEstimate - syncedCount))} left`;
+
+// Clamped both ends: total_estimate is Gmail's own label count and drifts, so
+// syncedCount can pass it — a bar reading 104% is worse than one that sits at
+// full for the last few seconds.
+export const progressPercent = (
+  syncedCount: number,
+  totalEstimate: number,
+): number =>
+  totalEstimate <= 0
+    ? 0
+    : Math.min(100, Math.max(0, Math.round((syncedCount / totalEstimate) * 100)));
+
+// The milestone's copy. Its own function because it names HOT_THREAD_COUNT,
+// and the number in the sentence has to be the number the queue actually
+// uses — a hardcoded "1,000" here would quietly become a lie the day the
+// tier size changes.
+export const recentReadyLine = (): string =>
+  `Latest ${HOT_THREAD_COUNT.toLocaleString()} ready to read offline, images included.`;
+
+// Human-readable store size for the pill's detail.
+export const formatBytes = (bytes: number): string =>
+  bytes >= 1_073_741_824
+    ? `${(bytes / 1_073_741_824).toFixed(1)} GB`
+    : `${Math.round(bytes / 1_048_576)} MB`;
+
 
 export type CategoryConfig = { label: string; icon: Ui.IconView; iconClass: string };
 
@@ -165,7 +212,7 @@ export const threadItemSpec = (row: ThreadRow): Ui.Palette.PaletteItemSpec => ({
   detail: row.sender,
 });
 
-export const InboxPalette = Ui.Palette.create<string>();
+export const InboxPalette = Ui.Palette.create<ThreadId>();
 
 // MODEL
 
@@ -214,13 +261,23 @@ export const Model = S.Struct({
   // without the latency half.
   searchSeq: S.Number,
   searchError: S.Option(S.String),
+  // On-disk size of the local store, shown in the sync pill's detail. None
+  // until the first read lands.
+  maybeLocalBytes: S.Option(S.Number),
+  // The newest HOT_THREAD_COUNT threads are fully local — bodies and images —
+  // while the rest of the mailbox is still downloading. Latched: see the
+  // CompletedCacheImageBatch handler for why it never goes back to false.
+  isRecentReady: S.Boolean,
 });
 export type Model = typeof Model.Type;
 
 export const init = (): Model => ({
   appearance: "System",
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
-  tabs: Ui.Tabs.init({ id: "inbox-tabs" }),
+  tabs: Ui.Tabs.init({
+    id: "inbox-tabs",
+    selectedValue: TAB_LABELS[0] ?? "",
+  }),
   list: Ui.VirtualList.init({ id: LIST_ID, rowHeightPx: ROW_HEIGHT }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
@@ -236,6 +293,8 @@ export const init = (): Model => ({
   searchResults: [],
   searchSeq: 0,
   searchError: Option.none(),
+  maybeLocalBytes: Option.none(),
+  isRecentReady: false,
 });
 
 // MESSAGE
@@ -254,11 +313,14 @@ export const HoveredRow = m("HoveredRow", { index: S.Number });
 /** Pointer entered the list area: a fresh hover session. */
 export const EnteredList = m("EnteredList");
 /** Pointer left the list area: the overlay fades out in place. */
-export const LeftList = m("LeftList");
-/** A row was clicked: open its thread. */
-export const OpenedRow = m("OpenedRow", { index: S.Number });
+export const ExitedList = m("ExitedList");
+/** A row was clicked: open its thread. `id` — not `index` — is what names
+ *  the thread. A strided backfill refresh or an incremental history pass can
+ *  replace the row list between paint and click, which shifts every index;
+ *  the id survives that. `index` rides along only to park the cursor. */
+export const ClickedRow = m("ClickedRow", { id: ThreadId, index: S.Number });
 /** Toggles the command palette — toolbar button or the global ⌘K sub. */
-export const OpenedPalette = m("OpenedPalette");
+export const ToggledPalette = m("ToggledPalette");
 export const GotPaletteMessage = m("GotPaletteMessage", {
   message: Ui.Palette.Message,
 });
@@ -271,7 +333,7 @@ export const ClickedSignOut = m("InboxClickedSignOut");
 /** The popover's light/dark switch. */
 export const ClickedAppearance = m("InboxClickedAppearance");
 /** Ranked results for the search identified by `seq`. */
-export const GotSearchResults = m("GotSearchResults", {
+export const SucceededSearch = m("SucceededSearch", {
   seq: S.Number,
   rows: S.Array(ThreadRow),
 });
@@ -280,20 +342,40 @@ export const FailedSearch = m("FailedSearch", {
   error: S.String,
 });
 /** The SyncEngine finished a pull: real thread rows from the local store. */
-export const GotThreads = m("GotThreads", { rows: S.Array(ThreadRow) });
+export const SucceededLoadInbox = m("SucceededLoadInbox", {
+  rows: S.Array(ThreadRow),
+});
 /** A sync-machine fact (checkpoint read, batch landed, failure, …). */
 export const GotSyncMessage = m("GotSyncMessage", {
   message: SyncMachine.Message,
 });
 export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
-export const GotThread = m("GotThread", { detail: ThreadDetail });
+/** On-disk size of the local store, for the sync pill's detail. */
+export const SucceededReadLocalSize = m("SucceededReadLocalSize", {
+  bytes: S.Number,
+});
+export const FailedReadLocalSize = m("FailedReadLocalSize", {
+  error: S.String,
+});
+/** One image batch landed — the prefetch loop's cue to ask for the next.
+ *  Carries the milestone rather than a count: the pill reports *that* the
+ *  recent window is fully local, not how far along it is. */
+export const CompletedCacheImageBatch = m("CompletedCacheImageBatch", {
+  isRecentReady: S.Boolean,
+});
+export const FailedCacheImageBatch = m("FailedCacheImageBatch", {
+  error: S.String,
+});
+export const SucceededLoadThread = m("SucceededLoadThread", {
+  detail: ThreadDetail,
+});
 /** List keyboard nav from the global subscription in main.ts. */
 export const PressedListKey = m("PressedListKey", {
   key: S.Literals(["j", "k", "Enter", "Escape"]),
 });
 export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
-export const CompletedListScroll = m("CompletedListScroll");
+export const CompletedScrollListToRow = m("CompletedScrollListToRow");
 
 export const Message = S.Union([
   GotFolderMenuMessage,
@@ -302,22 +384,26 @@ export const Message = S.Union([
   GotListMessage,
   HoveredRow,
   EnteredList,
-  LeftList,
-  OpenedRow,
-  OpenedPalette,
+  ExitedList,
+  ClickedRow,
+  ToggledPalette,
   GotPaletteMessage,
   GotAccountPopoverMessage,
   ClickedSignOut,
   ClickedAppearance,
-  GotSearchResults,
+  SucceededSearch,
   FailedSearch,
-  GotThreads,
+  SucceededLoadInbox,
   GotSyncMessage,
   FailedLoadInbox,
-  GotThread,
+  SucceededReadLocalSize,
+  FailedReadLocalSize,
+  CompletedCacheImageBatch,
+  FailedCacheImageBatch,
+  SucceededLoadThread,
   PressedListKey,
   FailedLoadThread,
   ClickedBack,
-  CompletedListScroll,
+  CompletedScrollListToRow,
 ]);
 export type Message = typeof Message.Type;

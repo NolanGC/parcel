@@ -9,6 +9,7 @@
 // auth parking).
 import { Option } from "effect";
 import { describe, expect, test } from "vitest";
+import { evo } from "foldkit/struct";
 
 import { HistoryId, PageToken } from "./Gmail";
 import * as SyncMachine from "./syncMachine";
@@ -64,7 +65,7 @@ describe("entry from the checkpoint", () => {
   test("no checkpoint primes from scratch", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.GotSyncCheckpoint({ maybeCheckpoint: Option.none() }),
+      SyncMachine.SucceededReadSyncCheckpoint({ maybeCheckpoint: Option.none() }),
     );
     expect(state._tag).toBe("Priming");
     expect(commandNames(commands)).toEqual(["PrimeInbox"]);
@@ -73,7 +74,7 @@ describe("entry from the checkpoint", () => {
   test("a mid-backfill checkpoint resumes with honest counts", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.GotSyncCheckpoint({
+      SyncMachine.SucceededReadSyncCheckpoint({
         maybeCheckpoint: Option.some(checkpoint()),
       }),
     );
@@ -93,7 +94,7 @@ describe("entry from the checkpoint", () => {
   test("a completed checkpoint goes straight to the history diff", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.GotSyncCheckpoint({
+      SyncMachine.SucceededReadSyncCheckpoint({
         maybeCheckpoint: Option.some(checkpoint({ isBackfillDone: true })),
       }),
     );
@@ -104,7 +105,7 @@ describe("entry from the checkpoint", () => {
   test("a checkpoint without a cursor is a dead prime — start over", () => {
     const [state] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.GotSyncCheckpoint({
+      SyncMachine.SucceededReadSyncCheckpoint({
         maybeCheckpoint: Option.some(
           checkpoint({ maybeHistoryId: Option.none() }),
         ),
@@ -122,7 +123,7 @@ describe("progress carried into each backfill page", () => {
   test("resuming from a checkpoint carries the checkpoint's count", () => {
     const [, commands] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.GotSyncCheckpoint({
+      SyncMachine.SucceededReadSyncCheckpoint({
         maybeCheckpoint: Option.some(checkpoint({ syncedCount: 4000 })),
       }),
     );
@@ -132,7 +133,7 @@ describe("progress carried into each backfill page", () => {
   test("the first page after priming carries the prime's count", () => {
     const [, commands] = SyncMachine.step(
       SyncMachine.Priming({ attempt: 0 }),
-      SyncMachine.CompletedPrime({
+      SyncMachine.CompletedPrimeInbox({
         historyId: cursor,
         syncedCount: 15,
         totalEstimate: 900,
@@ -144,7 +145,7 @@ describe("progress carried into each backfill page", () => {
   test("each further page carries the running count, not the state's", () => {
     const [, commands] = SyncMachine.step(
       backfilling,
-      SyncMachine.CompletedBatch({
+      SyncMachine.CompletedSyncBatch({
         syncedCount: 4100,
         maybeNextPageToken: Option.some(token),
       }),
@@ -156,7 +157,7 @@ describe("progress carried into each backfill page", () => {
     const [failedState] = SyncMachine.step(backfilling, failed());
     const [, commands] = SyncMachine.step(
       failedState,
-      SyncMachine.FiredRetry(),
+      SyncMachine.CompletedWaitRetry(),
     );
     expect(syncBatchCount(commands)).toBe(4000);
   });
@@ -166,7 +167,7 @@ describe("the sync spine", () => {
   test("prime → backfill", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.Priming({ attempt: 0 }),
-      SyncMachine.CompletedPrime({
+      SyncMachine.CompletedPrimeInbox({
         historyId: cursor,
         syncedCount: 15,
         totalEstimate: 10000,
@@ -179,7 +180,7 @@ describe("the sync spine", () => {
   test("a batch with a next page keeps walking", () => {
     const [state, commands] = SyncMachine.step(
       backfilling,
-      SyncMachine.CompletedBatch({
+      SyncMachine.CompletedSyncBatch({
         syncedCount: 4025,
         maybeNextPageToken: Option.some(PageToken.make("page-3")),
       }),
@@ -193,13 +194,69 @@ describe("the sync spine", () => {
         attempt: 0,
       }),
     );
-    expect(commandNames(commands)).toEqual(["SyncBatch"]);
+    // The refresh rides alongside every page so mail arriving mid-backfill
+    // reaches the list within a page instead of at the end of the walk.
+    expect(commandNames(commands)).toEqual([
+      "SyncBatch",
+      "RefreshDuringBackfill",
+    ]);
+  });
+
+  test("an interleaved refresh advances the cursor without disturbing the walk", () => {
+    const later = HistoryId.make("99999");
+    const [state, commands] = SyncMachine.step(
+      backfilling,
+      SyncMachine.RefreshedDuringBackfill({
+        maybeHistoryId: Option.some(later),
+        changedCount: 3,
+      }),
+    );
+
+    expect(state).toEqual(evo(backfilling, { historyId: () => later }));
+    // Nothing is issued: the next page is already in flight, and re-issuing
+    // SyncBatch here would walk the same page twice.
+    expect(commandNames(commands)).toEqual([]);
+  });
+
+  // Every failure mode of the interleaved pass arrives as None — a network
+  // blip must not knock a 25-minute backfill into Backoff, and it must not
+  // advance the cursor past changes it never actually applied.
+  test("a failed interleaved refresh leaves the backfill exactly as it was", () => {
+    const [state, commands] = SyncMachine.step(
+      backfilling,
+      SyncMachine.RefreshedDuringBackfill({
+        maybeHistoryId: Option.none(),
+        changedCount: 0,
+      }),
+    );
+
+    expect(state).toEqual(backfilling);
+    expect(commandNames(commands)).toEqual([]);
+  });
+
+  // A real race, not a hypothetical: the final page transitions to CatchingUp
+  // while the previous page's refresh is still in flight, so this message
+  // routinely arrives after the machine has left Backfilling. It must be
+  // dropped — applying its cursor here would move CatchingUp's starting point
+  // forward past changes the proper history pass has not yet replayed.
+  test("a refresh landing after the walk finished is dropped", () => {
+    const catchingUp = SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 });
+    const [state, commands] = SyncMachine.step(
+      catchingUp,
+      SyncMachine.RefreshedDuringBackfill({
+        maybeHistoryId: Option.some(HistoryId.make("h-999")),
+        changedCount: 1,
+      }),
+    );
+
+    expect(state).toEqual(catchingUp);
+    expect(commandNames(commands)).toEqual([]);
   });
 
   test("the last batch hands off to the history diff", () => {
     const [state, commands] = SyncMachine.step(
       backfilling,
-      SyncMachine.CompletedBatch({
+      SyncMachine.CompletedSyncBatch({
         syncedCount: 10000,
         maybeNextPageToken: Option.none(),
       }),
@@ -264,7 +321,7 @@ describe("the sync spine", () => {
 // had no transitions at all, so one bad token parked sync until a reload.
 describe("no state is a dead end", () => {
   const failedCheckpoint = (isAuthError = false) =>
-    SyncMachine.FailedCheckpoint({
+    SyncMachine.FailedReadSyncCheckpoint({
       accountEmail: "ada@example.com",
       isAuthError,
       maybeRetryAfterMs: Option.none(),
@@ -286,7 +343,7 @@ describe("no state is a dead end", () => {
     const [backoff] = SyncMachine.step(SyncMachine.init(), failedCheckpoint());
     const [state, commands] = SyncMachine.step(
       backoff,
-      SyncMachine.FiredRetry(),
+      SyncMachine.CompletedWaitRetry(),
     );
     // Back to Cold, not Priming: priming would re-stamp the checkpoint and
     // skip the account-ownership check the read performs.
@@ -302,7 +359,7 @@ describe("no state is a dead end", () => {
     let state = SyncMachine.init();
     [state] = SyncMachine.step(state, failedCheckpoint());
     expect(state._tag === "Backoff" && state.delayMs).toBe(2_000);
-    [state] = SyncMachine.step(state, SyncMachine.FiredRetry());
+    [state] = SyncMachine.step(state, SyncMachine.CompletedWaitRetry());
     [state] = SyncMachine.step(state, failedCheckpoint());
     expect(state._tag === "Backoff" && state.delayMs).toBe(4_000);
   });
@@ -315,7 +372,7 @@ describe("no state is a dead end", () => {
   test("the reconnect click gets the machine out of NeedsAuth", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.NeedsAuth(),
-      SyncMachine.RetriedAuth(),
+      SyncMachine.ClickedReconnect(),
     );
     expect(state).toEqual(SyncMachine.Priming({ attempt: 0 }));
     expect(commandNames(commands)).toEqual(["PrimeInbox"]);
@@ -336,7 +393,7 @@ describe("failure edges", () => {
     const [failedState] = SyncMachine.step(backfilling, failed());
     const [state, commands] = SyncMachine.step(
       failedState,
-      SyncMachine.FiredRetry(),
+      SyncMachine.CompletedWaitRetry(),
     );
     expect(state).toEqual(
       SyncMachine.Backfilling({
@@ -355,11 +412,11 @@ describe("failure edges", () => {
     [state] = SyncMachine.step(backfilling, failed());
     expect(state._tag === "Backoff" && state.delayMs).toBe(2_000);
 
-    [state] = SyncMachine.step(state, SyncMachine.FiredRetry());
+    [state] = SyncMachine.step(state, SyncMachine.CompletedWaitRetry());
     [state] = SyncMachine.step(state, failed());
     expect(state._tag === "Backoff" && state.delayMs).toBe(4_000);
 
-    [state] = SyncMachine.step(state, SyncMachine.FiredRetry());
+    [state] = SyncMachine.step(state, SyncMachine.CompletedWaitRetry());
     [state] = SyncMachine.step(state, failed());
     // Third consecutive failure: the stored page token is no longer
     // trusted; the resumed walk will skip-scan from the top instead.
@@ -391,7 +448,7 @@ describe("failure edges", () => {
     expect(state._tag).toBe("NeedsAuth");
     expect(commands).toEqual([]);
 
-    const [still] = SyncMachine.step(state, SyncMachine.FiredRetry());
+    const [still] = SyncMachine.step(state, SyncMachine.CompletedWaitRetry());
     expect(still._tag).toBe("NeedsAuth");
   });
 });

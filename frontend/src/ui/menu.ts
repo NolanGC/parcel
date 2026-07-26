@@ -1,5 +1,5 @@
 import { Menu as BaseMenu } from "@foldkit/ui";
-import { Effect, Option, Schema as S } from "effect";
+import { Array as Arr, Effect, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
@@ -230,17 +230,18 @@ const baseViewInputs = <Item extends string>(
 export const create = <Item extends string>() => {
   const base = BaseMenu.create<Item>();
 
-  const update = (
-    model: Model,
-    message: Message,
-  ): readonly [
+  type UpdateReturn = readonly [
     Model,
     ReadonlyArray<Command.Command<Message>>,
     Option.Option<BaseMenu.OutMessage<Item>>,
-  ] => {
+  ];
+
+  // Only the rect measurement is ours; everything else is the base menu's
+  // to interpret, so this delegates rather than matching exhaustively.
+  const update = (model: Model, message: Message): UpdateReturn => {
     if (message._tag === "MenuGotItemRects") {
       return [
-        evo(model, { rects: () => [...message.rects] }),
+        evo(model, { rects: () => Arr.copy(message.rects) }),
         [],
         Option.none(),
       ];
