@@ -14,7 +14,7 @@
 import { UserId } from "@foldkit/backend";
 import { Option } from "effect";
 import { AsyncData, Scene } from "foldkit";
-import { describe, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import { HistoryId, MessageId, ThreadId } from "./Gmail";
 import { update, view, type Model } from "./main";
@@ -39,6 +39,36 @@ const loggedOutModel: Model = {
   route: LoginRoute(),
   loginPage: Login.init(false),
   inboxPage: Inbox.init(),
+};
+
+// The Scene locators find nodes by their accessible surface, which is exactly
+// what a decorative overlay does not have. This walks the rendered tree
+// instead, structurally typed so it needs nothing from foldkit's internals.
+type RenderedNode = Readonly<{
+  data?: Readonly<{
+    props?: Readonly<Record<string, unknown>>;
+    class?: Readonly<Record<string, boolean>>;
+  }>;
+  children?: ReadonlyArray<RenderedNode | string | undefined>;
+}>;
+
+const findRendered = (
+  node: RenderedNode,
+  isMatch: (candidate: RenderedNode) => boolean,
+): RenderedNode | undefined => {
+  if (isMatch(node)) {
+    return node;
+  }
+  for (const child of node.children ?? []) {
+    if (child === undefined || typeof child === "string") {
+      continue;
+    }
+    const found = findRendered(child, isMatch);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+  return undefined;
 };
 
 describe("view", () => {
@@ -121,6 +151,41 @@ describe("the inbox", () => {
       Scene.with(inboxWith({ threads: AsyncData.succeed([threadRow]) })),
       Scene.expect(Scene.text("Inbox")).toExist(),
       Scene.expect(Scene.role("list")).toExist(),
+    );
+  });
+
+  // Where the overlay sits is the whole reason it tracks scrolling. Inside
+  // the scroll container the browser moves it with the rows; rendered beside
+  // the container it has to chase scrollTop through a scroll Message, which
+  // native scrolling never waits for, so the highlight trails the row it is
+  // highlighting. That is structure, not styling, so assert the tree rather
+  // than trusting the viewInputs wiring.
+  test("the hover overlay renders inside the list's scroll container", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          selected: Option.some(0),
+          isPointerInside: true,
+        }),
+      ),
+      Scene.tap(({ html }) => {
+        const container = findRendered(
+          html,
+          (node) => node.data?.props?.["id"] === Inbox.LIST_ID,
+        );
+
+        expect(container).toBeDefined();
+        expect(
+          container === undefined
+            ? undefined
+            : findRendered(
+                container,
+                (node) => node.data?.class?.["fk-hover-overlay"] === true,
+              ),
+        ).toBeDefined();
+      }),
     );
   });
 

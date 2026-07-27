@@ -71,22 +71,22 @@ const tabId = (id: string, index: number): string => `${id}-tab-${index}`;
 
 // MESSAGE
 
-export const GotBaseMessage = m("TabsGotBaseMessage", {
+export const GotBaseMessage = m("GotBaseMessage", {
   message: BaseTabs.Message,
 });
-export const EnteredContainer = m("TabsEnteredContainer", {
+export const EnteredContainer = m("EnteredContainer", {
   tabCount: S.Number,
 });
-export const ExitedContainer = m("TabsExitedContainer");
-export const EnteredTab = m("TabsEnteredTab", { index: S.Number });
-export const GotTabRects = m("TabsGotTabRects", { rects: S.Array(Rect) });
+export const ExitedContainer = m("ExitedContainer");
+export const EnteredTab = m("EnteredTab", { index: S.Number });
+export const MeasuredTabRects = m("MeasuredTabRects", { rects: S.Array(Rect) });
 
 export const Message = S.Union([
   GotBaseMessage,
   EnteredContainer,
   ExitedContainer,
   EnteredTab,
-  GotTabRects,
+  MeasuredTabRects,
 ]);
 export type Message = typeof Message.Type;
 
@@ -95,7 +95,7 @@ export type Message = typeof Message.Type;
 const MeasureTabRects = Command.define(
   "MeasureTabRects",
   { id: S.String, count: S.Number },
-  GotTabRects,
+  MeasuredTabRects,
 )(({ count, id }) =>
   Effect.sync(() => {
     const rects: Array<Rect> = [];
@@ -105,7 +105,7 @@ const MeasureTabRects = Command.define(
         element instanceof HTMLElement ? measureRect(element) : ZERO_RECT,
       );
     }
-    return GotTabRects({ rects });
+    return MeasuredTabRects({ rects });
   }),
 );
 
@@ -123,7 +123,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
   M.value(message).pipe(
     withUpdateReturn,
     M.tagsExhaustive({
-      TabsGotBaseMessage: ({ message }) => {
+      GotBaseMessage: ({ message }) => {
         const [base, commands, maybeSelected] = BaseTabsView.update(
           model.base,
           message,
@@ -147,7 +147,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         });
       },
 
-      TabsEnteredContainer: ({ tabCount }) => [
+      EnteredContainer: ({ tabCount }) => [
         evo(model, {
           session: (session) => session + 1,
           isPointerInside: () => true,
@@ -156,7 +156,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [MeasureTabRects({ id: model.id, count: tabCount })],
       ],
 
-      TabsExitedContainer: () => [
+      ExitedContainer: () => [
         evo(model, {
           isPointerInside: () => false,
           // Unlike Table rows, tabs keep a visible selected pill — the hover
@@ -166,12 +166,12 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [],
       ],
 
-      TabsEnteredTab: ({ index }) => [
+      EnteredTab: ({ index }) => [
         evo(model, { maybeHoverIndex: () => Option.some(index) }),
         [],
       ],
 
-      TabsGotTabRects: ({ rects }) => [
+      MeasuredTabRects: ({ rects }) => [
         evo(model, { rects: () => Arr.copy(rects) }),
         [],
       ],

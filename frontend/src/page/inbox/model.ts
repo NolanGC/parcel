@@ -27,6 +27,10 @@ export const PAGE_SURFACE = Ui.SurfaceLevel.make(1);
 // The virtualized list: rows are a fixed height so the visible window and the
 // traveling hover overlay are both pure arithmetic (index * ROW_HEIGHT).
 export const LIST_ID = "inbox-list";
+// The open thread's container. Only the perf bench reads it, but it lives
+// here so the id has one definition rather than being spelled in a harness
+// that cannot fail to compile when the view changes.
+export const DETAIL_PANE_ID = "inbox-detail-pane";
 export const ROW_HEIGHT = 53;
 export const LIST_OVERSCAN = 6;
 
@@ -58,6 +62,58 @@ export const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
 // system, like a favicon.
 export const AVATAR_BG = "#4f46e5";
 export const AVATAR_FG = "#ffffff";
+
+// LoadInbox re-reads the entire list from SQLite, so a refresh hands back
+// freshly decoded objects even for the thousands of rows whose bytes did not
+// change. That churn is invisible until you try to memoize: view memoization
+// compares arguments with `===`, so a new object per row misses the cache for
+// every row, and dev-mode deep-freezing re-walks the whole array. Reusing the
+// previous object whenever the fields are equal keeps a strided refresh
+// mid-backfill down to the handful of rows that actually moved.
+const isSameRow = (left: ThreadRow, right: ThreadRow): boolean =>
+  left.id === right.id &&
+  left.subject === right.subject &&
+  left.sender === right.sender &&
+  left.snippet === right.snippet &&
+  left.date === right.date &&
+  left.unread === right.unread &&
+  left.category === right.category;
+
+// The common case by a wide margin is that a refresh changed nothing at all,
+// so that case is answered by a positional scan that allocates nothing. Only
+// once a row actually differs do we pay for the id index, which at ~30k rows
+// is what put this on the wrong side of the update budget when it ran
+// unconditionally.
+const isAlignedWith = (
+  previous: ReadonlyArray<ThreadRow>,
+  next: ReadonlyArray<ThreadRow>,
+): boolean => {
+  if (previous.length !== next.length) {
+    return false;
+  }
+  return previous.every((row, index) => {
+    const incoming = next[index];
+    return incoming !== undefined && isSameRow(row, incoming);
+  });
+};
+
+export const reconcileRows = (
+  previous: ReadonlyArray<ThreadRow>,
+  next: ReadonlyArray<ThreadRow>,
+): ReadonlyArray<ThreadRow> => {
+  // Holding the array reference, not just the row references, is what lets a
+  // memoized list subtree skip entirely rather than re-walking 30k rows to
+  // discover that each one is unchanged.
+  if (isAlignedWith(previous, next)) {
+    return previous;
+  }
+
+  const previousById = new Map(previous.map((row) => [row.id, row] as const));
+  return next.map((row) => {
+    const existing = previousById.get(row.id);
+    return existing !== undefined && isSameRow(existing, row) ? existing : row;
+  });
+};
 
 // Same-day threads show the clock, older ones the date.
 export const formatTime = (epochMs: number): string => {
@@ -329,9 +385,9 @@ export const GotAccountPopoverMessage = m("GotAccountPopoverMessage", {
 });
 /** The popover's sign-out action. main.ts owns the session, so it watches for
  *  this tag and runs SignOut; here it only closes the popover. */
-export const ClickedSignOut = m("InboxClickedSignOut");
+export const ClickedAccountSignOut = m("ClickedAccountSignOut");
 /** The popover's light/dark switch. */
-export const ClickedAppearance = m("InboxClickedAppearance");
+export const ClickedAppearance = m("ClickedAppearance");
 /** Ranked results for the search identified by `seq`. */
 export const SucceededSearch = m("SucceededSearch", {
   seq: S.Number,
@@ -389,7 +445,7 @@ export const Message = S.Union([
   ToggledPalette,
   GotPaletteMessage,
   GotAccountPopoverMessage,
-  ClickedSignOut,
+  ClickedAccountSignOut,
   ClickedAppearance,
   SucceededSearch,
   FailedSearch,

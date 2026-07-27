@@ -427,7 +427,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
           // The inbox's account popover offers sign-out, but the session is
           // this model's to end — the page only closes its popover.
-          ...(message._tag === "InboxClickedSignOut" ? [SignOut()] : []),
+          ...(message._tag === "ClickedAccountSignOut" ? [SignOut()] : []),
         ];
         // The arms are intentionally identical: `evo` needs the union
         // narrowed to a concrete variant, and both variants carry inboxPage.

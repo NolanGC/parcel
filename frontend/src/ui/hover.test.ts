@@ -64,7 +64,7 @@ describe("Ui.Menu hover overlay", () => {
     expect(Option.isNone(next.maybeHoverIndex)).toBe(true);
     // The portaled panel is not in the DOM yet on Opened.
     expect(commands.map((command) => command.name)).not.toContain(
-      "MeasureMenuItemRects",
+      "MeasureItemRects",
     );
   });
 
@@ -75,14 +75,14 @@ describe("Ui.Menu hover overlay", () => {
     });
     const [, commands] = update(opened, BaseMenu.CompletedAnchorMenu());
     expect(commands.map((command) => command.name)).toContain(
-      "MeasureMenuItemRects",
+      "MeasureItemRects",
     );
   });
 
   test("measured rects land in the model", () => {
     const [next] = update(
       Menu.init({ id: "m", isAnimated: false }),
-      Menu.GotItemRects({ rects: [rect] }),
+      Menu.MeasuredItemRects({ rects: [rect] }),
     );
     expect(next.rects).toEqual([rect]);
   });

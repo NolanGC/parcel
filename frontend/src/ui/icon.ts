@@ -1,22 +1,30 @@
 import { Array as A, Option, Record as R } from "effect";
-import type { IconNode } from "lucide";
 import { html, type Html } from "foldkit/html";
 
 /**
- * FoldkitUI · Icon — real lucide geometry without the React wrapper.
+ * FoldkitUI · Icon — HugeIcons stroke-rounded geometry, no React wrapper.
  *
- * Fluid Functionalism renders lucide-react behind a name→component registry
- * (size 16, strokeWidth 1.5 resting / 2 active). We take the same approach
- * one level lower: the framework-agnostic `lucide` package exports every
- * icon as pure data (`IconNode` — an array of `[tag, attrs]` tuples), and
- * `icon` renders any of them through the foldkit SVG DSL. Icons are sized
- * by utility classes and stroke weight is a parameter, so active/checked
- * states can lift to strokeWidth 2 the way FF does.
+ * `@hugeicons/core-free-icons` exports every icon as pure data: an array of
+ * `[tag, attrs]` tuples, which is the same shape lucide used and so renders
+ * through the foldkit SVG DSL the same way. The free set *is* the
+ * stroke-rounded style, so there is no variant to select.
+ *
+ * Two adjustments the data needs. Its attribute keys are React props
+ * (`strokeLinejoin`), which SVG spells kebab-case; and every path carries a
+ * baked-in `stroke`/`strokeWidth`, which would override the root element and
+ * make the weight unadjustable. Both are handled in `svgAttributes` below, so
+ * icons stay sized by utility classes and weighted by a parameter — which is
+ * what lets active/checked states lift to 2 the way Fluid Functionalism does.
  */
 
 type H = ReturnType<typeof html<never>>;
 
-/** The SVG child elements lucide icons are drawn with. */
+/** One icon as `@hugeicons/core-free-icons` ships it. */
+export type IconNode = ReadonlyArray<
+  readonly [string, Readonly<Record<string, string | number>>]
+>;
+
+/** The SVG child elements these icons are drawn with. */
 const svgElements = (h: H): Readonly<Record<string, H["path"]>> => ({
   path: h.path,
   circle: h.circle,
@@ -27,27 +35,36 @@ const svgElements = (h: H): Readonly<Record<string, H["path"]>> => ({
   ellipse: h.ellipse,
 });
 
+// `stroke` and `strokeWidth` are dropped rather than translated: they are
+// baked into every path at the set's design weight, and a per-path value
+// beats the root element's, so keeping them would make `strokeWidth` here
+// silently do nothing. `key` is React bookkeeping and not an SVG attribute
+// at all.
+const DROPPED_ATTRIBUTES = new Set(["stroke", "strokeWidth", "key"]);
+
+const kebabCase = (key: string): string =>
+  key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+
+const svgAttributes = (h: H, attrs: Readonly<Record<string, unknown>>) =>
+  R.toEntries(attrs)
+    .filter(([key]) => !DROPPED_ATTRIBUTES.has(key))
+    .map(([key, value]) => h.Attribute(kebabCase(key), String(value)));
+
 const iconChildren = (h: H, node: IconNode): ReadonlyArray<Html> =>
   A.getSomes(
     node.map(([tag, attrs]) =>
       R.get(svgElements(h), tag).pipe(
-        Option.map((element) =>
-          element(
-            R.toEntries(attrs).map(([key, value]) =>
-              h.Attribute(key, String(value)),
-            ),
-            [],
-          ),
-        ),
+        Option.map((element) => element(svgAttributes(h, attrs), [])),
       ),
     ),
   );
 
-/** Renders a lucide `IconNode` with FF's icon conventions: stroked in
- *  currentColor, sized by `className` (e.g. `size-4`), aria-hidden. */
+/** Renders an icon with FF's conventions: stroked in currentColor, sized by
+ *  `className` (e.g. `size-4`), aria-hidden. The default weight is the one
+ *  HugeIcons draws at, so icons look as designed unless a caller lifts them. */
 export const icon =
   (node: IconNode) =>
-  (className: string, strokeWidth = "2"): Html => {
+  (className: string, strokeWidth = "1.5"): Html => {
     const h = html<never>();
     return h.svg(
       [
@@ -57,24 +74,6 @@ export const icon =
         h.StrokeWidth(strokeWidth),
         h.StrokeLinecap("round"),
         h.StrokeLinejoin("round"),
-        h.AriaHidden(true),
-        h.Class(className),
-      ],
-      iconChildren(h, node),
-    );
-  };
-
-/** Same geometry rendered solid — FF draws brand marks (e.g. the apple)
- *  with `fill` and no stroke. */
-export const iconFilled =
-  (node: IconNode) =>
-  (className: string): Html => {
-    const h = html<never>();
-    return h.svg(
-      [
-        h.ViewBox("0 0 24 24"),
-        h.Fill("currentColor"),
-        h.Stroke("none"),
         h.AriaHidden(true),
         h.Class(className),
       ],

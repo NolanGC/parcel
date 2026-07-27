@@ -43,6 +43,7 @@ import {
   OpeningThread,
   PALETTE_RESULT_LIMIT,
   ROW_HEIGHT,
+  reconcileRows,
   ShowingList,
   ShowingThread,
   SucceededLoadInbox,
@@ -53,7 +54,6 @@ import {
 
 export * from "./model";
 export { view } from "./view";
-
 
 // COMMAND
 
@@ -119,14 +119,12 @@ export const RunSearch = Command.define(
 )(({ seq, text }) =>
   Effect.gen(function* () {
     const search = yield* Search;
-    return yield* search
-      .search({ text, limit: PALETTE_RESULT_LIMIT })
-      .pipe(
-        Effect.map((rows) => SucceededSearch({ seq, rows })),
-        Effect.catchCause((cause) =>
-          Effect.succeed(FailedSearch({ seq, error: Cause.pretty(cause) })),
-        ),
-      );
+    return yield* search.search({ text, limit: PALETTE_RESULT_LIMIT }).pipe(
+      Effect.map((rows) => SucceededSearch({ seq, rows })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedSearch({ seq, error: Cause.pretty(cause) })),
+      ),
+    );
   }),
 );
 
@@ -427,7 +425,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           // A keystroke is the only palette message that changes the corpus;
           // the rest (cursor moves, rect measurements) reuse the last hits.
           onNone: (): UpdateReturn => {
-            if (message._tag !== "PaletteChangedQuery") {
+            if (message._tag !== "ChangedQuery") {
               return [stepped, paletteCommands];
             }
             const [next, searchCommands] = runSearch(stepped, message.query);
@@ -476,10 +474,22 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // settle folds the fetch outcome into whatever state threads is in:
       // success replaces the rows; failure keeps any previous rows (Stale)
       // or lands on Failure when there were none.
+      //
+      // The incoming rows are reconciled against the ones already on screen
+      // first, so unchanged threads keep their object identity and the view
+      // can memoize past them. See reconcileRows.
       SucceededLoadInbox: ({ rows }) => [
         evo(model, {
           threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
-            Result.succeed(rows),
+            Result.succeed(
+              reconcileRows(
+                Option.getOrElse(
+                  AsyncData.getData(model.threads),
+                  (): ReadonlyArray<ThreadRow> => [],
+                ),
+                rows,
+              ),
+            ),
           ),
         }),
         [],
@@ -500,10 +510,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
-      SucceededReadLocalSize: ({ bytes }) => [
-        evo(model, { maybeLocalBytes: () => Option.some(bytes) }),
-        [],
-      ],
+      // Re-wrapping an unchanged number in a fresh Option would hand the pill
+      // a new argument and cost it its memoization slot for nothing. The size
+      // read fires on the same strided cadence as the row refresh, so this is
+      // most of them once the store stops growing.
+      SucceededReadLocalSize: ({ bytes }) =>
+        Option.contains(model.maybeLocalBytes, bytes)
+          ? [model, []]
+          : [evo(model, { maybeLocalBytes: () => Option.some(bytes) }), []],
 
       // A size read is decoration; failing it leaves the previous number (or
       // nothing) rather than disturbing anything the user is looking at.
@@ -604,7 +618,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       // The actual sign-out is main.ts's job; this page just folds the
       // popover shut behind it.
-      InboxClickedSignOut: () => {
+      ClickedAccountSignOut: () => {
         const [accountPopover, commands] = Ui.Popover.close(
           model.accountPopover,
         );
@@ -617,7 +631,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       },
 
       // The popover stays open so the switch reads as a live preview.
-      InboxClickedAppearance: () => {
+      ClickedAppearance: () => {
         const appearance: Appearance =
           model.appearance === "Dark" ? "Light" : "Dark";
         return [

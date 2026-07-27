@@ -15,6 +15,7 @@ import {
 } from "effect";
 import { SqlClient } from "effect/unstable/sql";
 import type { SqlError } from "effect/unstable/sql/SqlError";
+import { ts } from "foldkit/schema";
 
 import {
   Gmail,
@@ -36,6 +37,7 @@ import {
   remoteImageUrls,
   rewriteImageUrls,
 } from "./images";
+import { cleanSnippet } from "./snippet";
 import { SqlLive } from "./sql";
 import { HOT_THREAD_COUNT, OPENED_LRU_COUNT } from "./tiers";
 
@@ -114,7 +116,7 @@ export const decodeThreadRows = (
           id: row.id,
           subject: row.subject,
           sender: (JSON.parse(row.participants) as string[])[0] ?? "",
-          snippet: row.snippet,
+          snippet: cleanSnippet(row.snippet),
           date: row.latest_date,
           unread: row.is_unread !== 0,
           category: row.category,
@@ -241,15 +243,16 @@ export type ImageBatchResult = Readonly<{
 /** What a history pass reports back to the machine. Expired = Gmail forgot
  *  the cursor (~a week); Overflowed = more changes than per-thread re-syncs
  *  are worth (the machine full-resyncs instead — see HISTORY_RESYNC_CAP). */
-export type HistoryResult =
-  | Readonly<{
-      _tag: "Applied";
-      historyId: HistoryId;
-      changedCount: number;
-      syncedAt: number;
-    }>
-  | Readonly<{ _tag: "Expired" }>
-  | Readonly<{ _tag: "Overflowed" }>;
+export const Applied = ts("Applied", {
+  historyId: HistoryId,
+  changedCount: S.Number,
+  syncedAt: S.Number,
+});
+export const Expired = ts("Expired", {});
+export const Overflowed = ts("Overflowed", {});
+
+export const HistoryResult = S.Union([Applied, Expired, Overflowed]);
+export type HistoryResult = typeof HistoryResult.Type;
 
 // Gmail body payloads are BASE64URL (-/_ alphabet), not btoa's +/.
 const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> => {
@@ -378,6 +381,11 @@ const HISTORY_RESYNC_CAP = 100;
 // image counter moves visibly, large enough that the per-batch SQL overhead
 // disappears against the network.
 const IMAGE_BATCH_THREADS = 8;
+// Threads evicted per image batch. The eviction query is unbounded by nature
+// (everything past the LRU window is a candidate), so without a cap one turn
+// of a four-second loop walks the entire cold tail. Draining a slice per cycle
+// keeps each turn's cost flat no matter how large the store grows.
+const IMAGE_EVICT_BATCH = 64;
 
 export class SyncEngine extends Context.Service<SyncEngine>()(
   "parcel/SyncEngine",
@@ -840,7 +848,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           } while (pageToken !== undefined);
 
           if (touched.size > HISTORY_RESYNC_CAP) {
-            return { _tag: "Overflowed" } as const;
+            return Overflowed();
           }
 
           yield* deleteMessagesLocal(deletedMessages);
@@ -853,17 +861,16 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             UPDATE sync_state SET history_id = ${latest}, last_synced_at = ${syncedAt}
             WHERE id = 1
           `;
-          return {
-            _tag: "Applied",
+          return Applied({
             historyId: latest,
             changedCount: touched.size,
             syncedAt,
-          } as const;
+          });
         }).pipe(
           // On listHistory a 404 means the cursor expired, not a missing
           // resource — the machine full-resyncs from Priming.
           Effect.catchTag("GmailNotFound", () =>
-            Effect.succeed({ _tag: "Expired" } as const),
+            Effect.succeed(Expired()),
           ),
         );
 
@@ -1002,32 +1009,36 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // OPENED_LRU_COUNT most recently opened threads' images. Evicted
       // threads go back to images_used_at = 0 — cold again, and so out of
       // the queue rather than churning straight back into it.
+      //
+      // Capped per cycle and folded into a single transaction. Selecting the
+      // whole cold tail and opening a transaction per thread cost one worker
+      // round trip each, so a large store spent hundreds of milliseconds of
+      // main thread time every four seconds, which lands as dropped frames in
+      // whatever happens to be animating. The leftovers drain on later turns.
       const evictColdImages = (cutoffDate: number) =>
         Effect.gen(function* () {
           const raw = yield* sql`
             SELECT id FROM threads
             WHERE images_cached_at > 0 AND latest_date < ${cutoffDate}
             ORDER BY images_used_at DESC, latest_date DESC
-            LIMIT -1 OFFSET ${OPENED_LRU_COUNT}
+            LIMIT ${IMAGE_EVICT_BATCH} OFFSET ${OPENED_LRU_COUNT}
           `;
           const rows = yield* decodeDbThreadIds(raw).pipe(Effect.orDie);
-          yield* Effect.forEach(
-            rows,
-            (row) =>
-              sql.withTransaction(
-                Effect.all([
-                  sql`
-                    DELETE FROM message_images WHERE message_id IN
-                      (SELECT id FROM messages WHERE thread_id = ${row.id})
-                  `,
-                  sql`
-                    UPDATE threads
-                    SET images_cached_at = 0, images_used_at = 0
-                    WHERE id = ${row.id}
-                  `,
-                ]),
-              ),
-            { discard: true },
+          // `sql.in` with an empty list is a syntax error.
+          if (Arr.isReadonlyArrayEmpty(rows)) return;
+          const ids = rows.map((row) => row.id);
+          yield* sql.withTransaction(
+            Effect.all([
+              sql`
+                DELETE FROM message_images WHERE message_id IN
+                  (SELECT id FROM messages WHERE ${sql.in("thread_id", ids)})
+              `,
+              sql`
+                UPDATE threads
+                SET images_cached_at = 0, images_used_at = 0
+                WHERE ${sql.in("id", ids)}
+              `,
+            ]),
           );
         });
 
@@ -1086,10 +1097,24 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // entirely the sync machine's job.
       const loadInbox = selectInbox;
 
-      // Inline image bytes reach the html as blob: urls (not data: URIs —
-      // inlining megabytes of base64 into the body string is slow and can
-      // OOM the tab). Each thread's urls are revoked on its next load.
-      const threadObjectUrls = new Map<ThreadId, Array<string>>();
+      // Image bytes reach the html as blob: urls (not data: URIs — inlining
+      // megabytes of base64 into the body string is slow and can OOM the
+      // tab).
+      //
+      // One registry for the whole engine, not one per thread. A blob: url
+      // pins its bytes in memory until it is revoked, and only one thread is
+      // ever on screen, so everything from the previous open is garbage the
+      // moment the next one starts. Keying this by thread — revoking only
+      // the urls of the thread being *re*-opened — leaked every other
+      // thread's images for the life of the tab: at ~13 remote images per
+      // thread averaging 76 KB, about a megabyte per thread opened, forever.
+      // (It was invisible before remote images: `cid:` attachments are 47
+      // rows in a 30,000-thread store.)
+      const liveObjectUrls: Array<string> = [];
+      const revokeObjectUrls = Effect.sync(() => {
+        for (const url of liveObjectUrls) URL.revokeObjectURL(url);
+        liveObjectUrls.length = 0;
+      });
       const registerObjectUrl = (
         registry: Array<string>,
         mimeType: string,
@@ -1120,11 +1145,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           `;
           const rows = yield* decodeDbMessages(rowsRaw).pipe(Effect.orDie);
 
-          for (const url of threadObjectUrls.get(id) ?? []) {
-            URL.revokeObjectURL(url);
-          }
-          const objectUrls: Array<string> = [];
-          threadObjectUrls.set(id, objectUrls);
+          yield* revokeObjectUrls;
+          const objectUrls = liveObjectUrls;
 
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {

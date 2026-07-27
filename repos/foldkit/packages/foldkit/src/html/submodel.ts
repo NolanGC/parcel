@@ -171,10 +171,23 @@ const assertNoNestedFunctions = (
       continue
     }
     if (isPlainObject(value) || Array.isArray(value)) {
+      if (validatedContainers.has(value)) {
+        continue
+      }
       walkForFunctions(value, [key])
+      validatedContainers.add(value)
     }
   }
 }
+
+// NOTE: containers that already passed the walk are skipped by reference
+// on later renders. VirtualList-scale viewInputs (an `items` array of tens
+// of thousands of rows) made the per-render walk the dominant cost of the
+// whole view phase, and Model data is immutable by convention, so a
+// container validated once cannot later grow a function. A mutated-in-place
+// container would evade re-validation, but mutation already breaks the
+// framework's rendering model in worse ways.
+const validatedContainers = new WeakSet<object>()
 
 // Framework-branded values that legitimately carry function members
 // internally (e.g. `ChildAttribute.dispatch`). The walker treats these
@@ -186,8 +199,8 @@ const walkForFunctions = (
   path: ReadonlyArray<string>,
 ): void => {
   const visit = (value: unknown, segment: string): void => {
-    const nextPath = [...path, segment]
     if (typeof value === 'function') {
+      const nextPath = [...path, segment]
       throw new Error(
         `Foldkit: h.submodel \`viewInputs\` may only contain functions at the ` +
           `top level. Found a function at \`viewInputs.${nextPath.join('.')}\`. ` +
@@ -199,7 +212,11 @@ const walkForFunctions = (
       return
     }
     if (isPlainObject(value) || Array.isArray(value)) {
-      walkForFunctions(value, nextPath)
+      if (validatedContainers.has(value)) {
+        return
+      }
+      walkForFunctions(value, [...path, segment])
+      validatedContainers.add(value)
     }
   }
 

@@ -44,13 +44,17 @@ const arg = (name: string): string | undefined => {
 const flag = (name: string): boolean => process.argv.includes(name);
 
 const chromeRoot =
-  arg("--chrome") ?? resolve(homedir(), "Library/Application Support/Google/Chrome");
+  arg("--chrome") ??
+  resolve(homedir(), "Library/Application Support/Google/Chrome");
 
 // Which Chrome profile holds the app's origin. Every profile has a
 // QuotaManager listing the storage keys it has buckets for, which is far
 // cheaper than scanning profiles for the database itself.
 const findProfile = (origin: string): string | undefined => {
-  const candidates = ["Default", ...Array.from({ length: 12 }, (_, i) => `Profile ${i + 1}`)];
+  const candidates = [
+    "Default",
+    ...Array.from({ length: 12 }, (_, i) => `Profile ${i + 1}`),
+  ];
   for (const profile of candidates) {
     const quota = resolve(chromeRoot, profile, "WebStorage/QuotaManager");
     if (!existsSync(quota)) continue;
@@ -58,16 +62,19 @@ const findProfile = (origin: string): string | undefined => {
     try {
       copyFileSync(quota, copy);
       const db = new Database(copy, { readonly: true });
-      const table = db
-        .query(`SELECT name FROM sqlite_master WHERE type='table'`)
-        .all()
-        .map((row: { name: string }) => row.name)
+      const table = (
+        db
+          .query(`SELECT name FROM sqlite_master WHERE type='table'`)
+          .all() as Array<{ name: string }>
+      )
+        .map((row) => row.name)
         .find((name) => /bucket/i.test(name));
       if (table === undefined) continue;
-      const hit = db
-        .query(`SELECT storage_key FROM ${table}`)
-        .all()
-        .some((row: { storage_key?: string }) => row.storage_key === origin);
+      const hit = (
+        db.query(`SELECT storage_key FROM ${table}`).all() as Array<{
+          storage_key?: string;
+        }>
+      ).some((row) => row.storage_key === origin);
       db.close();
       if (hit) return profile;
     } catch {
@@ -84,16 +91,33 @@ const poolFileName = (path: string): string | undefined => {
   try {
     if (!statSync(path).isFile()) return undefined;
     const header = readFileSync(path, { flag: "r" }).subarray(0, HEADER_BYTES);
-    return new TextDecoder().decode(header).replace(/\0+.*$/s, "");
+    // The header is the mapped database name, NUL-padded to HEADER_BYTES,
+    // so the name is everything up to the first NUL. Sliced rather than
+    // matched: a regex over a control character reads worse and lints worse
+    // than an indexOf.
+    const text = new TextDecoder().decode(header);
+    const end = text.indexOf("\u0000");
+    return end === -1 ? text : text.slice(0, end);
   } catch {
     return undefined;
   }
 };
 
-const poolFiles = (profile: string, matches: (name: string) => boolean): Array<string> => {
+const poolFiles = (
+  profile: string,
+  matches: (name: string) => boolean,
+): Array<string> => {
   const root = resolve(chromeRoot, profile, "File System");
   if (!existsSync(root)) return [];
-  return readdirSync(root, { recursive: true, encoding: "utf8" })
+  // Cast: the recursive+encoding overload isn't in every @types/node, but
+  // the runtime returns relative path strings either way.
+  const entries = (
+    readdirSync as unknown as (
+      path: string,
+      options: { recursive: boolean; encoding: "utf8" },
+    ) => Array<string>
+  )(root, { recursive: true, encoding: "utf8" });
+  return entries
     .map((entry) => resolve(root, entry))
     .filter((path) => {
       const name = poolFileName(path);
@@ -113,13 +137,23 @@ const extract = (origin: string): void => {
   }
   const pool = findPoolFile(profile);
   if (pool === undefined) {
-    throw new Error(`Found profile "${profile}" but no pool file holding ${DB_NAME}.`);
+    throw new Error(
+      `Found profile "${profile}" but no pool file holding ${DB_NAME}.`,
+    );
   }
   console.error(`# ${profile} → ${pool}`);
-  writeFileSync(snapshotPath, readFileSync(pool).subarray(HEADER_BYTES));
+  // `subarray`, not `slice`: this file is well over a gigabyte and a copy
+  // would double the peak. The cast is because Buffer's ArrayBufferLike
+  // doesn't narrow to ArrayBuffer, which writeFileSync's types now want.
+  writeFileSync(
+    snapshotPath,
+    readFileSync(pool).subarray(HEADER_BYTES) as unknown as Uint8Array,
+  );
 
   const db = new Database(snapshotPath, { readonly: true });
-  const check = Object.values(db.query("PRAGMA quick_check").get() as object)[0];
+  const check = Object.values(
+    db.query("PRAGMA quick_check").get() as object,
+  )[0];
   db.close();
   if (check !== "ok") {
     throw new Error(
@@ -150,7 +184,10 @@ const extract = (origin: string): void => {
 const QUIESCENT_MS = 10_000;
 
 const wipe = (origin: string): void => {
-  if (spawnSync("pgrep", ["-x", "Google Chrome"]).status === 0 && !flag("--force")) {
+  if (
+    spawnSync("pgrep", ["-x", "Google Chrome"]).status === 0 &&
+    !flag("--force")
+  ) {
     throw new Error(
       "Chrome is running. Close the Parcel tab and re-run with --force " +
         "(quitting Chrome entirely also works). The access handles belong to " +
@@ -166,9 +203,13 @@ const wipe = (origin: string): void => {
   // Everything the VFS mapped for us, not just the main database: SQLite's
   // journal is its own pool file, and leaving it behind would have the next
   // boot roll back into a database that no longer exists.
-  const targets = poolFiles(profile, (name) => name.replace(/^\//, "").startsWith(DB_NAME));
+  const targets = poolFiles(profile, (name) =>
+    name.replace(/^\//, "").startsWith(DB_NAME),
+  );
   if (targets.length === 0) {
-    console.error(`# ${profile}: nothing to wipe (no pool file holds ${DB_NAME})`);
+    console.error(
+      `# ${profile}: nothing to wipe (no pool file holds ${DB_NAME})`,
+    );
     return;
   }
 
@@ -201,7 +242,9 @@ const open = (): Database => {
   if (flag("--refresh") || !existsSync(snapshotPath)) extract(origin);
   else {
     const age = (Date.now() - statSync(snapshotPath).mtimeMs) / 60_000;
-    console.error(`# snapshot ${age.toFixed(0)}m old (--refresh to re-extract)`);
+    console.error(
+      `# snapshot ${age.toFixed(0)}m old (--refresh to re-extract)`,
+    );
   }
   return new Database(snapshotPath, { readonly: true });
 };
@@ -210,7 +253,8 @@ const open = (): Database => {
 // otherwise pour megabytes into the terminal.
 const cell = (value: unknown): unknown => {
   if (value instanceof Uint8Array) return `<${value.length} bytes>`;
-  if (typeof value === "string" && value.length > 80) return `${value.slice(0, 77)}…`;
+  if (typeof value === "string" && value.length > 80)
+    return `${value.slice(0, 77)}…`;
   return value;
 };
 
@@ -223,9 +267,13 @@ const run = (db: Database, query: string): void => {
     if (rows.length === 0) console.log("(no rows)");
     else {
       console.table(
-        rows.slice(0, 50).map((row) =>
-          Object.fromEntries(Object.entries(row).map(([key, value]) => [key, cell(value)])),
-        ),
+        rows
+          .slice(0, 50)
+          .map((row) =>
+            Object.fromEntries(
+              Object.entries(row).map(([key, value]) => [key, cell(value)]),
+            ),
+          ),
       );
       if (rows.length > 50) console.log(`… ${rows.length - 50} more rows`);
     }
@@ -237,8 +285,12 @@ const run = (db: Database, query: string): void => {
 
 // Where the bytes actually are — the question that motivated this tool.
 const tableReport = (db: Database): void => {
-  const pageSize = Object.values(db.query("PRAGMA page_size").get() as object)[0] as number;
-  const pageCount = Object.values(db.query("PRAGMA page_count").get() as object)[0] as number;
+  const pageSize = Object.values(
+    db.query("PRAGMA page_size").get() as object,
+  )[0] as number;
+  const pageCount = Object.values(
+    db.query("PRAGMA page_count").get() as object,
+  )[0] as number;
   const mb = (bytes: number): string => `${(bytes / 1048576).toFixed(1)} MB`;
 
   const tables = db
@@ -246,22 +298,35 @@ const tableReport = (db: Database): void => {
     .all() as Array<{ name: string }>;
 
   const rows = tables.map(({ name }) => {
-    const count = (db.query(`SELECT COUNT(*) n FROM "${name}"`).get() as { n: number }).n;
+    const count = (
+      db.query(`SELECT COUNT(*) n FROM "${name}"`).get() as { n: number }
+    ).n;
     // Sum the widest text/blob columns: an honest approximation of payload
     // bytes without pulling in dbstat, which isn't compiled into bun's SQLite.
-    const columns = (db.query(`PRAGMA table_info("${name}")`).all() as Array<{
-      name: string;
-      type: string;
-    }>).filter((column) => /TEXT|BLOB/i.test(column.type));
+    const columns = (
+      db.query(`PRAGMA table_info("${name}")`).all() as Array<{
+        name: string;
+        type: string;
+      }>
+    ).filter((column) => /TEXT|BLOB/i.test(column.type));
     const bytes = columns.reduce((total, column) => {
       const sum = (
-        db.query(`SELECT COALESCE(SUM(LENGTH("${column.name}")),0) n FROM "${name}"`).get() as {
+        db
+          .query(
+            `SELECT COALESCE(SUM(LENGTH("${column.name}")),0) n FROM "${name}"`,
+          )
+          .get() as {
           n: number;
         }
       ).n;
       return total + sum;
     }, 0);
-    return { table: name, rows: count.toLocaleString(), payload: mb(bytes), _b: bytes };
+    return {
+      table: name,
+      rows: count.toLocaleString(),
+      payload: mb(bytes),
+      _b: bytes,
+    };
   });
 
   rows.sort((a, b) => b._b - a._b);
@@ -294,7 +359,8 @@ const main = async (): Promise<void> => {
       .filter((value, index, all) => {
         const previous = all[index - 1];
         return (
-          !value.startsWith("--") && !(previous !== undefined && flags.has(previous))
+          !value.startsWith("--") &&
+          !(previous !== undefined && flags.has(previous))
         );
       })
       .join(" ");

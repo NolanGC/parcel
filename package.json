@@ -22,6 +22,7 @@
     "clear": "pkill -f 'workerd serve' || true",
     "destroy": "alchemy destroy",
     "perf": "bun perf/src/bench.ts",
+    "perf:hover": "bun perf/src/hover.ts",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --disable-nested-config .",
@@ -45,10 +46,16 @@
     "typescript": "^5"
   },
   "devDependencies": {
+    "@foldkit/devtools-mcp": "^0.13.4",
+    "@foldkit/oxlint-plugin": "^0.4.0",
     "@types/bun": "latest",
     "@types/pg": "^8.11.0",
     "drizzle-kit": "1.0.0-rc.1",
     "oxfmt": "^0.57.0",
     "oxlint": "^1.72.0"
+  },
+  "patchedDependencies": {
+    "foldkit@0.131.0": "patches/foldkit@0.131.0.patch",
+    "@foldkit/ui@0.131.0": "patches/@foldkit%2Fui@0.131.0.patch"
   }
 }

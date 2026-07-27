@@ -4,9 +4,9 @@ import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
-import { Check } from "lucide";
+import { Tick01Icon } from "@hugeicons/core-free-icons";
 
-import { icon, type IconView } from "./icon";
+import { icon, type IconNode, type IconView } from "./icon";
 import { weightLabel } from "./label";
 import { hoverTransition, popoutDown, popoutUp } from "./motion";
 import { measureRect, Rect } from "./rect";
@@ -60,11 +60,15 @@ export const init = (config: BaseMenu.InitConfig): Model => ({
 
 // MESSAGE
 
-// Tag is prefixed because this message is unioned with the base menu's own
-// messages — a bare "GotItemRects" could collide with a future upstream tag.
-export const GotItemRects = m("MenuGotItemRects", { rects: S.Array(Rect) });
+// Unioned flat with the base menu's own messages below, so this tag has to
+// stay distinct from every tag upstream defines. It is today. A collision
+// would make the union ambiguous rather than fail to compile, so it is worth
+// a glance when bumping @foldkit/ui.
+export const MeasuredItemRects = m("MeasuredItemRects", {
+  rects: S.Array(Rect),
+});
 
-export const Message = S.Union([BaseMenu.Message, GotItemRects]);
+export const Message = S.Union([BaseMenu.Message, MeasuredItemRects]);
 export type Message = typeof Message.Type;
 
 // COMMAND
@@ -73,9 +77,9 @@ export type Message = typeof Message.Type;
 // offsetParent, since the group is position: relative). Runs after the
 // panel has rendered, so the elements exist.
 const MeasureItemRects = Command.define(
-  "MeasureMenuItemRects",
+  "MeasureItemRects",
   { id: S.String },
-  GotItemRects,
+  MeasuredItemRects,
 )(({ id }) =>
   Effect.sync(() => {
     const rects: Array<Rect> = [];
@@ -84,7 +88,7 @@ const MeasureItemRects = Command.define(
       if (!(element instanceof HTMLElement)) break;
       rects.push(measureRect(element));
     }
-    return GotItemRects({ rects });
+    return MeasuredItemRects({ rects });
   }),
 );
 
@@ -99,7 +103,7 @@ export type MenuItemSpec = Readonly<{
   isChecked?: boolean;
 }>;
 
-const checkIcon = icon(Check);
+const checkIcon = icon(Tick01Icon as IconNode);
 
 // No hover background on the item itself — the traveling overlay carries
 // hover. Checked keeps its persistent `bg-active`.
@@ -239,7 +243,7 @@ export const create = <Item extends string>() => {
   // Only the rect measurement is ours; everything else is the base menu's
   // to interpret, so this delegates rather than matching exhaustively.
   const update = (model: Model, message: Message): UpdateReturn => {
-    if (message._tag === "MenuGotItemRects") {
+    if (message._tag === "MeasuredItemRects") {
       return [
         evo(model, { rects: () => Arr.copy(message.rects) }),
         [],

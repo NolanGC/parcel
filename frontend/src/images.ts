@@ -7,11 +7,17 @@
 // behalf and returns the bytes same-origin, which is what makes caching
 // possible in the first place.
 //
-// The privacy shape falls out of that for free. A remote image loaded live
-// from an open mail is a tracking pixel firing at the moment you read: it
-// tells the sender your IP, your user agent, and precisely when you looked.
-// Fetched here instead, the sender sees a Cloudflare IP at sync time and
-// learns nothing about when — or whether — the mail was ever opened.
+// The privacy shape is mixed, and worth stating precisely. A remote image
+// loaded live from an open mail is a tracking pixel firing at the moment you
+// read: it tells the sender your IP, your user agent, and exactly when you
+// looked. Fetched through the proxy instead, the sender sees a Cloudflare IP
+// and learns nothing about when the mail was opened.
+//
+// But the images are prefetched in the background, across the whole hot
+// window, for mail that has never been opened at all. That turns "no signal"
+// into "delivered and opened" for every recent message — read receipts the
+// sender would not otherwise have had. So open trackers are filtered out
+// before anything is fetched: see isTrackerUrl and the tiny-image scan.
 
 import { Context, Effect, Layer, Option } from "effect";
 
@@ -31,10 +37,81 @@ const SRC_PATTERN = /(?:src|background)\s*=\s*["']([^"']+)["']/gi;
  *  layouts, where the hundredth image is not what makes the mail readable. */
 const MAX_IMAGES_PER_MESSAGE = 60;
 
+// Open-tracker endpoints, which are not images in any useful sense: they
+// record a read and hand back a redirect, a transparent 1x1, or nothing at
+// all. Requesting one during the background prefetch reports the message as
+// opened, which is the thing we are trying not to do.
+//
+// Matched narrowly on the endpoint shapes the big senders use rather than on
+// anything resembling a heuristic. A false positive here is cheap and a false
+// negative is not: an image wrongly skipped simply loads from its origin when
+// the mail is opened (see rewriteImageUrls), while a tracker wrongly fetched
+// is a read receipt that cannot be taken back.
+const TRACKER_PATTERNS: ReadonlyArray<RegExp> = [
+  /\/wf\/open\b/i, // SendGrid, Sailthru
+  /\/track(?:ing)?\/open/i, // Mailchimp and friends
+  /\bopen\?upn=/i,
+  /\/e\/o\//i, // Marketo
+  /\/brand-views\b/i, // Glassdoor impression beacon
+  /\/imp\?/i, // generic impression beacon
+  /\bbeacon\b/i,
+  // "pixel" only where a tracker puts it: its own path segment, a query key,
+  // or the whole filename. A bare word match also caught real artwork named
+  // pixel-grid-clip-path-shape.png, which is the kind of image the mail is
+  // actually about.
+  /\/pixel[/?.]/i,
+  /[?&]pixel=/i,
+  /\bpixel\.(?:gif|png|jpe?g)\b/i,
+];
+
+const isTrackerUrl = (url: string): boolean =>
+  TRACKER_PATTERNS.some((pattern) => pattern.test(url));
+
+// An image declared 1x1 (or near it) is a spacer or a beacon either way, and
+// neither is worth a request. Read off the tag's own attributes because the
+// bytes are exactly what we are trying to avoid fetching.
+const IMG_TAG_PATTERN = /<img\b[^>]*>/gi;
+const TAG_SRC_PATTERN = /\bsrc\s*=\s*["']([^"']+)["']/i;
+const TRACKING_DIMENSION_PX = 2;
+
+const declaredDimension = (tag: string, name: string): number | undefined => {
+  const match = new RegExp(`\\b${name}\\s*[=:]\\s*["']?\\s*(\\d+)`, "i").exec(
+    tag,
+  );
+  return match?.[1] === undefined ? undefined : Number(match[1]);
+};
+
+const isTrackingSized = (tag: string): boolean => {
+  // Without the src stripped out first, a CDN url like
+  // `/cdn-cgi/image/width=600,quality=90/photo.png` reads as the tag's own
+  // declared width, and one spelling `width=1` would suppress a real image.
+  const attributes = tag.replace(TAG_SRC_PATTERN, "");
+  const width = declaredDimension(attributes, "width");
+  const height = declaredDimension(attributes, "height");
+  return (
+    (width !== undefined && width <= TRACKING_DIMENSION_PX) ||
+    (height !== undefined && height <= TRACKING_DIMENSION_PX)
+  );
+};
+
 const decodeEntities = (url: string): string =>
   url.replaceAll("&amp;", "&").replaceAll("&#38;", "&");
 
+// Urls belonging to <img> tags that declare themselves a pixel. Collected in
+// its own pass because SRC_PATTERN matches bare attributes and so cannot see
+// the width and height sitting next to them.
+const trackingSizedUrls = (body: string): ReadonlySet<string> => {
+  const skipped = new Set<string>();
+  for (const [tag] of body.matchAll(IMG_TAG_PATTERN)) {
+    if (!isTrackingSized(tag)) continue;
+    const source = TAG_SRC_PATTERN.exec(tag)?.[1];
+    if (source !== undefined) skipped.add(decodeEntities(source.trim()));
+  }
+  return skipped;
+};
+
 export const remoteImageUrls = (body: string): ReadonlyArray<string> => {
+  const tiny = trackingSizedUrls(body);
   const found = new Set<string>();
   for (const match of body.matchAll(SRC_PATTERN)) {
     const raw = match[1];
@@ -43,6 +120,7 @@ export const remoteImageUrls = (body: string): ReadonlyArray<string> => {
     // cid: is the inline-attachment path (message_attachments), data: is
     // already local, and anything else non-http we have no way to fetch.
     if (!url.startsWith("http://") && !url.startsWith("https://")) continue;
+    if (tiny.has(url) || isTrackerUrl(url)) continue;
     found.add(url);
     if (found.size >= MAX_IMAGES_PER_MESSAGE) break;
   }

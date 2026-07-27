@@ -25,7 +25,6 @@ import { describe, expect, test } from "vitest";
 import {
   CompletedSignOut,
   FailedCheckSession,
-  SignOut,
   SucceededCheckSession,
 } from "./auth";
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
@@ -211,7 +210,7 @@ describe("session", () => {
     const [model] = init(loggedInFlags, url("/inbox"));
     const [, commands] = update(
       model,
-      inboxMessage(Inbox.ClickedSignOut()),
+      inboxMessage(Inbox.ClickedAccountSignOut()),
     );
 
     expect(commands.map((command) => command.name)).toContain("SignOut");
@@ -257,7 +256,7 @@ describe("opening a thread", () => {
       Story.Command.resolve(
         Inbox.LoadThread,
         Inbox.SucceededLoadThread({ detail: threadDetail }),
-        ),
+      ),
       Story.model((next) => {
         expect(next.inboxPage.screen._tag).toBe("ShowingThread");
       }),
@@ -275,7 +274,7 @@ describe("opening a thread", () => {
       Story.Command.resolve(
         Inbox.LoadThread,
         Inbox.FailedLoadThread({ error: "thread is gone" }),
-        ),
+      ),
       Story.model((next) => {
         const { screen } = next.inboxPage;
         if (screen._tag !== "ShowingList") {
@@ -355,6 +354,21 @@ describe("list keyboard navigation", () => {
     );
   });
 
+  // The view memoizes the virtual list on exactly these two references
+  // (see lazyVirtualList), so a hover that touched either would silently
+  // rebuild the whole list — window math, spacers, container, boundary —
+  // once per row the pointer crosses. That is the cost that made panning
+  // the list feel heavier than panning a menu, and nothing in the types
+  // stops a future handler from reintroducing it.
+  test("hovering leaves the list and its rows untouched, so the view can skip them", () => {
+    const model = loadedInbox();
+    const [next] = update(model, inboxMessage(Inbox.HoveredRow({ index: 0 })));
+
+    expect(next.inboxPage.selected).toEqual(Option.some(0));
+    expect(next.inboxPage.list).toBe(model.inboxPage.list);
+    expect(next.inboxPage.threads).toBe(model.inboxPage.threads);
+  });
+
   test("Escape closes an open thread back to the list", () => {
     Story.story(
       update,
@@ -365,7 +379,7 @@ describe("list keyboard navigation", () => {
       Story.Command.resolve(
         Inbox.LoadThread,
         Inbox.SucceededLoadThread({ detail: threadDetail }),
-        ),
+      ),
       Story.message(inboxMessage(Inbox.PressedListKey({ key: "Escape" }))),
       Story.model((next) => {
         expect(next.inboxPage.screen._tag).toBe("ShowingList");
@@ -387,7 +401,7 @@ describe("palette search", () => {
 
   const settleMeasure = Story.Command.resolve(
     Ui.Palette.MeasureItemRects,
-    Ui.Palette.GotItemRects({ rects: [] }),
+    Ui.Palette.MeasuredItemRects({ rects: [] }),
   );
 
   test("a query runs a search and the results land in the model", () => {

@@ -1,0 +1,67 @@
+diff --git a/dist/virtualList/index.d.ts b/dist/virtualList/index.d.ts
+index b632ac3d4efcf6fcff80c8324764f9847d71ea83..8943a0719047eb018acdb02d052edcf40fa7898e 100644
+--- a/dist/virtualList/index.d.ts
++++ b/dist/virtualList/index.d.ts
+@@ -182,6 +182,24 @@ export type ViewInputs<Item> = Readonly<{
+     rowElement?: TagName;
+     containerClassName?: string;
+     containerAttributes?: ReadonlyArray<ChildAttribute>;
++    /** Content rendered inside the scroll container, in the same coordinate
++     *  space as the rows. Providing it makes the container a positioned
++     *  ancestor, so an absolutely positioned child placed at
++     *  `index * rowHeightPx` sits on the row at that index.
++     *
++     *  This exists for decorations that must stay glued to the content while
++     *  it scrolls, the traveling hover highlight being the motivating case.
++     *  Rendered as a sibling of the rows it would sit outside the scroll
++     *  container, leaving the consumer to chase `scrollTop` from the
++     *  `containerEvents` Subscription and re-apply it as a transform. Native
++     *  scrolling does not wait for that round trip, so the decoration lags the
++     *  rows it is meant to track. Inside the container the browser moves it
++     *  with the content and no scroll-linked work is needed at all.
++     *
++     *  Wrapped in a presentational row with `display: contents`, so it adds no
++     *  box of its own and does not appear to assistive technology as a list
++     *  item. */
++    contentOverlay?: Html;
+ }>;
+ /** Renders a virtualized list. Only items inside the viewport (plus an
+  *  overscan buffer) are mounted; spacer elements above and below the
+diff --git a/dist/virtualList/index.js b/dist/virtualList/index.js
+index 67005fbce88f0d1e678226e7e2ab358582b754b5..a55179066ef184d0eec8ef5d2929a3188b957c2b 100644
+--- a/dist/virtualList/index.js
++++ b/dist/virtualList/index.js
+@@ -339,7 +339,7 @@ export const view = () =>
+ __foldkitBrandViewResult((viewImpl), "@foldkit/ui/virtualList/index.js#view");
+ const viewImpl = defineView((model, viewInputs) => {
+     const h = html();
+-    const { items, itemToKey, itemToView, itemToRowHeightPx, overscan = DEFAULT_OVERSCAN, rowElement = 'li', containerClassName, containerAttributes = [], } = viewInputs;
++    const { items, itemToKey, itemToView, itemToRowHeightPx, overscan = DEFAULT_OVERSCAN, rowElement = 'li', containerClassName, containerAttributes = [], contentOverlay, } = viewInputs;
+     const baseContainerAttributes = [
+         h.Id(model.id),
+         h.Role('list'),
+@@ -349,6 +349,7 @@ const viewImpl = defineView((model, viewInputs) => {
+             'list-style': 'none',
+             margin: '0',
+             padding: '0',
++            ...(contentOverlay !== undefined ? { position: 'relative' } : {}),
+         }),
+         ...(containerClassName !== undefined
+             ? [h.Class(containerClassName)]
+@@ -358,7 +359,15 @@ const viewImpl = defineView((model, viewInputs) => {
+         ...childAttributes(baseContainerAttributes),
+         ...containerAttributes,
+     ];
+-    const renderContainer = (children) => __foldkitBrandViewResult((h.keyed('ul')(model.id, allContainerAttributes, children)), "@foldkit/ui/virtualList/index.js#renderContainer");
++    const contentOverlayRows = contentOverlay === undefined
++        ? []
++        : [
++            h.keyed('li')(`${model.id}-content-overlay`, [h.Role('presentation'), h.Style({ display: 'contents' })], [contentOverlay]),
++        ];
++    const renderContainer = (children) => __foldkitBrandViewResult((h.keyed('ul')(model.id, allContainerAttributes, [
++        ...contentOverlayRows,
++        ...children,
++    ])), "@foldkit/ui/virtualList/index.js#renderContainer");
+     const maybeWindow = itemToRowHeightPx !== undefined
+         ? visibleWindowVariable(model, items, itemToRowHeightPx, overscan)
+         : visibleWindow(model, items.length, overscan);

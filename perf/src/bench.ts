@@ -102,10 +102,10 @@ const installClock = (page: Page) =>
           },
           { once: true, capture: true },
         );
-        const paneVisible = () => {
-          const el = document.getElementById("inbox-detail-pane");
-          return el !== null && !el.classList.contains("invisible");
-        };
+        // Present in the DOM means open: the view mounts the pane only in
+        // the ShowingThread branch rather than toggling a class.
+        const paneVisible = () =>
+          document.getElementById("inbox-detail-pane") !== null;
         const observer = new MutationObserver(() => {
           state.lastMutation = performance.now();
         });
@@ -208,7 +208,7 @@ const runSample = async (
     );
   }
   await page.evaluate(() => (window as any).__bench.arm());
-  const row = page.locator(`#inbox-list-row-${index}`);
+  const row = page.locator(`[data-virtual-list-item-index="${index}"]`);
   if (options.hoverMs !== undefined) {
     await row.hover();
     await page.waitForTimeout(options.hoverMs);
@@ -227,10 +227,11 @@ const runSample = async (
     .locator("#inbox-detail-pane")
     .getByRole("button", { name: "Inbox" })
     .click();
-  await page.waitForFunction(() => {
-    const el = document.getElementById("inbox-detail-pane");
-    return el === null || el.classList.contains("invisible");
-  });
+  // The pane is unmounted on close, not hidden: the view renders it only in
+  // the ShowingThread branch.
+  await page.waitForFunction(
+    () => document.getElementById("inbox-detail-pane") === null,
+  );
   await page.waitForTimeout(150);
 
   const { phases, htmlBodies } = phasesOf(raw);
@@ -298,16 +299,22 @@ const main = async () => {
   // PARCEL_COOKIE (bare `<token>.<sig>` from the browser's BetterAuth
   // session cookie, in the root .env) skips the manual sign-in: injected
   // on the API origin, where the backend reads it.
+  //
+  // BetterAuth prefixes the cookie with `__Secure-` whenever it is issuing
+  // secure cookies, which is every HTTPS origin. Injecting the bare name
+  // against production silently fails to authenticate and drops the run into
+  // the manual sign-in wait, so the name follows the scheme.
   const cookie = process.env.PARCEL_COOKIE;
   if (cookie !== undefined && cookie.length > 0) {
-    await context.addCookies([
-      { name: "better-auth.session_token", value: cookie, url: API },
-    ]);
+    const name = API.startsWith("https:")
+      ? "__Secure-better-auth.session_token"
+      : "better-auth.session_token";
+    await context.addCookies([{ name, value: cookie, url: API }]);
   }
 
   try {
     await page.goto(`${WEB}/inbox`);
-    const firstRow = page.locator("#inbox-list-row-0");
+    const firstRow = page.locator('[data-virtual-list-item-index="0"]');
     const visible = await firstRow
       .waitFor({ timeout: 15_000 })
       .then(() => true)

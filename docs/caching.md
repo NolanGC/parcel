@@ -6,12 +6,12 @@ One storage rule, one tiering rule. Everything below is why.
 
 ## What we store
 
-| | Kept for |
-|---|---|
-| Metadata (subject, sender, date, snippet, labels) | every thread |
-| Message body | every message, gzipped |
-| `cid:` inline images | every message |
-| Remote images (`<img src="https://…">`) | newest 1,000 threads + a 1,000-thread LRU of what you've opened |
+|                                                   | Kept for                                                        |
+| ------------------------------------------------- | --------------------------------------------------------------- |
+| Metadata (subject, sender, date, snippet, labels) | every thread                                                    |
+| Message body                                      | every message, gzipped                                          |
+| `cid:` inline images                              | every message                                                   |
+| Remote images (`<img src="https://…">`)           | newest 1,000 threads + a 1,000-thread LRU of what you've opened |
 
 ## Why bodies are kept for everything
 
@@ -52,7 +52,7 @@ whole store          ~280,000 fetches
 ```
 
 Bodies cost one fetch per message and that fetch is already happening.
-Remote images cost *another ~12.7*, each a separate proxied request — roughly
+Remote images cost _another ~12.7_, each a separate proxied request — roughly
 **8 GB** and hours of wall-clock to hydrate the whole store. Thirty times the
 entire compressed database.
 
@@ -121,7 +121,7 @@ couldn't cache them otherwise regardless — mail CDNs send no CORS headers, so
 a browser `fetch()` to them returns an opaque response whose bytes can't be
 read.
 
-For the newest 1,000 the fetch happens at *sync* time, not open time, so the
+For the newest 1,000 the fetch happens at _sync_ time, not open time, so the
 sender learns nothing about whether or when you read the mail. This is the
 same strategy as Apple's Mail Privacy Protection, and it's why prefetching
 beats blocking: images still render.
@@ -144,17 +144,17 @@ bun sql --wipe              # empty the store (Chrome must be quit)
 
 ## Where this lives
 
-| | |
-|---|---|
-| Tier sizes | `frontend/src/tiers.ts` |
-| Body compression | `frontend/src/compression.ts` |
-| URL extraction, proxy fetch | `frontend/src/images.ts` |
-| Prefetch queue, LRU eviction | `cacheImageBatch` in `frontend/src/sync.ts` |
-| The prefetch loop | `CacheImageBatch` in `frontend/src/page/inbox/index.ts` |
-| The proxy | `proxyImage` in `backend/src/ApiService.ts` |
+|                              |                                                         |
+| ---------------------------- | ------------------------------------------------------- |
+| Tier sizes                   | `frontend/src/tiers.ts`                                 |
+| Body compression             | `frontend/src/compression.ts`                           |
+| URL extraction, proxy fetch  | `frontend/src/images.ts`                                |
+| Prefetch queue, LRU eviction | `cacheImageBatch` in `frontend/src/sync.ts`             |
+| The prefetch loop            | `CacheImageBatch` in `frontend/src/page/inbox/index.ts` |
+| The proxy                    | `proxyImage` in `backend/src/ApiService.ts`             |
 
 The queue is not a separate table: `threads.images_cached_at` is `0` for
 pending and a timestamp once done, and `threads.images_used_at` is the LRU
 stamp (`0` = never opened). Opening a thread stamps it, which is what puts a
-cold thread into the queue at all — and the reason the *second* open of an
+cold thread into the queue at all — and the reason the _second_ open of an
 old thread is the instant one.

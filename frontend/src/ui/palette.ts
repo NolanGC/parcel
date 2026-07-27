@@ -5,11 +5,11 @@ import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
 
-import { icon, type IconView } from "./icon";
+import { icon, type IconNode, type IconView } from "./icon";
 import { paletteBackdrop, palettePanel } from "./motion";
 import { measureRect, Rect } from "./rect";
 import { DIALOG_OFFSET, elevate, surface, type SurfaceLevel } from "./surface";
-import { Command as CommandKey, Search } from "lucide";
+import { CommandIcon, Search01Icon } from "@hugeicons/core-free-icons";
 
 /**
  * FoldkitUI · Palette — a ⌘K command palette composed from Fluid
@@ -67,21 +67,21 @@ const itemId = (id: string, index: number): string => `${id}-item-${index}`;
 
 // MESSAGE
 
-export const GotDialogMessage = m("PaletteGotDialogMessage", {
+export const GotDialogMessage = m("GotDialogMessage", {
   message: BaseDialog.Message,
 });
-export const ChangedQuery = m("PaletteChangedQuery", { query: S.String });
+export const ChangedQuery = m("ChangedQuery", { query: S.String });
 /** Arrow-key movement; `count` rides along because only the view knows the
  *  filtered result length. */
-export const MovedActive = m("PaletteMovedActive", {
+export const MovedActive = m("MovedActive", {
   delta: S.Number,
   count: S.Number,
 });
-export const PointedItem = m("PalettePointedItem", { index: S.Number });
+export const PointedItem = m("PointedItem", { index: S.Number });
 /** Click or Enter. The view resolves `activeIndex` to the concrete item, so
  *  update never needs to re-run the filter. */
-export const SelectedItem = m("PaletteSelectedItem", { item: S.String });
-export const GotItemRects = m("PaletteGotItemRects", {
+export const SelectedItem = m("SelectedItem", { item: S.String });
+export const MeasuredItemRects = m("MeasuredItemRects", {
   rects: S.Array(Rect),
 });
 
@@ -91,7 +91,7 @@ export const Message = S.Union([
   MovedActive,
   PointedItem,
   SelectedItem,
-  GotItemRects,
+  MeasuredItemRects,
 ]);
 export type Message = typeof Message.Type;
 
@@ -101,9 +101,9 @@ export type Message = typeof Message.Type;
 // offsetParent). Row count is discovered by probing ids, so the command
 // doesn't need to know the filter's output length.
 export const MeasureItemRects = Command.define(
-  "MeasurePaletteItemRects",
+  "MeasureItemRects",
   { id: S.String },
-  GotItemRects,
+  MeasuredItemRects,
 )(({ id }) =>
   Effect.sync(() => {
     const rects: Array<Rect> = [];
@@ -112,7 +112,7 @@ export const MeasureItemRects = Command.define(
       if (!(element instanceof HTMLElement)) break;
       rects.push(measureRect(element));
     }
-    return GotItemRects({ rects });
+    return MeasuredItemRects({ rects });
   }),
 );
 
@@ -176,8 +176,8 @@ const numberRows = <Item extends string>(
 
 // CREATE
 
-const searchIcon = icon(Search);
-const commandIcon = icon(CommandKey);
+const searchIcon = icon(Search01Icon as IconNode);
+const commandIcon = icon(CommandIcon as IconNode);
 
 /** Bordered keycap chip (the mock's Kbd): reads as a physical key at any
  *  elevation because border and text ride the theme tokens. */
@@ -235,7 +235,7 @@ export const create = <Item extends string>() => {
     M.value(message).pipe(
       withUpdateReturn,
       M.tagsExhaustive({
-        PaletteGotDialogMessage: ({ message }) => {
+        GotDialogMessage: ({ message }) => {
           const [dialog, commands] = BaseDialog.update(model.dialog, message);
           // Rows exist in the DOM once the show command completes; that's the
           // earliest correct moment to measure (same trigger discipline as
@@ -255,7 +255,7 @@ export const create = <Item extends string>() => {
           ];
         },
 
-        PaletteChangedQuery: ({ query }) => [
+        ChangedQuery: ({ query }) => [
           evo(model, {
             query: () => query,
             activeIndex: () => 0,
@@ -265,7 +265,7 @@ export const create = <Item extends string>() => {
           Option.none(),
         ],
 
-        PaletteMovedActive: ({ count, delta }) => {
+        MovedActive: ({ count, delta }) => {
           if (count === 0) return [model, [], Option.none()];
           // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
           // still rather than jumping to the opposite end.
@@ -276,13 +276,13 @@ export const create = <Item extends string>() => {
           return [evo(model, { activeIndex: () => next }), [], Option.none()];
         },
 
-        PalettePointedItem: ({ index }) => [
+        PointedItem: ({ index }) => [
           evo(model, { activeIndex: () => index }),
           [],
           Option.none(),
         ],
 
-        PaletteSelectedItem: ({ item }) => {
+        SelectedItem: ({ item }) => {
           const [next, commands] = delegateDialog(
             model,
             BaseDialog.close(model.dialog),
@@ -292,7 +292,7 @@ export const create = <Item extends string>() => {
           return [next, commands, Option.some(item as Item)];
         },
 
-        PaletteGotItemRects: ({ rects }) => [
+        MeasuredItemRects: ({ rects }) => [
           evo(model, { rects: () => Arr.copy(rects) }),
           [],
           Option.none(),

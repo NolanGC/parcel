@@ -553,6 +553,24 @@ export type ViewInputs<Item> = Readonly<{
   rowElement?: TagName
   containerClassName?: string
   containerAttributes?: ReadonlyArray<ChildAttribute>
+  /** Content rendered inside the scroll container, in the same coordinate
+   *  space as the rows. Providing it makes the container a positioned
+   *  ancestor, so an absolutely positioned child placed at
+   *  `index * rowHeightPx` sits on the row at that index.
+   *
+   *  This exists for decorations that must stay glued to the content while
+   *  it scrolls, the traveling hover highlight being the motivating case.
+   *  Rendered as a sibling of the rows it would sit outside the scroll
+   *  container, leaving the consumer to chase `scrollTop` from the
+   *  `containerEvents` Subscription and re-apply it as a transform. Native
+   *  scrolling does not wait for that round trip, so the decoration lags the
+   *  rows it is meant to track. Inside the container the browser moves it
+   *  with the content and no scroll-linked work is needed at all.
+   *
+   *  Wrapped in a presentational row with `display: contents`, so it adds no
+   *  box of its own and does not appear to assistive technology as a list
+   *  item. */
+  contentOverlay?: Html
 }>
 
 /** Renders a virtualized list. Only items inside the viewport (plus an
@@ -582,6 +600,7 @@ const viewImpl = defineView<Model, Message, ViewInputs<unknown>>(
       rowElement = 'li',
       containerClassName,
       containerAttributes = [],
+      contentOverlay,
     } = viewInputs
 
     const baseContainerAttributes = [
@@ -593,6 +612,7 @@ const viewImpl = defineView<Model, Message, ViewInputs<unknown>>(
         'list-style': 'none',
         margin: '0',
         padding: '0',
+        ...(contentOverlay !== undefined ? { position: 'relative' } : {}),
       }),
       ...(containerClassName !== undefined
         ? [h.Class(containerClassName)]
@@ -604,8 +624,22 @@ const viewImpl = defineView<Model, Message, ViewInputs<unknown>>(
       ...containerAttributes,
     ]
 
+    const contentOverlayRows: ReadonlyArray<Html> =
+      contentOverlay === undefined
+        ? []
+        : [
+            h.keyed('li')(
+              `${model.id}-content-overlay`,
+              [h.Role('presentation'), h.Style({ display: 'contents' })],
+              [contentOverlay],
+            ),
+          ]
+
     const renderContainer = (children: ReadonlyArray<Html>): Html =>
-      h.keyed('ul')(model.id, allContainerAttributes, children)
+      h.keyed('ul')(model.id, allContainerAttributes, [
+        ...contentOverlayRows,
+        ...children,
+      ])
 
     const maybeWindow =
       itemToRowHeightPx !== undefined

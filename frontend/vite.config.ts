@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin, type ResolvedConfig } from "vite";
 
 import tailwindcss from "@tailwindcss/vite";
+import { foldkit } from "@foldkit/vite-plugin";
 
 const IMPORT_META_ENV_PREFIX = "import.meta.env.";
 
@@ -68,7 +69,11 @@ const prerenderLanding = (): Plugin => {
 };
 
 export default defineConfig({
-  plugins: [tailwindcss(), prerenderLanding()],
+  plugins: [
+    foldkit({ devToolsMcpPort: 9988 }),
+    tailwindcss(),
+    prerenderLanding(),
+  ],
   optimizeDeps: {
     exclude: ["@effect/wa-sqlite"],
   },

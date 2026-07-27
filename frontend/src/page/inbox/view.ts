@@ -4,7 +4,7 @@
 
 import { Array as Arr, Match as M, Option } from "effect";
 import { AsyncData, Submodel } from "foldkit";
-import { html, type Html } from "foldkit/html";
+import { createKeyedLazy, createLazy, html, type Html } from "foldkit/html";
 
 import * as Icon from "../../icons";
 import { ThreadId } from "../../Gmail";
@@ -23,7 +23,7 @@ import {
   ClickedAppearance,
   ClickedBack,
   ClickedRow,
-  ClickedSignOut,
+  ClickedAccountSignOut,
   EnteredList,
   ExitedList,
   FOLDERS,
@@ -39,6 +39,7 @@ import {
   InboxPalette,
   LIST_ID,
   LIST_OVERSCAN,
+  DETAIL_PANE_ID,
   Message,
   Model,
   PAGE_SURFACE,
@@ -55,6 +56,19 @@ import {
 } from "./model";
 
 // VIEW
+
+// Hoisted out of the folder menu's viewInputs. Written inline it was a fresh
+// closure and a fresh string on every render, which would keep the cluster's
+// memoization slot missing no matter what the Model did.
+const FOLDER_BUTTON_CLASS = `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`;
+
+const folderItemSpec = (item: (typeof FOLDER_LABELS)[number]) => ({
+  icon: FOLDERS[item].icon,
+  label: item,
+  detail:
+    FOLDERS[item].count === undefined ? undefined : String(FOLDERS[item].count),
+  isChecked: item === "All Inbox",
+});
 
 const folderButtonContent = (): Html => {
   const h = html();
@@ -101,10 +115,7 @@ const profileChipContent = (profile: Profile): Html => {
 };
 
 // The account popover: identity up top, sign-out below.
-const accountPanelView = (
-  profile: Profile,
-  appearance: Appearance,
-): Html => {
+const accountPanelView = (profile: Profile, appearance: Appearance): Html => {
   const h = html<Message>();
   const itemClass = `flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`;
   const isDark = appearance === "Dark";
@@ -133,18 +144,18 @@ const accountPanelView = (
       ),
       h.div([h.Class("mx-2 my-1 border-t border-border")], []),
       h.button(
-        [
-          h.Type("button"),
-          h.OnClick(ClickedAppearance()),
-          h.Class(itemClass),
-        ],
+        [h.Type("button"), h.OnClick(ClickedAppearance()), h.Class(itemClass)],
         [
           (isDark ? Icon.sun : Icon.moon)("h-4 w-4 shrink-0"),
           isDark ? "Light mode" : "Dark mode",
         ],
       ),
       h.button(
-        [h.Type("button"), h.OnClick(ClickedSignOut()), h.Class(itemClass)],
+        [
+          h.Type("button"),
+          h.OnClick(ClickedAccountSignOut()),
+          h.Class(itemClass),
+        ],
         [Icon.logOut("h-4 w-4 shrink-0"), "Sign out"],
       ),
     ],
@@ -381,104 +392,137 @@ const syncPillView = (
   );
 };
 
+// The toolbar is split into three memoized pieces along the lines its inputs
+// actually change on. The pill's counter ticks several times a second during
+// a backfill; the folder menu and the account cluster do not move for minutes
+// at a time. Rendering them as one subtree meant every tick rebuilt four
+// submodels to change two digits.
+const lazyFolderCluster = createLazy();
+const lazySyncPill = createLazy();
+const lazyAccountCluster = createLazy();
+
+const folderClusterView = (
+  folderMenu: Model["folderMenu"],
+  tabs: Model["tabs"],
+): Html => {
+  const h = html<Message>();
+  return h.div(
+    [h.Class("flex min-w-0 items-center gap-5")],
+    [
+      h.submodel({
+        slotId: "inbox-folder-menu",
+        model: folderMenu,
+        view: FolderMenu.view,
+        viewInputs: {
+          items: FOLDER_LABELS,
+          itemSpec: folderItemSpec,
+          buttonContent: folderButtonContent(),
+          buttonClassName: FOLDER_BUTTON_CLASS,
+          ariaLabel: "Mail folders",
+          substrate: PAGE_SURFACE,
+        },
+        toParentMessage: (message) => GotFolderMenuMessage({ message }),
+      }),
+      h.nav(
+        [h.Class("flex items-center gap-2")],
+        [
+          h.submodel({
+            slotId: "inbox-tabs",
+            model: tabs,
+            view: Ui.Tabs.view,
+            viewInputs: {
+              tabs: TAB_LABELS,
+              tabSpec,
+              ariaLabel: "Mail categories",
+            },
+            toParentMessage: (message) => GotTabsMessage({ message }),
+          }),
+          Ui.button(
+            { variant: "ghost", size: "icon-sm", ariaLabel: "Add filter" },
+            [Icon.plus("h-[18px] w-[18px]")],
+          ),
+        ],
+      ),
+    ],
+  );
+};
+
+// Everything to the right of the pill. `profile` arrives as a fresh object on
+// every render (main.ts builds it inline from the session), so this takes the
+// two strings instead: they compare equal by value and the slot keeps its hit.
+const accountClusterView = (
+  accountPopover: Model["accountPopover"],
+  appearance: Appearance,
+  name: string,
+  email: string,
+): Html => {
+  const h = html<Message>();
+  const profile: Profile = { name, email };
+
+  return h.div(
+    [h.Class("flex shrink-0 items-center gap-3")],
+    [
+      h.button(
+        [
+          h.Type("button"),
+          h.AriaLabel("Search"),
+          h.OnClick(ToggledPalette()),
+          h.Class(
+            `flex h-7 cursor-pointer items-center gap-2 rounded-lg bg-hover px-2.5 text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+          ),
+        ],
+        [
+          Icon.search("h-4 w-4"),
+          h.kbd(
+            [h.Class("flex items-center text-[11px]")],
+            [Icon.command("h-3 w-3"), h.span([h.Class("ml-0.5")], ["K"])],
+          ),
+        ],
+      ),
+      h.submodel({
+        slotId: "inbox-account-popover",
+        model: accountPopover,
+        view: Ui.Popover.view,
+        viewInputs: {
+          buttonContent: profileChipContent(profile),
+          buttonClassName: `flex cursor-pointer items-center rounded-lg bg-hover py-1 pl-1.5 pr-2.5 outline-none hover:bg-active focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+          ariaLabel: "Account",
+          substrate: PAGE_SURFACE,
+          toPanelContent: () => accountPanelView(profile, appearance),
+        },
+        toParentMessage: (message) => GotAccountPopoverMessage({ message }),
+      }),
+      Ui.button(
+        { variant: "ghost", size: "icon-sm", ariaLabel: "Notifications" },
+        [Icon.bell("h-[18px] w-[18px]")],
+      ),
+      Ui.button({ variant: "tertiary", size: "icon", ariaLabel: "Compose" }, [
+        Icon.squarePen("h-[18px] w-[18px]"),
+      ]),
+    ],
+  );
+};
+
 const toolbarView = (model: Model, profile: Profile): Html => {
   const h = html<Message>();
   return h.header(
     [h.Class("flex items-center justify-between gap-4 px-5 py-3")],
     [
-      // Left cluster: folder dropdown and category tabs.
-      h.div(
-        [h.Class("flex min-w-0 items-center gap-5")],
-        [
-          h.submodel({
-            slotId: "inbox-folder-menu",
-            model: model.folderMenu,
-            view: FolderMenu.view,
-            viewInputs: {
-              items: FOLDER_LABELS,
-              itemSpec: (item) => ({
-                icon: FOLDERS[item].icon,
-                label: item,
-                detail:
-                  FOLDERS[item].count === undefined
-                    ? undefined
-                    : String(FOLDERS[item].count),
-                isChecked: item === "All Inbox",
-              }),
-              buttonContent: folderButtonContent(),
-              buttonClassName: `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`,
-              ariaLabel: "Mail folders",
-              substrate: PAGE_SURFACE,
-            },
-            toParentMessage: (message) => GotFolderMenuMessage({ message }),
-          }),
-          h.nav(
-            [h.Class("flex items-center gap-2")],
-            [
-              h.submodel({
-                slotId: "inbox-tabs",
-                model: model.tabs,
-                view: Ui.Tabs.view,
-                viewInputs: {
-                  tabs: TAB_LABELS,
-                  tabSpec,
-                  ariaLabel: "Mail categories",
-                },
-                toParentMessage: (message) => GotTabsMessage({ message }),
-              }),
-              Ui.button(
-                { variant: "ghost", size: "icon-sm", ariaLabel: "Add filter" },
-                [Icon.plus("h-[18px] w-[18px]")],
-              ),
-            ],
-          ),
-        ],
-      ),
-
-      // Right cluster: sync pill, search (⌘K), profile, notifications,
-      // compose.
+      lazyFolderCluster(folderClusterView, [model.folderMenu, model.tabs]),
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
-          syncPillView(model.sync, model.maybeLocalBytes, model.isRecentReady),
-          h.button(
-            [
-              h.Type("button"),
-              h.AriaLabel("Search"),
-              h.OnClick(ToggledPalette()),
-              h.Class(
-                `flex h-7 cursor-pointer items-center gap-2 rounded-lg bg-hover px-2.5 text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
-              ),
-            ],
-            [
-              Icon.search("h-4 w-4"),
-              h.kbd(
-                [h.Class("flex items-center text-[11px]")],
-                [Icon.command("h-3 w-3"), h.span([h.Class("ml-0.5")], ["K"])],
-              ),
-            ],
-          ),
-          h.submodel({
-            slotId: "inbox-account-popover",
-            model: model.accountPopover,
-            view: Ui.Popover.view,
-            viewInputs: {
-              buttonContent: profileChipContent(profile),
-              buttonClassName: `flex cursor-pointer items-center rounded-lg bg-hover py-1 pl-1.5 pr-2.5 outline-none hover:bg-active focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
-              ariaLabel: "Account",
-              substrate: PAGE_SURFACE,
-              toPanelContent: () => accountPanelView(profile, model.appearance),
-            },
-            toParentMessage: (message) => GotAccountPopoverMessage({ message }),
-          }),
-          Ui.button(
-            { variant: "ghost", size: "icon-sm", ariaLabel: "Notifications" },
-            [Icon.bell("h-[18px] w-[18px]")],
-          ),
-          Ui.button(
-            { variant: "tertiary", size: "icon", ariaLabel: "Compose" },
-            [Icon.squarePen("h-[18px] w-[18px]")],
-          ),
+          lazySyncPill(syncPillView, [
+            model.sync,
+            model.maybeLocalBytes,
+            model.isRecentReady,
+          ]),
+          lazyAccountCluster(accountClusterView, [
+            model.accountPopover,
+            model.appearance,
+            profile.name,
+            profile.email,
+          ]),
         ],
       ),
     ],
@@ -510,6 +554,8 @@ const categoryTagView = (category: Category): Html => {
     [icon(`h-3.5 w-3.5 ${iconClass}`, "2.25"), label],
   );
 };
+
+const lazyThreadRow = createKeyedLazy();
 
 // One list row. Carries no hover background of its own — the traveling
 // overlay (listOverlayView) is the single highlight for mouse and keyboard.
@@ -612,20 +658,33 @@ const statusRowView = (text: string): Html => {
 };
 
 // The traveling hover highlight. One absolutely-positioned overlay glides
-// between rows: `top` (transitioned) gives the travel, `translateY(-scrollTop)`
-// (not transitioned — see .fk-hover-overlay) tracks scrolling instantly.
+// between rows; `top` is transitioned, which is the whole animation.
+//
+// It rides the VirtualList's `contentOverlay` slot, which puts it INSIDE the
+// scroll container alongside the rows. That placement is the point: `top` is
+// then a content-space coordinate and the browser scrolls the overlay with
+// the rows for free. Rendered as a sibling of the list it had to chase
+// scrollTop through a `translateY(-scrollTop)` recomputed from scroll
+// Messages, and since native scrolling never waits for that round trip, the
+// highlight visibly trailed the rows it was highlighting.
+//
 // Keyed by the hover session so re-entering the list remounts it (snap +
 // @starting-style fade-in) instead of sliding from a stale row; leaving keeps
 // it mounted and fades it out in place (data-hidden), unless the keyboard
 // holds it.
-const listOverlayView = (model: Model): Html => {
+const listOverlayView = (
+  selected: Option.Option<number>,
+  hoverSession: number,
+  isPointerInside: boolean,
+  keyboardControlled: boolean,
+): Html => {
   const h = html<Message>();
-  return Option.match(model.selected, {
+  return Option.match(selected, {
     onNone: () => h.empty,
     onSome: (index) => {
-      const visible = model.isPointerInside || model.keyboardControlled;
+      const visible = isPointerInside || keyboardControlled;
       return h.keyed("div")(
-        `inbox-hover-overlay-${model.hoverSession}`,
+        `inbox-hover-overlay-${hoverSession}`,
         [
           h.Class("fk-hover-overlay"),
           ...(visible ? [] : [h.DataAttribute("hidden", "")]),
@@ -634,7 +693,6 @@ const listOverlayView = (model: Model): Html => {
             left: "0",
             right: "0",
             height: `${ROW_HEIGHT}px`,
-            transform: `translateY(${-model.list.scrollTop}px)`,
           }),
         ],
         [],
@@ -643,8 +701,48 @@ const listOverlayView = (model: Model): Html => {
   });
 };
 
-// The virtualized thread list plus its overlay. The wrapper is the overlay's
-// positioning context and clips it to the viewport; the list owns its scroll.
+// The list, memoized on everything it actually draws from. Scrolling and
+// hovering invalidate it by necessity now that the overlay rides inside the
+// container. What it still buys is every render driven by something else: the
+// sync pill ticks several times a second through a backfill, and rebuilding
+// the list on each of those was pure waste.
+//
+// The overlay gets its own slot rather than being rebuilt inline, and that is
+// load-bearing, not tidiness. A freshly built vnode is a new reference every
+// render, so passing one straight into the list's args would miss the cache
+// unconditionally and leave the memo above doing nothing at all.
+const lazyVirtualList = createLazy();
+const lazyListOverlay = createLazy();
+
+const listSubmodelView = (
+  list: Model["list"],
+  rows: ReadonlyArray<ThreadRow>,
+  overlay: Html,
+): Html => {
+  const h = html<Message>();
+  return h.submodel({
+    slotId: LIST_ID,
+    model: list,
+    view: Ui.VirtualList.view<ThreadRow>(),
+    viewInputs: {
+      items: rows,
+      itemToKey: (row: ThreadRow) => row.id,
+      // One memoization slot per thread id. Rows keep their identity
+      // across a refresh (see reconcileRows), so a sync tick that changed
+      // nothing in the visible window rebuilds no rows at all, and one
+      // that marked a thread read rebuilds exactly that row.
+      itemToView: (row: ThreadRow, index: number) =>
+        lazyThreadRow(row.id, threadRowView, [row, index]),
+      overscan: LIST_OVERSCAN,
+      containerClassName: "h-full",
+      contentOverlay: overlay,
+    },
+    toParentMessage: (message) => GotListMessage({ message }),
+  });
+};
+
+// The virtualized thread list. The wrapper carries the pointer boundary for
+// the hover session; the list owns its scroll and now its overlay too.
 const virtualListView = (
   model: Model,
   rows: ReadonlyArray<ThreadRow>,
@@ -652,26 +750,21 @@ const virtualListView = (
   const h = html<Message>();
   return h.div(
     [
-      h.Class("relative min-h-0 flex-1 overflow-clip"),
+      h.Class("min-h-0 flex-1 overflow-clip"),
       h.OnMouseEnter(EnteredList()),
       h.OnMouseLeave(ExitedList()),
     ],
     [
-      listOverlayView(model),
-      h.submodel({
-        slotId: LIST_ID,
-        model: model.list,
-        view: Ui.VirtualList.view<ThreadRow>(),
-        viewInputs: {
-          items: rows,
-          itemToKey: (row: ThreadRow) => row.id,
-          itemToView: (row: ThreadRow, index: number) =>
-            threadRowView(row, index),
-          overscan: LIST_OVERSCAN,
-          containerClassName: "h-full",
-        },
-        toParentMessage: (message) => GotListMessage({ message }),
-      }),
+      lazyVirtualList(listSubmodelView, [
+        model.list,
+        rows,
+        lazyListOverlay(listOverlayView, [
+          model.selected,
+          model.hoverSession,
+          model.isPointerInside,
+          model.keyboardControlled,
+        ]),
+      ]),
     ],
   );
 };
@@ -819,6 +912,11 @@ const messageCardView = (message: MessageDetail): Html => {
   );
 };
 
+// Keyed by thread id rather than a single slot: reopening a thread you had
+// open before should not have to rebuild its iframes, and srcdocFor rebuilds
+// the whole body string every time it runs.
+const lazyThreadDetail = createKeyedLazy();
+
 const threadDetailView = (detail: ThreadDetail): Html => {
   const h = html<Message>();
   return h.div(
@@ -858,27 +956,33 @@ const threadDetailView = (detail: ThreadDetail): Html => {
 
 // Renders whatever the Search service last ranked, in that order — the
 // palette does no matching of its own.
-const paletteView = (model: Model): Html => {
+const lazyPalette = createLazy();
+
+const paletteView = (
+  palette: Model["palette"],
+  searchResults: ReadonlyArray<ThreadRow>,
+  searchError: Option.Option<string>,
+): Html => {
   const h = html<Message>();
   const specs = new Map(
-    model.searchResults.map((row) => [row.id, threadItemSpec(row)]),
+    searchResults.map((row) => [row.id, threadItemSpec(row)]),
   );
 
   return h.submodel({
     slotId: "inbox-palette",
-    model: model.palette,
+    model: palette,
     view: InboxPalette.view,
     viewInputs: {
       // One unlabeled group: results are the only thing in the palette.
       groups: [
         {
           label: "",
-          items: model.searchResults.map((row) => row.id),
+          items: searchResults.map((row) => row.id),
         },
       ],
       itemSpec: (item: ThreadId) => specs.get(item) ?? { label: item },
       placeholder: "Search your mail…",
-      emptyLabel: Option.getOrElse(model.searchError, () => "No results"),
+      emptyLabel: Option.getOrElse(searchError, () => "No results"),
       substrate: PAGE_SURFACE,
     },
     toParentMessage: (message) => GotPaletteMessage({ message }),
@@ -907,7 +1011,9 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
         // its scroll position, so closing is free.
         h.div(
           [
-            h.Class("relative mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col"),
+            h.Class(
+              "relative mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col",
+            ),
           ],
           [
             h.div(
@@ -931,15 +1037,22 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                       h.Class(
                         "absolute inset-0 z-10 flex min-h-0 flex-col bg-background px-6",
                       ),
+                      // The click→paint benchmark's anchor for "the thread is
+                      // on screen". It has no styling or behaviour attached.
+                      h.Id(DETAIL_PANE_ID),
                     ],
-                    [threadDetailView(detail)],
+                    [lazyThreadDetail(detail.id, threadDetailView, [detail])],
                   ),
                 ],
               }),
             ),
           ],
         ),
-        paletteView(model),
+        lazyPalette(paletteView, [
+          model.palette,
+          model.searchResults,
+          model.searchError,
+        ]),
       ],
     );
   },
