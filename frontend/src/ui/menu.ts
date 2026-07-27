@@ -74,8 +74,11 @@ export type Message = typeof Message.Type;
 // COMMAND
 
 // Measures every item's layout rect relative to the group container (the
-// offsetParent, since the group is position: relative). Runs after the
-// panel has rendered, so the elements exist.
+// offsetParent, since the group is position: relative). Runs after the panel
+// has rendered, so the elements exist.
+// NOTE: The imperative probe is the point. Item count is discovered by walking
+// ids until one is missing, so the Command never has to be told how many items
+// the menu rendered; there is no collection to map over until the walk has run.
 const MeasureItemRects = Command.define(
   "MeasureItemRects",
   { id: S.String },
@@ -85,7 +88,9 @@ const MeasureItemRects = Command.define(
     const rects: Array<Rect> = [];
     for (let index = 0; ; index++) {
       const element = document.getElementById(`${id}-item-${index}`);
-      if (!(element instanceof HTMLElement)) break;
+      if (!(element instanceof HTMLElement)) {
+        break;
+      }
       rects.push(measureRect(element));
     }
     return MeasuredItemRects({ rects });
@@ -164,22 +169,23 @@ const overlayView = (model: Model): Html => {
   const h = html<never>();
   return Option.match(model.maybeHoverIndex, {
     onNone: () => h.empty,
-    onSome: (index) => {
-      const rect = model.rects[index];
-      if (rect === undefined) return h.empty;
-      return h.div(
-        [
-          h.Class("fk-hover-overlay rounded-lg"),
-          h.Style({
-            top: `${rect.top}px`,
-            left: `${rect.left}px`,
-            width: `${rect.width}px`,
-            height: `${rect.height}px`,
-          }),
-        ],
-        [],
-      );
-    },
+    onSome: (index) =>
+      Option.match(Arr.get(model.rects, index), {
+        onNone: () => h.empty,
+        onSome: (rect) =>
+          h.div(
+            [
+              h.Class("fk-hover-overlay rounded-lg"),
+              h.Style({
+                top: `${rect.top}px`,
+                left: `${rect.left}px`,
+                width: `${rect.width}px`,
+                height: `${rect.height}px`,
+              }),
+            ],
+            [],
+          ),
+      }),
   });
 };
 
@@ -204,6 +210,10 @@ const baseViewInputs = <Item extends string>(
     buttonContent,
     buttonClassName,
     ariaLabel,
+    // NOTE: outline-none with no focus-visible: partner is deliberate. The
+    // base menu's FocusItems command moves focus to this container on open;
+    // it is never a keyboard tab stop, so a ring here would mark focus the
+    // user didn't move. The items inside keep their own rings.
     itemsClassName: `z-50 ${widthClassName} rounded-xl p-1 outline-none ${surface(
       elevate(substrate, POPOUT_OFFSET),
       3,

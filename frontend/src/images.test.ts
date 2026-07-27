@@ -7,15 +7,14 @@ import { describe, expect, test } from "vitest";
 
 import { remoteImageUrls } from "./images";
 
-const img = (attributes: string) => `<html><body><img ${attributes}></body></html>`;
+const img = (attributes: string) =>
+  `<html><body><img ${attributes}></body></html>`;
 
 describe("remoteImageUrls", () => {
   test("keeps ordinary remote images", () => {
     const body = img('src="https://cdn.example.com/logo.png" width="120"');
 
-    expect(remoteImageUrls(body)).toEqual([
-      "https://cdn.example.com/logo.png",
-    ]);
+    expect(remoteImageUrls(body)).toEqual(["https://cdn.example.com/logo.png"]);
   });
 
   test("skips the open trackers seen in production", () => {
@@ -95,14 +94,21 @@ describe("remoteImageUrls false positives found against the real store", () => {
 
   // The dimension scan must read the tag's attributes, not the url's query.
   test("does not read a CDN sizing parameter as the tag's own width", () => {
-    const url = "https://cdn.example.com/cdn-cgi/image/width=1,quality=90/a.png";
+    const url =
+      "https://cdn.example.com/cdn-cgi/image/width=1,quality=90/a.png";
 
     expect(remoteImageUrls(`<img src="${url}" width="600">`)).toEqual([url]);
   });
 
   test("still catches a genuine pixel path or query", () => {
-    expect(remoteImageUrls('<img src="https://t.example.com/pixel.gif">')).toEqual([]);
-    expect(remoteImageUrls('<img src="https://t.example.com/pixel/x?a=1">')).toEqual([]);
-    expect(remoteImageUrls('<img src="https://t.example.com/x?pixel=1">')).toEqual([]);
+    expect(
+      remoteImageUrls('<img src="https://t.example.com/pixel.gif">'),
+    ).toEqual([]);
+    expect(
+      remoteImageUrls('<img src="https://t.example.com/pixel/x?a=1">'),
+    ).toEqual([]);
+    expect(
+      remoteImageUrls('<img src="https://t.example.com/x?pixel=1">'),
+    ).toEqual([]);
   });
 });

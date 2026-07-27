@@ -1,6 +1,4 @@
-// The inbox page's view. Pure rendering over the Model in model.ts; every
-// interaction is a Message from there. Nothing in here reaches for a
-// Command or the update logic.
+// Pure rendering over the Model in model.ts. Every interaction is a Message.
 
 import { Array as Arr, Match as M, Option } from "effect";
 import { AsyncData, Submodel } from "foldkit";
@@ -49,7 +47,7 @@ import {
   formatBytes,
   formatProgress,
   progressPercent,
-  recentReadyLine,
+  RECENT_READY_LINE,
   formatTime,
   tabSpec,
   threadItemSpec,
@@ -57,18 +55,21 @@ import {
 
 // VIEW
 
-// Hoisted out of the folder menu's viewInputs. Written inline it was a fresh
-// closure and a fresh string on every render, which would keep the cluster's
-// memoization slot missing no matter what the Model did.
+// NOTE: Hoisted out of viewInputs. Inline it was a fresh string per render,
+// which missed the cluster's memoization slot no matter what the Model did.
 const FOLDER_BUTTON_CLASS = `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`;
 
-const folderItemSpec = (item: (typeof FOLDER_LABELS)[number]) => ({
-  icon: FOLDERS[item].icon,
-  label: item,
-  detail:
-    FOLDERS[item].count === undefined ? undefined : String(FOLDERS[item].count),
-  isChecked: item === "All Inbox",
-});
+const DEFAULT_FOLDER = "All Inbox";
+
+const folderItemSpec = (item: (typeof FOLDER_LABELS)[number]) => {
+  const { icon, count } = FOLDERS[item];
+  return {
+    icon,
+    label: item,
+    detail: count === undefined ? undefined : String(count),
+    isChecked: item === DEFAULT_FOLDER,
+  };
+};
 
 const folderButtonContent = (): Html => {
   const h = html();
@@ -83,10 +84,9 @@ const folderButtonContent = (): Html => {
   );
 };
 
-// The signed-in Google account, passed down from main.ts.
-export type Profile = { readonly name: string; readonly email: string };
+export type Profile = Readonly<{ name: string; email: string }>;
 
-export type ViewInputs = { readonly profile: Profile };
+export type ViewInputs = Readonly<{ profile: Profile }>;
 
 const profileInitial = (profile: Profile, sizeClassName: string): Html => {
   const h = html();
@@ -114,11 +114,13 @@ const profileChipContent = (profile: Profile): Html => {
   );
 };
 
-// The account popover: identity up top, sign-out below.
 const accountPanelView = (profile: Profile, appearance: Appearance): Html => {
   const h = html<Message>();
   const itemClass = `flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] text-muted-foreground outline-none hover:bg-hover hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`;
-  const isDark = appearance === "Dark";
+  const appearanceToggle =
+    appearance === "Dark"
+      ? { icon: Icon.sun, label: "Light mode" }
+      : { icon: Icon.moon, label: "Dark mode" };
 
   return h.div(
     [],
@@ -145,10 +147,7 @@ const accountPanelView = (profile: Profile, appearance: Appearance): Html => {
       h.div([h.Class("mx-2 my-1 border-t border-border")], []),
       h.button(
         [h.Type("button"), h.OnClick(ClickedAppearance()), h.Class(itemClass)],
-        [
-          (isDark ? Icon.sun : Icon.moon)("h-4 w-4 shrink-0"),
-          isDark ? "Light mode" : "Dark mode",
-        ],
+        [appearanceToggle.icon("h-4 w-4 shrink-0"), appearanceToggle.label],
       ),
       h.button(
         [
@@ -162,23 +161,74 @@ const accountPanelView = (profile: Profile, appearance: Appearance): Html => {
   );
 };
 
-// What the pill says, per machine state: a short label for the pill itself
-// and a fuller sentence for the hover detail. Cold is deliberately not empty
-// — the machine boots Cold, so rendering nothing there made the pill appear a
-// beat after first paint and shove the toolbar sideways.
+const spinner = (): Html =>
+  Ui.brailleLoader("text-[13px] text-muted-foreground");
+
+const PILL_CLASS =
+  "flex h-7 shrink-0 items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] tabular-nums text-muted-foreground";
+
+// NeedsAuth is the one pill that is a control: the machine parks there and
+// cannot leave on its own, so without a click there is no way back short of
+// reloading the page.
+const reconnectPillView = (body: ReadonlyArray<Html>): Html => {
+  const h = html<Message>();
+  return h.button(
+    [
+      h.Type("button"),
+      h.OnClick(GotSyncMessage({ message: SyncMachine.ClickedReconnect() })),
+      h.Class(
+        `${PILL_CLASS} cursor-pointer outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+      ),
+    ],
+    body,
+  );
+};
+
+const statusPillView = (
+  body: ReadonlyArray<Html>,
+  label: string,
+  detail: string,
+  isWorking: boolean,
+): Html => {
+  const h = html<Message>();
+  return h.div(
+    [
+      h.Class(PILL_CLASS),
+      h.Role("status"),
+      // The pill text alone is terse, so the detail rides along for screen
+      // readers rather than living only in a hover affordance.
+      h.AriaLabel(`${label}. ${detail}`),
+      ...(isWorking ? [h.AriaLive("polite")] : []),
+    ],
+    body,
+  );
+};
+
+// Everything the pill needs to know about a machine state, decided in one
+// exhaustive match so a new state can't be half-handled.
+// NOTE: Cold is deliberately not empty. The machine boots Cold, so rendering
+// nothing there made the pill appear a beat after first paint and shove the
+// toolbar sideways.
 type SyncSummary = Readonly<{
   /** The pill itself. */
   label: string;
-  /** The panel's headline — the stage, named. */
+  /** The panel's headline: the stage, named. */
   stage: string;
   /** The line under the bar: counts and time when we have them, a plain
    *  explanation of the stage when we don't. */
   detail: string;
-  /** Some only while backfilling, which is the one stage with a real
-   *  denominator to draw a bar against. */
+  /** Some only while backfilling, the one stage with a real denominator to
+   *  draw a bar against. */
   maybeProgress: Option.Option<
     Readonly<{ syncedCount: number; totalEstimate: number }>
   >;
+  /** Whether the machine is mid-pass, which is what makes the pill a polite
+   *  live region rather than a static status. */
+  isWorking: boolean;
+  // NOTE: A function, not a value. The glyph appears in both the pill and the
+  // panel header, and a vnode is not reusable across two positions in the
+  // tree: snabbdom patches through the same object twice.
+  toLeadingGlyph: () => Html;
 }>;
 
 const syncSummary = (sync: SyncMachine.State): SyncSummary =>
@@ -190,42 +240,56 @@ const syncSummary = (sync: SyncMachine.State): SyncSummary =>
         stage: "Starting",
         detail: "Reading your local mailbox.",
         maybeProgress: Option.none(),
+        isWorking: true,
+        toLeadingGlyph: spinner,
       }),
       Priming: () => ({
         label: "Syncing…",
         stage: "Priming",
         detail: "Fetching your most recent mail.",
         maybeProgress: Option.none(),
+        isWorking: true,
+        toLeadingGlyph: spinner,
       }),
       Backfilling: ({ syncedCount, totalEstimate }) => ({
         label: `Syncing ${syncedCount.toLocaleString()} of ~${totalEstimate.toLocaleString()}`,
         stage: "Backfilling",
         detail: formatProgress(syncedCount, totalEstimate),
         maybeProgress: Option.some({ syncedCount, totalEstimate }),
+        isWorking: true,
+        toLeadingGlyph: spinner,
       }),
       CatchingUp: () => ({
         label: "Checking…",
         stage: "Checking",
         detail: "Looking for anything that changed since the last sync.",
         maybeProgress: Option.none(),
+        isWorking: true,
+        toLeadingGlyph: spinner,
       }),
       Settled: () => ({
         label: "Synced",
         stage: "Synced",
         detail: "Your mailbox is up to date on this device.",
         maybeProgress: Option.none(),
+        isWorking: false,
+        toLeadingGlyph: () => Icon.check("h-3.5 w-3.5"),
       }),
       Backoff: () => ({
         label: "Retrying…",
         stage: "Retrying",
         detail: "Gmail asked us to slow down. Retrying shortly.",
         maybeProgress: Option.none(),
+        isWorking: false,
+        toLeadingGlyph: () => Ui.badgeDot({ color: "amber" }),
       }),
       NeedsAuth: () => ({
         label: "Reconnect Gmail",
         stage: "Disconnected",
         detail: "Your Gmail session expired. Click to sign in again.",
         maybeProgress: Option.none(),
+        isWorking: false,
+        toLeadingGlyph: () => Ui.badgeDot({ color: "red" }),
       }),
     }),
   );
@@ -243,85 +307,63 @@ const syncPillView = (
   isRecentReady: boolean,
 ): Html => {
   const h = html<Message>();
-  const { label, stage, detail, maybeProgress } = syncSummary(sync);
-  const isWorking =
-    sync._tag === "Cold" ||
-    sync._tag === "Priming" ||
-    sync._tag === "Backfilling" ||
-    sync._tag === "CatchingUp";
+  const { label, stage, detail, maybeProgress, isWorking, toLeadingGlyph } =
+    syncSummary(sync);
 
-  // A function, not a value: the glyph appears in both the pill and the
-  // panel header, and a vnode is not reusable across two positions in the
-  // tree — snabbdom patches through the same object twice.
-  const leading = (): Html =>
-    sync._tag === "Settled"
-      ? Icon.check("h-3.5 w-3.5")
-      : sync._tag === "Backoff"
-        ? Ui.badgeDot({ color: "amber" })
-        : sync._tag === "NeedsAuth"
-          ? Ui.badgeDot({ color: "red" })
-          : Ui.brailleLoader("text-[13px] text-muted-foreground");
+  // NOTE: The bar is decorative. The exact fraction is in the detail line
+  // right below it, and that is what a screen reader reads.
+  const progressRows = Arr.fromOption(
+    Option.map(maybeProgress, ({ syncedCount, totalEstimate }) =>
+      h.div(
+        [
+          h.Class("mt-2 h-1 w-full overflow-hidden rounded-full bg-active"),
+          h.AriaHidden(true),
+        ],
+        [
+          h.div(
+            [
+              h.Class("h-full rounded-full bg-foreground/70"),
+              h.Style({
+                width: `${progressPercent(syncedCount, totalEstimate)}%`,
+              }),
+            ],
+            [],
+          ),
+        ],
+      ),
+    ),
+  );
 
-  const progressRows: ReadonlyArray<Html> = Option.match(maybeProgress, {
-    onNone: () => [],
-    onSome: ({ syncedCount, totalEstimate }) => {
-      const percent = progressPercent(syncedCount, totalEstimate);
-      return [
-        // The bar is decorative — the exact fraction is in the detail line
-        // right below it, and that is what a screen reader reads.
-        h.div(
-          [
-            h.Class("mt-2 h-1 w-full overflow-hidden rounded-full bg-active"),
-            h.AriaHidden(true),
-          ],
-          [
-            h.div(
-              [
-                h.Class("h-full rounded-full bg-foreground/70"),
-                h.Style({ width: `${percent}%` }),
-              ],
-              [],
-            ),
-          ],
-        ),
-      ];
-    },
-  });
-
-  // The header's right edge carries both numbers that are true of every
-  // state: how far along we are, and how much is on disk. Neither earns its
-  // own row — the size in particular is a standing fact, not a step, and a
-  // labelled "On disk" row gave it more weight than the progress it sits next
-  // to.
+  // The header's right edge carries the two numbers true of every state: how
+  // far along we are, and how much is on disk. Neither earns its own row.
   const trailing = [
-    ...Option.match(maybeLocalBytes, {
-      onNone: () => [],
-      onSome: (bytes) => [formatBytes(bytes)],
-    }),
-    ...Option.match(maybeProgress, {
-      onNone: () => [],
-      onSome: ({ syncedCount, totalEstimate }) => [
-        `${progressPercent(syncedCount, totalEstimate)}%`,
-      ],
-    }),
+    ...Arr.fromOption(Option.map(maybeLocalBytes, formatBytes)),
+    ...Arr.fromOption(
+      Option.map(
+        maybeProgress,
+        ({ syncedCount, totalEstimate }) =>
+          `${progressPercent(syncedCount, totalEstimate)}%`,
+      ),
+    ),
   ].join(" · ");
 
   // The one genuinely interesting thing the app has to say mid-sync: your
-  // recent mail is entirely local — bodies, images, offline — while the rest
-  // of the mailbox is still coming down. Shown only while backfilling; once
-  // the walk is done the whole mailbox is local and the claim is redundant.
-  const milestoneRows: ReadonlyArray<Html> =
-    isRecentReady && Option.isSome(maybeProgress)
-      ? [
-          h.div(
-            [h.Class("mt-2 flex items-start gap-1.5 text-foreground")],
-            [
-              Icon.check("mt-0.5 h-3.5 w-3.5 shrink-0"),
-              h.span([], [recentReadyLine()]),
-            ],
-          ),
-        ]
-      : [];
+  // recent mail is entirely local while the rest is still coming down. Shown
+  // only while backfilling, since once the walk is done the whole mailbox is
+  // local and the claim is redundant.
+  const milestoneRows = Arr.fromOption(
+    Option.map(
+      Option.filter(maybeProgress, () => isRecentReady),
+      () =>
+        h.div(
+          [h.Class("mt-2 flex items-start gap-1.5 text-foreground")],
+          [
+            Icon.check("mt-0.5 h-3.5 w-3.5 shrink-0"),
+            h.span([], [RECENT_READY_LINE]),
+          ],
+        ),
+    ),
+  );
 
   // Hover-only, no state: the panel is always in the DOM for screen readers
   // and is revealed by the group. Cheaper than a Popover for something with
@@ -341,7 +383,7 @@ const syncPillView = (
         [
           h.span(
             [h.Class("flex items-center gap-2 text-foreground")],
-            [leading(), stage],
+            [toLeadingGlyph(), stage],
           ),
           h.span([h.Class("shrink-0 text-muted-foreground")], [trailing]),
         ],
@@ -352,51 +394,22 @@ const syncPillView = (
     ],
   );
 
-  const body: ReadonlyArray<Html> = [leading(), h.span([], [label])];
-  const pillClass =
-    "flex h-7 shrink-0 items-center gap-2 rounded-lg bg-hover px-2.5 text-[12px] tabular-nums text-muted-foreground";
+  const body: ReadonlyArray<Html> = [toLeadingGlyph(), h.span([], [label])];
 
-  // NeedsAuth is the one pill that is a control: the machine parks there and
-  // cannot leave on its own, so without a click there is no way back short
-  // of reloading the page.
   return h.div(
     [h.Class("group relative")],
     [
       sync._tag === "NeedsAuth"
-        ? h.button(
-            [
-              h.Type("button"),
-              h.OnClick(
-                GotSyncMessage({ message: SyncMachine.ClickedReconnect() }),
-              ),
-              h.Class(
-                `${pillClass} cursor-pointer outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
-              ),
-            ],
-            body,
-          )
-        : h.div(
-            [
-              h.Class(pillClass),
-              h.Role("status"),
-              // The pill text alone is terse; the detail is what actually
-              // explains the state, so it rides along for screen readers
-              // rather than living only in a hover affordance.
-              h.AriaLabel(`${label}. ${detail}`),
-              ...(isWorking ? [h.AriaLive("polite")] : []),
-            ],
-            body,
-          ),
+        ? reconnectPillView(body)
+        : statusPillView(body, label, detail, isWorking),
       detailPanel,
     ],
   );
 };
 
-// The toolbar is split into three memoized pieces along the lines its inputs
-// actually change on. The pill's counter ticks several times a second during
-// a backfill; the folder menu and the account cluster do not move for minutes
-// at a time. Rendering them as one subtree meant every tick rebuilt four
-// submodels to change two digits.
+// NOTE: Split into three memoized pieces along the lines its inputs change
+// on. The pill ticks several times a second during a backfill; as one subtree
+// every tick rebuilt four submodels to change two digits.
 const lazyFolderCluster = createLazy();
 const lazySyncPill = createLazy();
 const lazyAccountCluster = createLazy();
@@ -447,9 +460,8 @@ const folderClusterView = (
   );
 };
 
-// Everything to the right of the pill. `profile` arrives as a fresh object on
-// every render (main.ts builds it inline from the session), so this takes the
-// two strings instead: they compare equal by value and the slot keeps its hit.
+// NOTE: `profile` arrives as a fresh object per render, so this takes the two
+// strings instead; they compare equal by value and the slot keeps its hit.
 const accountClusterView = (
   accountPopover: Model["accountPopover"],
   appearance: Appearance,
@@ -562,7 +574,7 @@ const lazyThreadRow = createKeyedLazy();
 // The row height is fixed by the VirtualList; content just fills and centers.
 const threadRowView = (row: ThreadRow, index: number): Html => {
   const h = html<Message>();
-  const tone = row.unread ? "text-foreground" : "text-muted-foreground";
+  const tone = row.isUnread ? "text-foreground" : "text-muted-foreground";
 
   return h.div(
     [
@@ -598,7 +610,7 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
         [
           // The dot's slot is always reserved so the subject column lines up
           // across read and unread rows; only the dot itself hides.
-          row.unread
+          row.isUnread
             ? Ui.badgeDot({ color: "indigo", ariaLabel: "Unread" })
             : h.span([h.Class("invisible h-[7px] w-[7px] shrink-0")], []),
           // The truncation ellipsis draws in the truncating element's color;
@@ -673,21 +685,21 @@ const statusRowView = (text: string): Html => {
 // it mounted and fades it out in place (data-hidden), unless the keyboard
 // holds it.
 const listOverlayView = (
-  selected: Option.Option<number>,
+  maybeSelected: Option.Option<number>,
   hoverSession: number,
   isPointerInside: boolean,
-  keyboardControlled: boolean,
+  isKeyboardControlled: boolean,
 ): Html => {
   const h = html<Message>();
-  return Option.match(selected, {
+  return Option.match(maybeSelected, {
     onNone: () => h.empty,
     onSome: (index) => {
-      const visible = isPointerInside || keyboardControlled;
+      const isVisible = isPointerInside || isKeyboardControlled;
       return h.keyed("div")(
         `inbox-hover-overlay-${hoverSession}`,
         [
           h.Class("fk-hover-overlay"),
-          ...(visible ? [] : [h.DataAttribute("hidden", "")]),
+          ...(isVisible ? [] : [h.DataAttribute("hidden", "")]),
           h.Style({
             top: `${index * ROW_HEIGHT}px`,
             left: "0",
@@ -701,16 +713,10 @@ const listOverlayView = (
   });
 };
 
-// The list, memoized on everything it actually draws from. Scrolling and
-// hovering invalidate it by necessity now that the overlay rides inside the
-// container. What it still buys is every render driven by something else: the
-// sync pill ticks several times a second through a backfill, and rebuilding
-// the list on each of those was pure waste.
-//
-// The overlay gets its own slot rather than being rebuilt inline, and that is
-// load-bearing, not tidiness. A freshly built vnode is a new reference every
-// render, so passing one straight into the list's args would miss the cache
-// unconditionally and leave the memo above doing nothing at all.
+// NOTE: The overlay gets its own memo slot rather than being rebuilt inline.
+// A freshly built vnode is a new reference every render, so passing one
+// straight into the list's args would miss the cache unconditionally and
+// leave the memo doing nothing.
 const lazyVirtualList = createLazy();
 const lazyListOverlay = createLazy();
 
@@ -727,10 +733,9 @@ const listSubmodelView = (
     viewInputs: {
       items: rows,
       itemToKey: (row: ThreadRow) => row.id,
-      // One memoization slot per thread id. Rows keep their identity
-      // across a refresh (see reconcileRows), so a sync tick that changed
-      // nothing in the visible window rebuilds no rows at all, and one
-      // that marked a thread read rebuilds exactly that row.
+      // NOTE: One memo slot per thread id. Rows keep identity across a
+      // refresh (see reconcileRows), so a sync tick that changed nothing in
+      // the visible window rebuilds no rows.
       itemToView: (row: ThreadRow, index: number) =>
         lazyThreadRow(row.id, threadRowView, [row, index]),
       overscan: LIST_OVERSCAN,
@@ -741,8 +746,7 @@ const listSubmodelView = (
   });
 };
 
-// The virtualized thread list. The wrapper carries the pointer boundary for
-// the hover session; the list owns its scroll and now its overlay too.
+// The wrapper carries the pointer boundary for the hover session.
 const virtualListView = (
   model: Model,
   rows: ReadonlyArray<ThreadRow>,
@@ -759,32 +763,45 @@ const virtualListView = (
         model.list,
         rows,
         lazyListOverlay(listOverlayView, [
-          model.selected,
+          model.maybeSelected,
           model.hoverSession,
           model.isPointerInside,
-          model.keyboardControlled,
+          model.isKeyboardControlled,
         ]),
       ]),
     ],
   );
 };
 
+// Whether the store is still being filled, which is what separates "empty
+// inbox" from "not downloaded yet".
+const isSyncFilling = (sync: SyncMachine.State): boolean =>
+  M.value(sync).pipe(
+    M.withReturnType<boolean>(),
+    M.tagsExhaustive({
+      Cold: () => true,
+      Priming: () => true,
+      Backfilling: () => true,
+      CatchingUp: () => false,
+      Settled: () => false,
+      Backoff: () => false,
+      NeedsAuth: () => false,
+    }),
+  );
+
 // The loaded rows, preceded by an error row when one is present (a stale
 // refresh, or a thread open that failed).
 const listBodyView = (
   model: Model,
   rows: ReadonlyArray<ThreadRow>,
-  error: Option.Option<string>,
+  maybeError: Option.Option<string>,
 ): ReadonlyArray<Html> => [
-  ...Option.match(error, {
-    onNone: (): ReadonlyArray<Html> => [],
-    onSome: (message) => [statusRowView(message)],
-  }),
+  ...Arr.fromOption(Option.map(maybeError, statusRowView)),
   Arr.match(rows, {
     onEmpty: () =>
       statusRowView(
-        // A cold store while the machine is still filling it isn't empty,
-        // it's early — the first primed rows land within a second or two.
+        // NOTE: A cold store while the machine is still filling it isn't
+        // empty, it's early. The first primed rows land within a second or two.
         isSyncFilling(model.sync)
           ? "Syncing your inbox…"
           : "Your inbox is empty.",
@@ -793,26 +810,26 @@ const listBodyView = (
   }),
 ];
 
-const isSyncFilling = (sync: SyncMachine.State): boolean =>
-  sync._tag === "Cold" ||
-  sync._tag === "Priming" ||
-  sync._tag === "Backfilling";
+const LOADING_LINE = "Loading your inbox…";
 
-// The list section: header, then whichever body the load state calls for.
 const listSectionView = (model: Model): Html => {
   const h = html<Message>();
 
-  const openError =
-    model.screen._tag === "ShowingList"
-      ? model.screen.error
-      : Option.none<string>();
+  const maybeOpenError = M.value(model.screen).pipe(
+    M.withReturnType<Option.Option<string>>(),
+    M.tagsExhaustive({
+      ShowingList: ({ maybeError }) => maybeError,
+      OpeningThread: () => Option.none(),
+      ShowingThread: () => Option.none(),
+    }),
+  );
 
   const body = AsyncData.match(model.threads, {
-    onIdle: (): ReadonlyArray<Html> => [statusRowView("Loading your inbox…")],
-    onLoading: () => [statusRowView("Loading your inbox…")],
+    onIdle: (): ReadonlyArray<Html> => [statusRowView(LOADING_LINE)],
+    onLoading: () => [statusRowView(LOADING_LINE)],
     onFailure: (error) => [statusRowView(error)],
-    onSuccess: (rows) => listBodyView(model, rows, openError),
-    onRefreshing: (rows) => listBodyView(model, rows, openError),
+    onSuccess: (rows) => listBodyView(model, rows, maybeOpenError),
+    onRefreshing: (rows) => listBodyView(model, rows, maybeOpenError),
     onStale: ({ error, data }) => listBodyView(model, data, Option.some(error)),
   });
 
@@ -824,12 +841,10 @@ const listSectionView = (model: Model): Html => {
 
 // THREAD DETAIL
 //
-// Html bodies render in a sandboxed srcdoc iframe (email css can't leak out,
-// ours can't leak in; no scripts run). Plain bodies skip the iframe.
+// NOTE: Html bodies render in a sandboxed srcdoc iframe so email css can't
+// leak out, ours can't leak in, and no scripts run. Plain bodies skip it.
 
-// default-src 'none' blocks everything except images (inline cid: images
-// arrive as blob: urls over locally stored bytes; remote images load live)
-// and inline styles.
+// default-src 'none' blocks everything except images and inline styles.
 const FRAME_CSP =
   "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
 
@@ -954,14 +969,12 @@ const threadDetailView = (detail: ThreadDetail): Html => {
   );
 };
 
-// Renders whatever the Search service last ranked, in that order — the
-// palette does no matching of its own.
 const lazyPalette = createLazy();
 
 const paletteView = (
   palette: Model["palette"],
   searchResults: ReadonlyArray<ThreadRow>,
-  searchError: Option.Option<string>,
+  maybeSearchError: Option.Option<string>,
 ): Html => {
   const h = html<Message>();
   const specs = new Map(
@@ -982,7 +995,7 @@ const paletteView = (
       ],
       itemSpec: (item: ThreadId) => specs.get(item) ?? { label: item },
       placeholder: "Search your mail…",
-      emptyLabel: Option.getOrElse(searchError, () => "No results"),
+      emptyLabel: Option.getOrElse(maybeSearchError, () => "No results"),
       substrate: PAGE_SURFACE,
     },
     toParentMessage: (message) => GotPaletteMessage({ message }),
@@ -1051,7 +1064,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
         lazyPalette(paletteView, [
           model.palette,
           model.searchResults,
-          model.searchError,
+          model.maybeSearchError,
         ]),
       ],
     );

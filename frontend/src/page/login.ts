@@ -2,6 +2,7 @@ import { Match as M, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
+import { ts } from "foldkit/schema";
 import { evo } from "foldkit/struct";
 
 import {
@@ -11,39 +12,40 @@ import {
   StartedGoogleRedirect,
 } from "../auth";
 
-// The sign-in page as a page submodel: a single "Continue with Google"
-// button that starts the OAuth round-trip. There is no local success
-// transition — the flow leaves the page entirely and the returning visit's
-// boot-time `CheckSession` performs the logged-in switch — so the submodel
-// only tracks the in-flight state and any error starting (or, via the
-// ?error= callback param surfaced through `init`, finishing) the flow.
-
 // MODEL
 
+// NOTE: There is no local success transition. The OAuth flow leaves the page
+// entirely, and the returning visit's boot-time CheckSession performs the
+// logged-in switch, so `Redirecting` is terminal for this submodel.
+export const CheckingSession = ts("CheckingSession");
+export const Ready = ts("Ready");
+export const Redirecting = ts("Redirecting");
+export const Status = S.Union([CheckingSession, Ready, Redirecting]);
+export type Status = typeof Status.Type;
+
 export const Model = S.Struct({
-  pending: S.Boolean,
-  error: S.Option(S.String),
-  // True while the boot-time `CheckSession` is still in flight and the
-  // localStorage cache was empty — the button waits so a valid cookie
-  // doesn't flash the page before logging in. Driven by the parent (it owns
-  // the session check) via `setCheckingSession`.
-  checkingSession: S.Boolean,
+  status: Status,
+  maybeError: S.Option(S.String),
 });
 export type Model = typeof Model.Type;
 
 export const init = (
-  checkingSession: boolean,
-  error: Option.Option<string> = Option.none(),
-): Model => ({
-  pending: false,
-  error,
-  checkingSession,
-});
+  status: Status,
+  maybeError: Option.Option<string> = Option.none(),
+): Model => ({ status, maybeError });
 
-export const setCheckingSession = (
-  model: Model,
-  checkingSession: boolean,
-): Model => evo(model, { checkingSession: () => checkingSession });
+/** The parent's boot session check came back without a session, so the page
+ *  stops waiting on it. */
+export const settledSessionCheck = (model: Model): Model =>
+  evo(model, {
+    status: M.type<Status>().pipe(
+      M.tagsExhaustive({
+        CheckingSession: () => Ready(),
+        Ready: () => Ready(),
+        Redirecting: () => Redirecting(),
+      }),
+    ),
+  });
 
 // MESSAGE
 
@@ -51,8 +53,6 @@ export const ClickedGoogleSignIn = m("ClickedGoogleSignIn");
 
 export const Message = S.Union([
   ClickedGoogleSignIn,
-  // Results of the SignInWithGoogle command issued below. The redirect
-  // unloads the page, so `StartedGoogleRedirect` is a formality.
   StartedGoogleRedirect,
   FailedAuth,
 ]);
@@ -70,17 +70,25 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     M.withReturnType<UpdateReturn>(),
     M.tagsExhaustive({
       ClickedGoogleSignIn: () =>
-        model.pending
-          ? [model, []]
-          : [
-              evo(model, { pending: () => true, error: () => Option.none() }),
+        M.value(model.status).pipe(
+          M.withReturnType<UpdateReturn>(),
+          M.tagsExhaustive({
+            Ready: () => [
+              evo(model, {
+                status: () => Redirecting(),
+                maybeError: () => Option.none(),
+              }),
               [SignInWithGoogle()],
             ],
+            CheckingSession: () => [model, []],
+            Redirecting: () => [model, []],
+          }),
+        ),
       StartedGoogleRedirect: () => [model, []],
       FailedAuth: ({ error }) => [
         evo(model, {
-          pending: () => false,
-          error: () => Option.some(error),
+          status: () => Ready(),
+          maybeError: () => Option.some(error),
         }),
         [],
       ],
@@ -89,9 +97,18 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
 // VIEW
 
+const statusLabel = M.type<Status>().pipe(
+  M.tagsExhaustive({
+    CheckingSession: () => "Checking session…",
+    Ready: () => "Continue with Google",
+    Redirecting: () => "Redirecting to Google…",
+  }),
+);
+
+const isBusy = (status: Status): boolean => status._tag !== "Ready";
+
 export const view = Submodel.defineView<Model, Message>((model): Html => {
   const h = html<Message>();
-  const disabled = model.pending || model.checkingSession;
 
   return h.main(
     [h.Class("min-h-screen bg-neutral-950 px-6 py-24 text-neutral-100")],
@@ -108,20 +125,14 @@ export const view = Submodel.defineView<Model, Message>((model): Html => {
             [
               h.Type("button"),
               h.OnClick(ClickedGoogleSignIn()),
-              h.Disabled(disabled),
+              h.Disabled(isBusy(model.status)),
               h.Class(
                 "mt-8 w-full border border-neutral-700 bg-neutral-800 px-4 py-3 font-medium text-neutral-100 hover:bg-neutral-700 disabled:opacity-50",
               ),
             ],
-            [
-              model.checkingSession
-                ? "Checking session…"
-                : model.pending
-                  ? "Redirecting to Google…"
-                  : "Continue with Google",
-            ],
+            [statusLabel(model.status)],
           ),
-          Option.match(model.error, {
+          Option.match(model.maybeError, {
             onNone: () => h.empty,
             onSome: (error) =>
               h.p(

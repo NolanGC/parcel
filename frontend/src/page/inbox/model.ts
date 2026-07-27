@@ -1,10 +1,7 @@
-// The inbox page's vocabulary: its constants, its Model, and its Message
-// set. Imported by both view.ts and index.ts, and imports neither — the
-// split exists so the update logic and the ~700 lines of view can be read
-// independently, and a shared file with no sibling imports is what keeps
-// that from becoming an import cycle.
+// Imported by both view.ts and index.ts, and imports neither, which is what
+// keeps the split from becoming an import cycle.
 
-import { Option, Schema as S } from "effect";
+import { Array as Arr, Option, Schema as S } from "effect";
 import { AsyncData } from "foldkit";
 import { m } from "foldkit/message";
 import { ts } from "foldkit/schema";
@@ -16,30 +13,21 @@ import { ThreadDetail, ThreadRow, type ThreadCategory } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
 
-// The inbox, built on FoldkitUI (the Fluid Functionalism port). Colors come
-// from the surface ladder + overlay tokens in styles.css, motion from the
-// spring tiers in ui/motion.ts. Rows are real threads pulled through the
-// SyncEngine (Gmail → local SQLite → this list); the folder dropdown, tabs,
-// and palette are chrome.
-
 export const PAGE_SURFACE = Ui.SurfaceLevel.make(1);
 
-// The virtualized list: rows are a fixed height so the visible window and the
-// traveling hover overlay are both pure arithmetic (index * ROW_HEIGHT).
+// NOTE: Rows are a fixed height so the visible window and the traveling hover
+// overlay are both pure arithmetic (index * ROW_HEIGHT).
 export const LIST_ID = "inbox-list";
-// The open thread's container. Only the perf bench reads it, but it lives
-// here so the id has one definition rather than being spelled in a harness
-// that cannot fail to compile when the view changes.
-export const DETAIL_PANE_ID = "inbox-detail-pane";
 export const ROW_HEIGHT = 53;
 export const LIST_OVERSCAN = 6;
 
-// Html email bodies render in a sandboxed iframe at a fixed height and scroll
-// internally — no content measurement, no pane pre-mounting.
+// NOTE: Only the perf bench reads this, but it lives here so a view change
+// can't leave the harness silently addressing nothing.
+export const DETAIL_PANE_ID = "inbox-detail-pane";
+
 export const BODY_FRAME_HEIGHT = 600;
 
-// APPEARANCE — System follows the OS; Light/Dark pin a class on <html> so the
-// light-dark() tokens re-resolve, wrapped in a 180ms cross-fade.
+// APPEARANCE
 
 export const Appearance = S.Literals(["System", "Light", "Dark"]);
 export type Appearance = typeof Appearance.Type;
@@ -48,7 +36,6 @@ export type Appearance = typeof Appearance.Type;
 
 export type Category = "promotions" | "primary" | "other";
 
-// Gmail's category labels mapped onto the chip set the design defines.
 export const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
   personal: "primary",
   promotions: "promotions",
@@ -58,16 +45,13 @@ export const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
   none: "other",
 };
 
-// Sender tiles are "content colors" — deliberately outside the surface token
-// system, like a favicon.
+// NOTE: Content colors, deliberately outside the surface token system.
 export const AVATAR_BG = "#4f46e5";
 export const AVATAR_FG = "#ffffff";
 
-// LoadInbox re-reads the entire list from SQLite, so a refresh hands back
-// freshly decoded objects even for the thousands of rows whose bytes did not
-// change. That churn is invisible until you try to memoize: view memoization
-// compares arguments with `===`, so a new object per row misses the cache for
-// every row, and dev-mode deep-freezing re-walks the whole array. Reusing the
+// NOTE: LoadInbox re-decodes the entire list, so a refresh hands back fresh
+// objects even for rows whose bytes did not change. View memoization compares
+// with `===`, so that churn would miss the cache for every row. Reusing the
 // previous object whenever the fields are equal keeps a strided refresh
 // mid-backfill down to the handful of rows that actually moved.
 const isSameRow = (left: ThreadRow, right: ThreadRow): boolean =>
@@ -76,14 +60,13 @@ const isSameRow = (left: ThreadRow, right: ThreadRow): boolean =>
   left.sender === right.sender &&
   left.snippet === right.snippet &&
   left.date === right.date &&
-  left.unread === right.unread &&
+  left.isUnread === right.isUnread &&
   left.category === right.category;
 
-// The common case by a wide margin is that a refresh changed nothing at all,
-// so that case is answered by a positional scan that allocates nothing. Only
-// once a row actually differs do we pay for the id index, which at ~30k rows
-// is what put this on the wrong side of the update budget when it ran
-// unconditionally.
+// NOTE: The common case by a wide margin is that a refresh changed nothing,
+// so that case is answered by a positional scan that allocates nothing. The id
+// index below is only paid for once a row actually differs; running it
+// unconditionally put this on the wrong side of the update budget at ~30k rows.
 const isAlignedWith = (
   previous: ReadonlyArray<ThreadRow>,
   next: ReadonlyArray<ThreadRow>,
@@ -101,9 +84,9 @@ export const reconcileRows = (
   previous: ReadonlyArray<ThreadRow>,
   next: ReadonlyArray<ThreadRow>,
 ): ReadonlyArray<ThreadRow> => {
-  // Holding the array reference, not just the row references, is what lets a
-  // memoized list subtree skip entirely rather than re-walking 30k rows to
-  // discover that each one is unchanged.
+  // NOTE: Holding the array reference, not just the row references, is what
+  // lets a memoized list subtree skip entirely rather than re-walking every
+  // row to discover each one is unchanged.
   if (isAlignedWith(previous, next)) {
     return previous;
   }
@@ -115,7 +98,6 @@ export const reconcileRows = (
   });
 };
 
-// Same-day threads show the clock, older ones the date.
 export const formatTime = (epochMs: number): string => {
   const date = new Date(epochMs);
   const now = new Date();
@@ -127,20 +109,24 @@ export const formatTime = (epochMs: number): string => {
   ).slice(2)}`;
 };
 
-// Remaining sync time at the quota bucket's sustained rate. That rate — not
-// concurrency — is what binds the backfill, so it is the honest basis for an
-// estimate; see THREADS_PER_SECOND. Rounded coarsely on purpose: a number
-// that ticks every second reads as precision the estimate does not have.
+const SECONDS_PER_MINUTE = 60;
+const MINUTES_PER_HOUR = 60;
+const SECONDS_PER_HOUR = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+
+// NOTE: Rounded coarsely on purpose. A number that ticks every second reads as
+// precision the estimate lacks; the rate comes from THREADS_PER_SECOND.
 export const formatEta = (remainingThreads: number): string => {
   const seconds = Math.ceil(remainingThreads / THREADS_PER_SECOND);
-  if (seconds < 60) return "under a minute";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `about ${minutes} min`;
-  const hours = Math.round(seconds / 3600);
-  return `about ${hours} hr`;
+  if (seconds < SECONDS_PER_MINUTE) {
+    return "under a minute";
+  }
+  const minutes = Math.round(seconds / SECONDS_PER_MINUTE);
+  if (minutes < MINUTES_PER_HOUR) {
+    return `about ${minutes} min`;
+  }
+  return `about ${Math.round(seconds / SECONDS_PER_HOUR)} hr`;
 };
 
-// The backfill line: where the walk is and how much longer, in one row.
 export const formatProgress = (
   syncedCount: number,
   totalEstimate: number,
@@ -148,32 +134,39 @@ export const formatProgress = (
   `${syncedCount.toLocaleString()} of ${totalEstimate.toLocaleString()} threads · ` +
   `${formatEta(Math.max(0, totalEstimate - syncedCount))} left`;
 
-// Clamped both ends: total_estimate is Gmail's own label count and drifts, so
-// syncedCount can pass it — a bar reading 104% is worse than one that sits at
-// full for the last few seconds.
+const FULL_PERCENT = 100;
+
+// NOTE: Clamped both ends. total_estimate is Gmail's own label count and
+// drifts, so syncedCount can pass it, and a bar reading 104% is worse than one
+// that sits at full for the last few seconds.
 export const progressPercent = (
   syncedCount: number,
   totalEstimate: number,
 ): number =>
   totalEstimate <= 0
     ? 0
-    : Math.min(100, Math.max(0, Math.round((syncedCount / totalEstimate) * 100)));
+    : Math.min(
+        FULL_PERCENT,
+        Math.max(0, Math.round((syncedCount / totalEstimate) * FULL_PERCENT)),
+      );
 
-// The milestone's copy. Its own function because it names HOT_THREAD_COUNT,
-// and the number in the sentence has to be the number the queue actually
-// uses — a hardcoded "1,000" here would quietly become a lie the day the
-// tier size changes.
-export const recentReadyLine = (): string =>
-  `Latest ${HOT_THREAD_COUNT.toLocaleString()} ready to read offline, images included.`;
+// NOTE: Names HOT_THREAD_COUNT rather than spelling the number, so the
+// sentence can't become a lie the day the tier size changes.
+export const RECENT_READY_LINE = `Latest ${HOT_THREAD_COUNT.toLocaleString()} ready to read offline, images included.`;
 
-// Human-readable store size for the pill's detail.
+const BYTES_PER_GB = 1_073_741_824;
+const BYTES_PER_MB = 1_048_576;
+
 export const formatBytes = (bytes: number): string =>
-  bytes >= 1_073_741_824
-    ? `${(bytes / 1_073_741_824).toFixed(1)} GB`
-    : `${Math.round(bytes / 1_048_576)} MB`;
+  bytes >= BYTES_PER_GB
+    ? `${(bytes / BYTES_PER_GB).toFixed(1)} GB`
+    : `${Math.round(bytes / BYTES_PER_MB)} MB`;
 
-
-export type CategoryConfig = { label: string; icon: Ui.IconView; iconClass: string };
+export type CategoryConfig = Readonly<{
+  label: string;
+  icon: Ui.IconView;
+  iconClass: string;
+}>;
 
 export const CATEGORIES: Record<Category, CategoryConfig> = {
   promotions: {
@@ -189,12 +182,12 @@ export const CATEGORIES: Record<Category, CategoryConfig> = {
   other: { label: "Other", icon: Icon.ellipsis, iconClass: "" },
 };
 
-export type TabConfig = {
+export type TabConfig = Readonly<{
   label: string;
   icon: Ui.IconView;
   count: number;
   iconClass: string;
-};
+}>;
 
 export const TABS: ReadonlyArray<TabConfig> = [
   { label: "To-do", icon: Icon.circleCheck, count: 2, iconClass: "" },
@@ -216,17 +209,19 @@ export const TABS: ReadonlyArray<TabConfig> = [
 
 export const TAB_LABELS: ReadonlyArray<string> = TABS.map((tab) => tab.label);
 
-export const tabSpec = (label: string): Ui.Tabs.TabSpec => {
-  const tab = TABS.find((tab) => tab.label === label);
-  return tab === undefined
-    ? { icon: Icon.ellipsis, label }
-    : {
+export const tabSpec = (label: string): Ui.Tabs.TabSpec =>
+  Option.match(
+    Arr.findFirst(TABS, (tab) => tab.label === label),
+    {
+      onNone: () => ({ icon: Icon.ellipsis, label }),
+      onSome: (tab) => ({
         icon: tab.icon,
         label: tab.label,
         detail: String(tab.count),
         iconClass: tab.iconClass,
-      };
-};
+      }),
+    },
+  );
 
 // FOLDER MENU
 
@@ -240,7 +235,10 @@ export const FOLDER_LABELS = [
 ] as const;
 export type FolderLabel = (typeof FOLDER_LABELS)[number];
 
-export const FOLDERS: Record<FolderLabel, { icon: Ui.IconView; count?: number }> = {
+export const FOLDERS: Record<
+  FolderLabel,
+  Readonly<{ icon: Ui.IconView; count?: number }>
+> = {
   "All Inbox": { icon: Icon.inbox, count: 199 },
   Sent: { icon: Icon.send },
   "Send later": { icon: Icon.clock },
@@ -251,19 +249,12 @@ export const FOLDERS: Record<FolderLabel, { icon: Ui.IconView; count?: number }>
 
 export const FolderMenu = Ui.Menu.create<FolderLabel>();
 
-// COMMAND PALETTE — search over the local store (⌘K, or the toolbar search
-// button). Items are thread ids; the corpus is the mailbox itself.
-//
-// The whole store already rides in the model (SyncEngine.loadInbox selects
-// every row — see the VirtualList note in sync.ts), so matching is pure and
-// instant: no command round-trip, no debounce, nothing async to keep honest.
-// The rank/cap happens here rather than in the palette because only an
-// unbounded corpus needs one, and the palette re-applies the same scorer.
+// COMMAND PALETTE
 
 export const PALETTE_RESULT_LIMIT = 50;
 
 export const threadItemSpec = (row: ThreadRow): Ui.Palette.PaletteItemSpec => ({
-  icon: row.unread ? Icon.mail : Icon.mailOpen,
+  icon: row.isUnread ? Icon.mail : Icon.mailOpen,
   label: row.subject === "" ? "(no subject)" : row.subject,
   detail: row.sender,
 });
@@ -272,15 +263,11 @@ export const InboxPalette = Ui.Palette.create<ThreadId>();
 
 // MODEL
 
-// The inbox rows as an async-loaded value: Loading renders the placeholder,
-// Success/Refreshing the rows, Failure the error, and Stale keeps the last
-// good rows on screen with the refresh error above them.
 export const ThreadsData = AsyncData.Schema(S.Array(ThreadRow), S.String);
 
-// Which screen the page shows, as a tagged state — the list, the list with a
-// thread load in flight, or an open thread. One state at a time, so "detail
-// open while a different load is pending" can't be expressed.
-export const ShowingList = ts("ShowingList", { error: S.Option(S.String) });
+export const ShowingList = ts("ShowingList", {
+  maybeError: S.Option(S.String),
+});
 export const OpeningThread = ts("OpeningThread", { id: ThreadId });
 export const ShowingThread = ts("ShowingThread", { detail: ThreadDetail });
 export const Screen = S.Union([ShowingList, OpeningThread, ShowingThread]);
@@ -294,35 +281,25 @@ export const Model = S.Struct({
   palette: Ui.Palette.Model,
   accountPopover: Ui.Popover.Model,
   threads: ThreadsData.schema,
-  // The sync machine: fills and freshens the SQLite store behind the UI.
-  // Its state renders as the toolbar pill; its progress triggers the
-  // strided row refreshes (see GotSyncMessage).
   sync: SyncMachine.State,
   screen: Screen,
-  // The single list cursor: mouse hover and j/k both move it. Drives the
-  // traveling hover overlay; Enter (or a click) opens it.
-  selected: S.Option(S.Number),
-  // Hover-session state for the traveling overlay (the FF treatment).
-  // Bumped on each pointer entry; keys the overlay so a new session remounts
-  // it (snap + @starting-style fade-in) instead of sliding from a stale row.
+  /** The single list cursor: mouse hover and j/k both move it. */
+  maybeSelected: S.Option(S.Number),
+  // NOTE: Bumped on each pointer entry; keys the overlay so a new session
+  // remounts it rather than sliding from a stale row.
   hoverSession: S.Number,
   isPointerInside: S.Boolean,
-  // True once j/k has claimed the overlay: it then stays visible regardless
-  // of the pointer, until real mouse motion over a row reclaims it.
-  keyboardControlled: S.Boolean,
-  // The palette's results, in the order the Search service ranked them.
+  /** Once j/k claims the overlay it stays visible regardless of the pointer,
+   *  until real mouse motion over a row reclaims it. */
+  isKeyboardControlled: S.Boolean,
   searchResults: S.Array(ThreadRow),
-  // Bumped per issued search; a reply carrying an older seq lost the race to
-  // a later keystroke and is dropped. The correctness half of a debounce,
-  // without the latency half.
+  // NOTE: Bumped per issued search; a reply carrying an older seq lost the
+  // race to a later keystroke and is dropped.
   searchSeq: S.Number,
-  searchError: S.Option(S.String),
-  // On-disk size of the local store, shown in the sync pill's detail. None
-  // until the first read lands.
+  maybeSearchError: S.Option(S.String),
   maybeLocalBytes: S.Option(S.Number),
-  // The newest HOT_THREAD_COUNT threads are fully local — bodies and images —
-  // while the rest of the mailbox is still downloading. Latched: see the
-  // CompletedCacheImageBatch handler for why it never goes back to false.
+  /** The newest HOT_THREAD_COUNT threads are fully local, bodies and images.
+   *  Latched; see the CompletedCacheImageBatch handler. */
   isRecentReady: S.Boolean,
 });
 export type Model = typeof Model.Type;
@@ -332,23 +309,21 @@ export const init = (): Model => ({
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
   tabs: Ui.Tabs.init({
     id: "inbox-tabs",
-    selectedValue: TAB_LABELS[0] ?? "",
+    selectedValue: Option.getOrElse(Arr.head(TAB_LABELS), () => ""),
   }),
   list: Ui.VirtualList.init({ id: LIST_ID, rowHeightPx: ROW_HEIGHT }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
-  // main.ts issues LoadInbox on entering the inbox, so the page is born
-  // loading rather than idle.
   threads: AsyncData.Loading(),
   sync: SyncMachine.init(),
-  screen: ShowingList({ error: Option.none() }),
-  selected: Option.none(),
+  screen: ShowingList({ maybeError: Option.none() }),
+  maybeSelected: Option.none(),
   hoverSession: 0,
   isPointerInside: false,
-  keyboardControlled: false,
+  isKeyboardControlled: false,
   searchResults: [],
   searchSeq: 0,
-  searchError: Option.none(),
+  maybeSearchError: Option.none(),
   maybeLocalBytes: Option.none(),
   isRecentReady: false,
 });
@@ -425,10 +400,11 @@ export const FailedCacheImageBatch = m("FailedCacheImageBatch", {
 export const SucceededLoadThread = m("SucceededLoadThread", {
   detail: ThreadDetail,
 });
+export const ListKey = S.Literals(["j", "k", "Enter", "Escape"]);
+export type ListKey = typeof ListKey.Type;
+
 /** List keyboard nav from the global subscription in main.ts. */
-export const PressedListKey = m("PressedListKey", {
-  key: S.Literals(["j", "k", "Enter", "Escape"]),
-});
+export const PressedListKey = m("PressedListKey", { key: ListKey });
 export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
 export const CompletedScrollListToRow = m("CompletedScrollListToRow");

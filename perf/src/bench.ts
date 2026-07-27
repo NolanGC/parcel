@@ -67,9 +67,7 @@ type RawResult = {
 const round1 = (n: number): number => Math.round(n * 10) / 10;
 
 const quantile = (sorted: ReadonlyArray<number>, q: number): number =>
-  sorted.length === 0
-    ? 0
-    : sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)];
+  sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)] ?? 0;
 
 const aggregate = (values: ReadonlyArray<number>) => {
   const sorted = [...values].sort((a, b) => a - b);

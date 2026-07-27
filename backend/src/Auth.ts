@@ -5,6 +5,7 @@ import * as Output from "alchemy/Output";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { drizzle } from "drizzle-orm/node-postgres";
+import * as Arr from "effect/Array";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -33,38 +34,42 @@ export type AuthUser = {
 type MakeAuthOptions = {
   secret: string;
   baseOrigin: string;
-  frontendOrigin: Option.Option<string>;
+  maybeFrontendOrigin: Option.Option<string>;
   isLocal: boolean;
-  google: Option.Option<{ clientId: string; clientSecret: string }>;
+  maybeGoogle: Option.Option<{ clientId: string; clientSecret: string }>;
 };
 
-// Exactly one origin may make credentialed requests: the frontend bound as
-// FRONTEND_ORIGIN in alchemy.run.ts (the deployed Website in cloud stages,
-// http://localhost:1337 under `alchemy dev`). Nothing else — a wildcard
-// would let any site ride the SameSite=None session cookie, and even a
-// dev-localhost entry would let a local process hit production with it.
-// Option.none means the binding is missing (a wiring bug): deny everything.
+// NOTE: Exactly one origin may make credentialed requests, the frontend bound
+// as FRONTEND_ORIGIN. A wildcard would let any site ride the SameSite=None
+// session cookie, and even a dev-localhost entry would let a local process hit
+// production with it. Option.none means the binding is missing: deny all.
 //
-// The packaged desktop app (packages/desktop) is the one exception: Tauri
-// serves the same frontend bundle from a fixed local origin
-// (`tauri://localhost` on macOS/Linux, `http://tauri.localhost` on Windows).
-// Allowing it does not reopen the wildcard hole: browsers can't fake these
-// origins, and each Tauri app has its own webview cookie jar, so no other
-// process can ride the session cookie. Under `alchemy dev` the desktop shell
-// loads http://localhost:1337 directly and never hits this branch.
+// The packaged desktop app is the one exception, since Tauri serves the same
+// bundle from a fixed local origin. Allowing it does not reopen the wildcard
+// hole: browsers can't fake these origins, and each Tauri app has its own
+// webview cookie jar. Under `alchemy dev` the shell loads localhost:1337
+// directly and never reaches this branch.
 const DESKTOP_ORIGINS: ReadonlySet<string> = new Set([
   "tauri://localhost",
   "http://tauri.localhost",
 ]);
 
 const makeIsAllowedOrigin =
-  (frontendOrigin: Option.Option<string>) =>
+  (maybeFrontendOrigin: Option.Option<string>) =>
   (origin: string): boolean =>
     DESKTOP_ORIGINS.has(origin) ||
-    Option.exists(frontendOrigin, (allowed) => allowed === origin);
+    Option.exists(maybeFrontendOrigin, (allowed) => allowed === origin);
+
+// Worker env values are untyped, and a binding that is missing reads as either
+// undefined or "". Both mean "not configured".
+const envText = (value: unknown): Option.Option<string> =>
+  Option.filter(
+    Option.fromNullishOr(value as string | undefined),
+    (text) => text !== "",
+  );
 
 const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
-  const isAllowedOrigin = makeIsAllowedOrigin(options.frontendOrigin);
+  const isAllowedOrigin = makeIsAllowedOrigin(options.maybeFrontendOrigin);
   return betterAuth({
     database: drizzleAdapter(drizzle({ client: pool }), {
       provider: "pg",
@@ -82,18 +87,16 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
     // disabled default everywhere. The integ tests never need it: they mint
     // sessions with a test-only BetterAuth instance (test-utils plugin)
     // over this same database and secret — see test/integ.test.ts.
-    socialProviders: Option.match(options.google, {
+    socialProviders: Option.match(options.maybeGoogle, {
       onNone: () => ({}),
       onSome: ({ clientId, clientSecret }) => ({
         google: {
           clientId,
           clientSecret,
-          // Gmail access outlives the sign-in hour, so the app needs a
-          // refresh token — Google only issues one when access is
-          // "offline" AND a consent screen was shown (re-logins without
-          // `consent` return access tokens only). `select_account` also
-          // keeps the account chooser on shared machines. Tokens land on
-          // the `account` row; `auth.api.getAccessToken` refreshes them.
+          // NOTE: Gmail access outlives the sign-in hour, so the app needs a
+          // refresh token, and Google only issues one when access is
+          // "offline" AND a consent screen was shown. `select_account` keeps
+          // the chooser on shared machines. Tokens land on the `account` row.
           accessType: "offline" as const,
           prompt: "select_account consent" as const,
           // Sign-in doubles as the Gmail grant. Read-only for now; wider
@@ -115,10 +118,13 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
     // BetterAuth checks the Origin header of state-changing requests
     // against this list; echoing the (validated) request origin keeps it in
     // lockstep with the CORS policy in ChatService.
-    trustedOrigins: (request) => {
-      const origin = request?.headers.get("origin");
-      return origin != null && isAllowedOrigin(origin) ? [origin] : [];
-    },
+    trustedOrigins: (request) =>
+      Arr.fromOption(
+        Option.filter(
+          Option.fromNullishOr(request?.headers.get("origin")),
+          isAllowedOrigin,
+        ),
+      ),
     // Prod: the frontend and this worker are different workers.dev sites,
     // so the session cookie must be `SameSite=None; Secure` to cross sites.
     // Dev: both origins are localhost (same-site), and Safari refuses
@@ -231,54 +237,46 @@ export const BetterAuthPg = Layer.effect(
       "BETTER_AUTH_SECRET",
     );
 
-    // FRONTEND_ORIGIN is a plain-text binding attached in alchemy.run.ts
-    // (the Website's URL — it can't be bound from here without creating a
-    // module cycle with ChatService). Read lazily: it only exists at
-    // runtime, and this layer also builds at plan time. Empty means the
-    // first deploy of a fresh stage ran before the Website URL existed.
-    const frontendOrigin = (): Option.Option<string> => {
-      const raw = env.FRONTEND_ORIGIN as string | undefined;
-      return raw ? Option.some(new URL(raw).origin) : Option.none();
-    };
+    // NOTE: Read lazily. These bindings only exist at runtime and this layer
+    // also builds at plan time. Absent means the first deploy of a fresh stage
+    // ran before the Website URL existed.
+    const maybeFrontendOrigin = (): Option.Option<string> =>
+      Option.map(envText(env.FRONTEND_ORIGIN), (raw) => new URL(raw).origin);
 
-    // Google OAuth credentials, bound in alchemy.run.ts from the deploy
-    // machine's env. Read lazily for the same reason as FRONTEND_ORIGIN.
-    // None means the stage deployed without them (only the integ-test
-    // stage legitimately does): the provider is simply not offered.
-    const google = (): Option.Option<{
+    // Google OAuth credentials, bound from the deploy machine's env. None
+    // means the stage deployed without them (only the integ-test stage
+    // legitimately does), and the provider is simply not offered.
+    const maybeGoogle = (): Option.Option<{
       clientId: string;
       clientSecret: string;
-    }> => {
-      const clientId = env.GOOGLE_CLIENT_ID as string | undefined;
-      const clientSecret = env.GOOGLE_CLIENT_SECRET as string | undefined;
-      return clientId && clientSecret
-        ? Option.some({ clientId, clientSecret })
-        : Option.none();
-    };
+    }> =>
+      Option.all({
+        clientId: envText(env.GOOGLE_CLIENT_ID),
+        clientSecret: envText(env.GOOGLE_CLIENT_SECRET),
+      });
 
     const withAuth = <A>(
       requestUrl: string,
       use: (auth: AuthInstance) => Promise<A>,
     ) =>
       Effect.gen(function* () {
-        // The public origin bound in alchemy.run.ts, not the request URL:
-        // under `alchemy dev` the request URL inside workerd carries the
-        // proxy's random internal port (127.0.0.1:<random>), and Google
-        // rejects OAuth callbacks built from anything but the exact
-        // registered origin. The request URL is only a fallback for a
-        // missing binding (first deploy of a fresh stage).
-        const baseOrigin = (env.API_ORIGIN as string | undefined)
-          ? new URL(env.API_ORIGIN as string).origin
-          : new URL(requestUrl).origin;
+        // NOTE: The bound public origin, not the request URL. Under `alchemy
+        // dev` the request URL inside workerd carries the proxy's random
+        // internal port, and Google rejects OAuth callbacks built from
+        // anything but the exact registered origin. The request URL is only a
+        // fallback for a missing binding.
+        const baseOrigin = new URL(
+          Option.getOrElse(envText(env.API_ORIGIN), () => requestUrl),
+        ).origin;
         const connectionString = Redacted.value(yield* conn.connectionString);
         // The integ-test stage overrides the per-stage Random secret with
         // one the test run generated (TEST_AUTH_SECRET, bound in
         // alchemy.run.ts only for that stage), so the tests' test-utils
         // BetterAuth instance can sign session cookies this worker accepts.
         const secretValue =
-          (env.TEST_AUTH_SECRET as string | undefined) ??
+          Option.getOrUndefined(envText(env.TEST_AUTH_SECRET)) ??
           Redacted.value(yield* secret);
-        const frontend = frontendOrigin();
+        const maybeFrontend = maybeFrontendOrigin();
         const pool = new pg.Pool({ connectionString, max: 1 });
         return yield* Effect.tryPromise({
           try: () =>
@@ -286,11 +284,11 @@ export const BetterAuthPg = Layer.effect(
               makeAuth(pool, {
                 secret: secretValue,
                 baseOrigin,
-                frontendOrigin: frontend,
+                maybeFrontendOrigin: maybeFrontend,
                 isLocal: /^http:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(
                   baseOrigin,
                 ),
-                google: google(),
+                maybeGoogle: maybeGoogle(),
               }),
             ),
           catch: (cause) => new AuthError({ cause }),
@@ -301,7 +299,7 @@ export const BetterAuthPg = Layer.effect(
 
     return {
       isAllowedOrigin: (origin: string) =>
-        makeIsAllowedOrigin(frontendOrigin())(origin),
+        makeIsAllowedOrigin(maybeFrontendOrigin())(origin),
       withAuth,
       sessionUser: (request: Request) =>
         withAuth(request.url, (auth) =>

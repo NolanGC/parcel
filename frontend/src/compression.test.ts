@@ -20,8 +20,9 @@ const withCompression = <A, E>(
 const htmlBody = `<!doctype html><html><body>${
   `<table role="presentation" style="width:100%;border-collapse:collapse">` +
   `<tr><td style="padding:12px;font-family:Helvetica,Arial,sans-serif">` +
-  `Thanks for your order. Your package is on its way.</td></tr></table>`
-    .repeat(40)
+  `Thanks for your order. Your package is on its way.</td></tr></table>`.repeat(
+    40,
+  )
 }</body></html>`;
 
 describe("compression", () => {

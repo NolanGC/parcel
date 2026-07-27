@@ -8,9 +8,9 @@ import { load } from "foldkit/navigation";
 
 import { API_URL } from "./config";
 
-// The client-side session is a cached copy of the user profile; the actual
-// authority is the http-only cookie BetterAuth set, which the server
-// validates on every gated request.
+// The client-side session is a cached copy of the user profile. The authority
+// is the http-only cookie BetterAuth set, which the server validates on every
+// gated request.
 export const Session = S.Struct({
   userId: UserId,
   email: S.String,
@@ -33,12 +33,8 @@ export const CompletedSessionPersistence = m("CompletedSessionPersistence");
 
 // SERVICE
 
-// The BetterAuth client wraps its REST endpoints (paths, redirect handling,
-// error shapes) so upgrades don't silently change the wire contract under
-// hand-rolled fetches. `credentials: "include"` makes the browser
-// attach/store the session cookie across the frontend/chat-service origin
-// split. As a service, commands stay pure descriptions and tests can
-// provide a stub instead of a network.
+// NOTE: `credentials: "include"` is what carries the session cookie across the
+// frontend/API origin split.
 const makeAuthClient = () =>
   createAuthClient({
     baseURL: API_URL,
@@ -77,8 +73,7 @@ const errorMessage = (
 
 // COMMAND
 
-// Asks the server who the cookie belongs to. This is the boot-time
-// authority; the localStorage copy only provides instant first paint.
+/** Asks the server who the cookie belongs to: the boot-time authority. */
 export const CheckSession = Command.define(
   "CheckSession",
   SucceededCheckSession,
@@ -102,16 +97,14 @@ export const CheckSession = Command.define(
   ),
 );
 
-// Sign-in is a full-page OAuth round-trip: BetterAuth answers this POST
-// with Google's authorization URL, and `load` hands the tab over to it.
-// Google sends the user back through the API worker's
-// /api/auth/callback/google, which sets the session cookie and redirects to
-// callbackURL — so success never produces a message here (the page has
-// unloaded); the boot-time CheckSession on the return visit picks the
-// session up. Only failures to *start* the flow report back, and a declined
-// consent screen comes back as ?error= on errorCallbackURL (read in init).
-// `disableRedirect` keeps the client's default auto-redirect plugin out of
-// the way so foldkit's `load` owns the navigation.
+/**
+ * Starts the full-page OAuth round-trip. Success never produces a message
+ * here: `load` unloads the page, and the return visit's boot-time
+ * `CheckSession` picks the session up. Only failures to *start* the flow
+ * report back.
+ */
+// NOTE: `disableRedirect` keeps the client's auto-redirect plugin out of the
+// way so foldkit's `load` owns the navigation.
 export const SignInWithGoogle = Command.define(
   "SignInWithGoogle",
   StartedGoogleRedirect,
@@ -146,17 +139,14 @@ export const SignInWithGoogle = Command.define(
   ),
 );
 
-// Sign-out is best-effort: the client drops its state either way, and the
-// server-side session expires on its own if the request never lands.
+/** Best-effort: the client drops its state either way, and the server-side
+ *  session expires on its own if the request never lands. */
 export const SignOut = Command.define(
   "SignOut",
   CompletedSignOut,
 )(
   AuthClient.pipe(
     Effect.flatMap((client) => Effect.tryPromise(() => client.signOut())),
-    // Ignored, not handled: the model transitions to logged-out on
-    // CompletedSignOut regardless, so there is no branch to feed an error
-    // into — but log it, or a dead endpoint would be invisible.
     Effect.tapError((error) =>
       Effect.logWarning("sign-out request failed", error),
     ),
@@ -167,9 +157,6 @@ export const SignOut = Command.define(
 
 // SESSION CACHE
 
-// KeyValueStore abstracts the storage engine: the app provides the
-// localStorage-backed layer below, tests can provide `layerMemory`. The
-// schema store handles the JSON round-trip through `Session`.
 export const sessionStorageLayer: Layer.Layer<KeyValueStore.KeyValueStore> =
   KeyValueStore.layerStorage(() => localStorage);
 
@@ -177,9 +164,9 @@ const sessionStore = Effect.map(KeyValueStore.KeyValueStore, (store) =>
   KeyValueStore.toSchemaStore(store, Session),
 );
 
-// Runs pre-boot as part of `flags`, before the runtime's `resources`
-// exist — so it provides its own layer instead of using the R channel.
-// A corrupt or unreadable cache is the same as no cache.
+// NOTE: Runs pre-boot as part of `flags`, before the runtime's `resources`
+// exist, so it provides its own layer instead of using the R channel. A
+// corrupt or unreadable cache is the same as no cache.
 export const readStoredSession: Effect.Effect<Option.Option<Session>> =
   sessionStore.pipe(
     Effect.flatMap((store) => store.get(SESSION_STORAGE_KEY)),
@@ -187,6 +174,8 @@ export const readStoredSession: Effect.Effect<Option.Option<Session>> =
     Effect.provide(sessionStorageLayer),
   );
 
+/** Best-effort: a failed write only costs the next visit its instant first
+ *  paint, and `CheckSession` remains the authority. */
 export const SaveSession = Command.define(
   "SaveSession",
   { session: Session },
@@ -194,9 +183,6 @@ export const SaveSession = Command.define(
 )(({ session }) =>
   sessionStore.pipe(
     Effect.flatMap((store) => store.set(SESSION_STORAGE_KEY, session)),
-    // Best-effort by design: a failed write (quota, blocked storage) only
-    // costs the next visit its instant first paint — CheckSession remains
-    // the authority. Log it so chronically broken storage is diagnosable.
     Effect.tapError((error) =>
       Effect.logWarning("session cache write failed", error),
     ),
@@ -205,7 +191,8 @@ export const SaveSession = Command.define(
   ),
 );
 
-// Otel, better observability into cache evictions etc
+/** Best-effort: if the eviction fails, the next boot paints logged-in from the
+ *  stale cache until `SucceededCheckSession(none)` corrects it. */
 export const ClearSession = Command.define(
   "ClearSession",
   CompletedSessionPersistence,
@@ -213,8 +200,6 @@ export const ClearSession = Command.define(
   Effect.flatMap(KeyValueStore.KeyValueStore, (store) =>
     store.remove(SESSION_STORAGE_KEY),
   ).pipe(
-    // Best-effort: if the eviction fails, the next boot paints logged-in
-    // from the stale cache until SucceededCheckSession(none) corrects it.
     Effect.tapError((error) =>
       Effect.logWarning("session cache eviction failed", error),
     ),
