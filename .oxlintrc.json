@@ -1,4 +1,5 @@
 {
+  "extends": ["./node_modules/@foldkit/oxlint-plugin/recommended.json"],
   "ignorePatterns": [
     ".alchemy/**",
     "repos/**",

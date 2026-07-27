@@ -22,40 +22,40 @@
     "clear": "pkill -f 'workerd serve' || true",
     "destroy": "alchemy destroy",
     "perf": "bun perf/src/bench.ts",
+    "perf:hover": "bun perf/src/hover.ts",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --disable-nested-config .",
     "lint:fix": "oxlint --disable-nested-config --fix .",
     "test": "bun run --cwd frontend test",
-    "test:integ": "INTEG=1 bun test test/integ.test.ts"
+    "test:integ": "INTEG=1 bun test test/integ.test.ts",
+    "sql": "bun perf/src/sql.ts"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^4.20250805.0",
-    "@effect/platform-bun": "4.0.0-beta.88",
-    "@effect/platform-node": "4.0.0-beta.88",
+    "@effect/platform-bun": "4.0.0-beta.97",
+    "@effect/platform-node": "4.0.0-beta.97",
     "@effect/sql": "^0.52.0",
-    "@effect/sql-pg": "4.0.0-beta.88",
+    "@effect/sql-pg": "4.0.0-beta.97",
     "@effect/sql-sqlite-wasm": "^0.53.0",
-    "alchemy": "2.0.0-beta.59",
+    "alchemy": "2.0.0-beta.62",
     "better-auth": "^1.6.23",
     "drizzle-orm": "1.0.0-rc.1",
-    "effect": "4.0.0-beta.88",
+    "effect": "4.0.0-beta.97",
     "pg": "^8.13.0",
     "typescript": "^5"
   },
   "devDependencies": {
+    "@foldkit/devtools-mcp": "^0.13.4",
+    "@foldkit/oxlint-plugin": "^0.4.0",
     "@types/bun": "latest",
     "@types/pg": "^8.11.0",
     "drizzle-kit": "1.0.0-rc.1",
     "oxfmt": "^0.57.0",
     "oxlint": "^1.72.0"
   },
-  "overrides": {
-    "@distilled.cloud/cloudflare-runtime": "0.12.0",
-    "@distilled.cloud/cloudflare-vite-plugin": "0.12.0",
-    "@distilled.cloud/cloudflare-rolldown-plugin": "0.12.0"
-  },
   "patchedDependencies": {
-    "alchemy@2.0.0-beta.59": "patches/alchemy@2.0.0-beta.59.patch"
+    "foldkit@0.131.0": "patches/foldkit@0.131.0.patch",
+    "@foldkit/ui@0.131.0": "patches/@foldkit%2Fui@0.131.0.patch"
   }
 }

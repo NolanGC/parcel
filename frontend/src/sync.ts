@@ -1,22 +1,45 @@
-// The SyncEngine: pulls one page of inbox threads from Gmail into a local
-// SQLite store and serves all reads (inbox list, open thread) from it.
+// The SyncEngine: Gmail → local SQLite, serving all reads (inbox list, open
+// thread) from the store. The sync machine (syncMachine.ts) drives the
+// network passes: primeInbox fills the first screen, syncBatch walks the
+// whole mailbox page by page, applyHistory replays Gmail's change feed.
 // Provided to the Foldkit runtime via `resources` in entry.ts.
 
-import { Context, Effect, Layer, Schema as S } from "effect";
+import {
+  Array as Arr,
+  Clock,
+  Context,
+  Effect,
+  Layer,
+  Option,
+  Schema as S,
+} from "effect";
 import { SqlClient } from "effect/unstable/sql";
 import type { SqlError } from "effect/unstable/sql/SqlError";
+import { ts } from "foldkit/schema";
 
 import {
   Gmail,
+  HistoryId,
   LabelId,
   MessageId,
   ThreadId,
   type GmailError,
+  type ListHistoryResponse,
   type Message as GmailMessage,
   type MessagePart,
+  type PageToken,
   type Thread as GmailThread,
 } from "./Gmail";
+import { BodyCodec, Compression, CompressionError } from "./compression";
+import {
+  IMAGE_CONCURRENCY,
+  ImageFetcher,
+  remoteImageUrls,
+  rewriteImageUrls,
+} from "./images";
+import { cleanSnippet } from "./snippet";
 import { SqlLive } from "./sql";
+import { HOT_THREAD_COUNT, OPENED_LRU_COUNT } from "./tiers";
 
 // Gmail's inbox tab categories, as they appear in system label ids
 // (CATEGORY_PERSONAL etc.). "none" = no category label on the thread.
@@ -64,6 +87,13 @@ export type ThreadDetail = typeof ThreadDetail.Type;
 
 // What the SELECTs below return. A mismatch is a bug in our own
 // schema/DDL pair, hence orDie at the call sites.
+//
+// Exported (with its column list and mapper) because search.ts selects the
+// same shape — one definition, so the list and the palette can't drift on
+// how a stored row becomes a ThreadRow.
+export const THREAD_ROW_COLUMNS =
+  "id, subject, snippet, participants, latest_date, is_unread, category";
+
 const DbThreadRow = S.Struct({
   id: ThreadId,
   subject: S.String,
@@ -74,6 +104,26 @@ const DbThreadRow = S.Struct({
   category: ThreadCategory,
 });
 const decodeDbRows = S.decodeUnknownEffect(S.Array(DbThreadRow));
+
+export const decodeThreadRows = (
+  raw: unknown,
+): Effect.Effect<ReadonlyArray<ThreadRow>> =>
+  decodeDbRows(raw).pipe(
+    Effect.orDie,
+    Effect.map((rows) =>
+      rows.map(
+        (row): ThreadRow => ({
+          id: row.id,
+          subject: row.subject,
+          sender: (JSON.parse(row.participants) as string[])[0] ?? "",
+          snippet: cleanSnippet(row.snippet),
+          date: row.latest_date,
+          unread: row.is_unread !== 0,
+          category: row.category,
+        }),
+      ),
+    ),
+  );
 
 const DbMessageRow = S.Struct({
   id: MessageId,
@@ -86,7 +136,8 @@ const decodeDbMessages = S.decodeUnknownEffect(S.Array(DbMessageRow));
 const DbBodyRow = S.Struct({
   message_id: MessageId,
   mime_type: S.String,
-  body: S.String,
+  data: S.instanceOf(Uint8Array),
+  codec: BodyCodec,
 });
 const decodeDbBodies = S.decodeUnknownEffect(S.Array(DbBodyRow));
 
@@ -98,8 +149,110 @@ const DbImageRow = S.Struct({
 });
 const decodeDbImages = S.decodeUnknownEffect(S.Array(DbImageRow));
 
+const DbRemoteImageRow = S.Struct({
+  url: S.String,
+  mime_type: S.String,
+  bytes: S.instanceOf(Uint8Array),
+});
+const decodeDbRemoteImages = S.decodeUnknownEffect(S.Array(DbRemoteImageRow));
+
+const DbUrlRow = S.Struct({ url: S.String });
+const decodeDbUrls = S.decodeUnknownEffect(S.Array(DbUrlRow));
+
+const DbThreadIdRow = S.Struct({ id: ThreadId });
+const decodeDbThreadIds = S.decodeUnknownEffect(S.Array(DbThreadIdRow));
+
+const DbCutoffRow = S.Struct({ latest_date: S.Number });
+const decodeDbCutoffs = S.decodeUnknownEffect(S.Array(DbCutoffRow));
+
 const DbSubjectRow = S.Struct({ subject: S.String });
 const decodeDbSubjects = S.decodeUnknownEffect(S.Array(DbSubjectRow));
+
+const DbSyncStateRow = S.Struct({
+  history_id: S.NullOr(HistoryId),
+  email: S.NullOr(S.String),
+  synced_count: S.Number,
+  total_estimate: S.Number,
+  backfill_done: S.Number,
+});
+const decodeDbSyncState = S.decodeUnknownEffect(S.Array(DbSyncStateRow));
+
+const DbCountRow = S.Struct({ n: S.Number });
+const decodeDbCounts = S.decodeUnknownEffect(S.Array(DbCountRow));
+
+// PRAGMA results come back named after the pragma itself.
+const decodeDbPragmaCounts = S.decodeUnknownEffect(
+  S.Array(S.Struct({ page_count: S.Number })),
+);
+const decodeDbPragmaSizes = S.decodeUnknownEffect(
+  S.Array(S.Struct({ page_size: S.Number })),
+);
+
+const DbThreadHistoryRow = S.Struct({
+  id: ThreadId,
+  history_id: S.NullOr(HistoryId),
+});
+const decodeDbThreadHistories = S.decodeUnknownEffect(
+  S.Array(DbThreadHistoryRow),
+);
+
+const DbMessageIdRow = S.Struct({ id: MessageId });
+const decodeDbMessageIds = S.decodeUnknownEffect(S.Array(DbMessageIdRow));
+
+// The sync machine's persisted knowledge: everything the machine needs to
+// re-derive its state after a refresh. No runtime state (page tokens, retry
+// attempts) is ever persisted — those die with the tab by design.
+export const SyncCheckpoint = S.Struct({
+  maybeHistoryId: S.Option(HistoryId),
+  isBackfillDone: S.Boolean,
+  syncedCount: S.Number,
+  totalEstimate: S.Number,
+});
+export type SyncCheckpoint = typeof SyncCheckpoint.Type;
+
+/** What primeInbox reports back to the machine. */
+export type PrimeResult = Readonly<{
+  historyId: HistoryId;
+  syncedCount: number;
+  totalEstimate: number;
+}>;
+
+/** What one backfill page reports back to the machine. */
+export type BatchResult = Readonly<{
+  syncedCount: number;
+  maybeNextPageToken: Option.Option<PageToken>;
+}>;
+
+/** What one image batch reports back to the page's prefetch loop.
+ *
+ *  `isIdle` means the queue came up empty, which is the loop's cue to slow
+ *  down rather than to stop — the backfill is usually still producing threads
+ *  for it to work on.
+ *
+ *  `isRecentReady` is the milestone: the hot window is full and every thread
+ *  in it has its images stored, so the mail you actually look at is entirely
+ *  local while the rest of the mailbox is still downloading. It is a real
+ *  crossing point rather than a gauge — the backfill walks newest-first and
+ *  only ever adds *older* threads, so once the store passes HOT_THREAD_COUNT
+ *  the window's membership stops changing and the image loop converges on it. */
+export type ImageBatchResult = Readonly<{
+  isIdle: boolean;
+  isRecentReady: boolean;
+}>;
+
+/** What a history pass reports back to the machine. Expired = Gmail forgot
+ *  the cursor (~a week); Overflowed = more changes than per-thread re-syncs
+ *  are worth (the machine full-resyncs instead — see HISTORY_RESYNC_CAP). */
+export const Applied = ts("Applied", {
+  historyId: HistoryId,
+  changedCount: S.Number,
+  syncedAt: S.Number,
+});
+export const Expired = ts("Expired", {});
+export const Overflowed = ts("Overflowed", {});
+
+export const HistoryResult = S.Union([Applied, Expired, Overflowed]);
+export type HistoryResult = typeof HistoryResult.Type;
 
 // Gmail body payloads are BASE64URL (-/_ alphabet), not btoa's +/.
 const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> => {
@@ -201,7 +354,38 @@ const latestDate = (messages: ReadonlyArray<GmailMessage>): number =>
 // SERVICE
 
 const INBOX = LabelId.make("INBOX");
+// The prime page: enough to fill the first screen.
 const PULL_LIMIT = 15;
+// One backfill page of thread stubs. threads.list costs 10 quota units
+// whatever the page size, so small pages are pure overhead — and every
+// page is re-walked by the skip-scan on resume. Held at 100 rather than
+// the 500 maximum only because one CompletedSyncBatch per page is also the
+// progress tick: at the ~19 threads/sec quota ceiling this reports in
+// every ~5s. Going higher wants progress decoupled from paging first.
+const LIST_PAGE_SIZE = 100;
+// How many threads are fetched and then committed together. Bounds how
+// many full thread payloads sit in memory at once; also the transaction
+// size, which is what stops every INSERT paying its own OPFS fsync.
+const SYNC_CHUNK_SIZE = 25;
+// Gmail allows 250 quota units/user/sec and the token bucket in Gmail.ts
+// paces to 200, so the ceiling is ~19 threads/sec (threads.get = 10 units).
+// 20 in flight is what it takes to actually reach it; the bucket — not this
+// number — is what keeps us under the quota.
+const SYNC_CONCURRENCY = 20;
+const HISTORY_PAGE_SIZE = 500;
+// Above this many changed threads, per-thread re-syncs are slower than a
+// fresh skip-scan walk — the machine resets to Priming instead.
+const HISTORY_RESYNC_CAP = 100;
+// Threads per image batch. Real mail carries ~13 remote images per message,
+// so this is ~100 proxy fetches per pass — small enough that the pill's
+// image counter moves visibly, large enough that the per-batch SQL overhead
+// disappears against the network.
+const IMAGE_BATCH_THREADS = 8;
+// Threads evicted per image batch. The eviction query is unbounded by nature
+// (everything past the LRU window is a candidate), so without a cap one turn
+// of a four-second loop walks the entire cold tail. Draining a slice per cycle
+// keeps each turn's cost flat no matter how large the store grows.
+const IMAGE_EVICT_BATCH = 64;
 
 export class SyncEngine extends Context.Service<SyncEngine>()(
   "parcel/SyncEngine",
@@ -209,6 +393,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
     make: Effect.gen(function* () {
       const gmail = yield* Gmail;
       const sql = yield* SqlClient.SqlClient;
+      const compression = yield* Compression;
+      const imageFetcher = yield* ImageFetcher;
 
       const upsertThread = (thread: GmailThread) => {
         const messages = thread.messages ?? [];
@@ -231,6 +417,13 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             message_count: messages.length,
             is_unread: messages.some((message) =>
               message.labelIds?.some((id) => id === UNREAD_LABEL),
+            )
+              ? 1
+              : 0,
+            // Archiving is just the removal of this label, so re-reading it
+            // on every sync is what lets a thread leave the local inbox.
+            in_inbox: messages.some((message) =>
+              message.labelIds?.some((id) => id === INBOX),
             )
               ? 1
               : 0,
@@ -265,18 +458,28 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const part = displayPart(message);
           const data = part?.body?.data;
           if (part === undefined || data === undefined) return;
+          // orDie: this gzips a string we just decoded ourselves, so a
+          // failure here is the platform misbehaving rather than anything a
+          // sync retry could fix. Keeping it out of the error channel is
+          // what stops CompressionError leaking into every sync signature.
+          const body = yield* compression
+            .compress(utf8.decode(base64UrlToBytes(data)))
+            .pipe(Effect.orDie);
           yield* sql`INSERT OR REPLACE INTO message_bodies ${sql.insert([
             {
               message_id: message.id,
               mime_type: part.mimeType ?? "text/plain",
-              body: utf8.decode(base64UrlToBytes(data)),
+              data: body.data,
+              codec: body.codec,
             },
           ])}`;
         });
 
       // Inline image bytes: small ones ride along in the payload, larger
-      // ones need the attachments endpoint.
-      const upsertInlineImages = (message: GmailMessage) =>
+      // ones need the attachments endpoint. Resolved during the fetch phase
+      // so the write phase is pure SQL — a transaction must never be held
+      // open across a network round-trip.
+      const resolveInlineImages = (message: GmailMessage) =>
         Effect.forEach(
           inlineImages(message),
           (image) =>
@@ -289,82 +492,629 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   ? undefined
                   : (yield* gmail.getAttachment(message.id, attachmentId))
                       .data);
-              if (data === undefined) return;
-              yield* sql`INSERT OR REPLACE INTO message_attachments ${sql.insert(
-                [
-                  {
-                    message_id: message.id,
-                    content_id: image.contentId,
-                    mime_type: image.mimeType,
-                    bytes: base64UrlToBytes(data),
-                  },
-                ],
-              )}`;
+              return data === undefined
+                ? []
+                : [
+                    {
+                      message_id: message.id,
+                      content_id: image.contentId,
+                      mime_type: image.mimeType,
+                      bytes: base64UrlToBytes(data),
+                    },
+                  ];
             }),
           { concurrency: 2 },
-        );
+        ).pipe(Effect.map((groups) => groups.flat()));
 
-      const syncThread = (id: ThreadId) =>
+      type FetchedThread = Readonly<{
+        thread: GmailThread;
+        images: ReadonlyArray<{
+          message_id: MessageId;
+          content_id: string;
+          mime_type: string;
+          bytes: Uint8Array;
+        }>;
+      }>;
+
+      // Everything network for one thread. `None` means Gmail 404'd it — the
+      // thread is gone (deleted, or its last message aged out of
+      // Spam/Trash), so the caller drops the local copy.
+      const fetchThread = (
+        id: ThreadId,
+      ): Effect.Effect<Option.Option<FetchedThread>, GmailError> =>
         Effect.gen(function* () {
           const thread = yield* gmail.getThread(id, "full");
+          const images = yield* Effect.forEach(
+            thread.messages ?? [],
+            resolveInlineImages,
+          ).pipe(Effect.map((groups) => groups.flat()));
+          return Option.some<FetchedThread>({ thread, images });
+        }).pipe(
+          Effect.catchTag("GmailNotFound", () =>
+            Effect.succeed(Option.none<FetchedThread>()),
+          ),
+        );
+
+      const persistThread = ({ thread, images }: FetchedThread) =>
+        Effect.gen(function* () {
           yield* upsertThread(thread);
           yield* Effect.forEach(thread.messages ?? [], (message) =>
-            Effect.all([
-              upsertMessage(thread.id, message),
-              upsertBody(message),
-              upsertInlineImages(message),
-            ]),
+            Effect.gen(function* () {
+              yield* upsertMessage(thread.id, message);
+              yield* upsertBody(message);
+            }),
+          );
+          yield* Effect.forEach(
+            images,
+            (image) =>
+              sql`INSERT OR REPLACE INTO message_attachments ${sql.insert([image])}`,
           );
         });
 
-      // The network pass: one page of inbox threads, fetched in full
-      // format and persisted with everything the UI needs to display them.
-      const syncInbox = Effect.gen(function* () {
+      // Fetch concurrently, then commit in one transaction per chunk.
+      // Splitting the phases is what makes the transaction safe (no network
+      // inside it) and what makes it worth having: previously every INSERT
+      // committed on its own, so a full backfill paid an fsync per statement
+      // rather than per chunk.
+      const syncThreads = (ids: ReadonlyArray<ThreadId>) =>
+        Effect.forEach(
+          Arr.chunksOf(ids, SYNC_CHUNK_SIZE),
+          (group) =>
+            Effect.forEach(
+              group,
+              (id) =>
+                fetchThread(id).pipe(
+                  Effect.map((maybeFetched) => ({ id, maybeFetched })),
+                ),
+              { concurrency: SYNC_CONCURRENCY },
+            ).pipe(
+              Effect.flatMap((fetched) =>
+                sql.withTransaction(
+                  Effect.forEach(
+                    fetched,
+                    ({ id, maybeFetched }) =>
+                      Option.match(maybeFetched, {
+                        onNone: () => deleteThreadLocal(id),
+                        onSome: persistThread,
+                      }),
+                    { discard: true },
+                  ),
+                ),
+              ),
+            ),
+          { discard: true },
+        );
+
+      const countLocalThreads = Effect.gen(function* () {
+        const raw = yield* sql`SELECT COUNT(*) AS n FROM threads`;
+        const rows = yield* decodeDbCounts(raw).pipe(Effect.orDie);
+        return rows[0]?.n ?? 0;
+      });
+
+      // On-disk size of the local store, from SQLite's own page accounting
+      // (the same number `bun sql --tables` reports). Surfaced in the sync
+      // pill's detail because a local-first client that quietly grows to a
+      // gigabyte should say so where you can see it.
+      const localSizeBytes = Effect.gen(function* () {
+        const pageCount = yield* sql`PRAGMA page_count`;
+        const pageSize = yield* sql`PRAGMA page_size`;
+        const counts = yield* decodeDbPragmaCounts(pageCount).pipe(
+          Effect.orDie,
+        );
+        const sizes = yield* decodeDbPragmaSizes(pageSize).pipe(Effect.orDie);
+        return (counts[0]?.page_count ?? 0) * (sizes[0]?.page_size ?? 0);
+      });
+
+      // The stubs from a threads.list page that the store has never seen.
+      // A page of already-stored threads costs one local SELECT and no
+      // fetches, which is what makes restarting the walk from the top cheap
+      // (the resume path after a refresh or an expired page token).
+      //
+      // Membership, deliberately — not a historyId comparison. The backfill
+      // exists to *fill*; keeping threads current is applyHistory's job, and
+      // it is already correct by construction: primeInbox captures the
+      // history cursor BEFORE the walk starts, so the first history pass
+      // replays every change that landed during it. Comparing the stub's
+      // historyId against the stored one added no correctness and, when the
+      // two disagreed for any reason, silently re-downloaded the entire
+      // mailbox on every resume while the progress counter sat still.
+      //
+      // Safe because persistThread writes a thread and its messages in one
+      // transaction: a thread row exists only if its messages do, so "we
+      // have this id" can be trusted to mean the thread is complete.
+      const unseenThreadIds = (stubs: ReadonlyArray<GmailThread>) =>
+        Effect.gen(function* () {
+          if (Arr.isReadonlyArrayEmpty(stubs)) return [];
+          const raw = yield* sql`
+            SELECT id, history_id FROM threads
+            WHERE ${sql.in(
+              "id",
+              stubs.map((stub) => stub.id),
+            )}
+          `;
+          const rows = yield* decodeDbThreadHistories(raw).pipe(Effect.orDie);
+          const local = new Set(rows.map((row) => row.id));
+          return stubs
+            .filter((stub) => !local.has(stub.id))
+            .map((stub) => stub.id);
+        });
+
+      // MACHINE PASSES
+
+      // Every local table, in foreign-key order. Used when the signed-in
+      // account changes: the store is one mailbox's worth of data keyed by
+      // nothing, so the only safe response to a different owner is to drop
+      // all of it.
+      const deleteAllLocal = sql.withTransaction(
+        Effect.forEach(
+          [
+            "message_attachments",
+            "message_images",
+            "message_bodies",
+            "message_labels",
+            "messages",
+            "threads",
+            "labels",
+            "outbox",
+            "sync_state",
+          ],
+          (table) => sql`DELETE FROM ${sql.literal(table)}`,
+          { discard: true },
+        ),
+      );
+
+      // `accountEmail` is the signed-in address, from the session — not from
+      // Gmail. A network call here could fail, and failing open would mean
+      // rendering the previous account's mail to whoever just signed in.
+      //
+      // The OPFS database is per-origin and holds exactly one mailbox with
+      // no owner column, so a mismatch is not a merge problem, it is a
+      // "this data belongs to someone else" problem. Wipe and re-prime.
+      const readCheckpoint = (accountEmail: string) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT history_id, email, synced_count, total_estimate, backfill_done
+            FROM sync_state WHERE id = 1
+          `;
+          const rows = yield* decodeDbSyncState(raw).pipe(Effect.orDie);
+          const row = rows[0];
+          if (row === undefined) return Option.none<SyncCheckpoint>();
+
+          if (row.email !== null && row.email !== accountEmail) {
+            yield* Effect.logInfo("mailbox owner changed; clearing local store");
+            yield* deleteAllLocal;
+            return Option.none<SyncCheckpoint>();
+          }
+
+          // total_estimate is otherwise only ever written by primeInbox, and a
+          // mailbox resuming mid-backfill never re-primes — so it would keep
+          // whatever number the last prime wrote, including one from before
+          // this counted the INBOX label instead of the whole mailbox.
+          // Refresh it once per boot, best-effort: a progress denominator is
+          // not worth failing a boot over.
+          const totalEstimate = yield* gmail.getLabel(INBOX).pipe(
+            Effect.map((label) => label.threadsTotal ?? row.total_estimate),
+            Effect.catchCause(() => Effect.succeed(row.total_estimate)),
+          );
+          if (totalEstimate !== row.total_estimate) {
+            yield* sql`
+              UPDATE sync_state SET total_estimate = ${totalEstimate} WHERE id = 1
+            `;
+          }
+
+          return Option.some<SyncCheckpoint>({
+            maybeHistoryId: Option.fromNullishOr(row.history_id),
+            isBackfillDone: row.backfill_done !== 0,
+            syncedCount: row.synced_count,
+            totalEstimate,
+          });
+        });
+
+      // The first-screen pass: capture the history cursor BEFORE pulling
+      // anything (changes during the long backfill are then replayed by the
+      // first applyHistory), sync the newest page, stamp the checkpoint.
+      const primeInbox: Effect.Effect<
+        PrimeResult,
+        GmailError | SqlError
+      > = Effect.gen(function* () {
+        const profile = yield* gmail.getProfile;
+        // The backfill only ever walks INBOX, so the progress denominator
+        // has to be the INBOX label's own count. profile.threadsTotal counts
+        // the entire mailbox — All Mail, Sent, Spam, Trash — which reads as
+        // a bar that stalls at a few percent and then declares itself done.
+        // One extra quota unit for a number that isn't a lie.
+        const inboxLabel = yield* gmail.getLabel(INBOX);
+        const totalEstimate = inboxLabel.threadsTotal ?? profile.threadsTotal;
         const page = yield* gmail.listThreads({
           labelIds: [INBOX],
           maxResults: PULL_LIMIT,
         });
-        yield* Effect.forEach(
-          page.threads ?? [],
-          (stub) => syncThread(stub.id),
-          { concurrency: 4 },
-        );
+        yield* syncThreads(yield* unseenThreadIds(page.threads ?? []));
+        const syncedCount = yield* countLocalThreads;
+        const syncedAt = yield* Clock.currentTimeMillis;
+        yield* sql`
+          INSERT INTO sync_state (id, history_id, email, last_synced_at, synced_count, total_estimate, backfill_done)
+          VALUES (1, ${profile.historyId}, ${profile.emailAddress}, ${syncedAt}, ${syncedCount}, ${totalEstimate}, 0)
+          ON CONFLICT (id) DO UPDATE SET
+            history_id = excluded.history_id,
+            email = excluded.email,
+            last_synced_at = excluded.last_synced_at,
+            synced_count = excluded.synced_count,
+            total_estimate = excluded.total_estimate,
+            backfill_done = 0
+        `;
+        return {
+          historyId: profile.historyId,
+          syncedCount,
+          totalEstimate,
+        };
       });
 
+      // One backfill page: list LIST_PAGE_SIZE stubs, fetch only the stale
+      // ones, stamp progress. The checkpoint stores counts (knowledge),
+      // never the page token (runtime state) — a resumed walk re-lists
+      // from the top and skip-scans, see staleThreadIds.
+      //
+      // `previousCount` comes from the machine's own Backfilling state, so
+      // progress advances by addition. The last page reconciles against a
+      // real COUNT(*): additions can drift from the truth if applyHistory
+      // deleted a thread mid-walk, and "done" is the one moment the number
+      // is worth being exact about.
+      const syncBatch = (
+        maybePageToken: Option.Option<PageToken>,
+        previousCount: number,
+      ): Effect.Effect<BatchResult, GmailError | SqlError> =>
+        Effect.gen(function* () {
+          const page = yield* gmail.listThreads({
+            labelIds: [INBOX],
+            maxResults: LIST_PAGE_SIZE,
+            ...Option.match(maybePageToken, {
+              onNone: () => ({}),
+              onSome: (pageToken) => ({ pageToken }),
+            }),
+          });
+          const unseen = yield* unseenThreadIds(page.threads ?? []);
+          yield* syncThreads(unseen);
+          const maybeNextPageToken = Option.fromNullishOr(page.nextPageToken);
+          const isDone = Option.isNone(maybeNextPageToken);
+          const syncedCount = isDone
+            ? yield* countLocalThreads
+            : previousCount + unseen.length;
+          const syncedAt = yield* Clock.currentTimeMillis;
+          yield* sql`
+            UPDATE sync_state SET
+              synced_count = ${syncedCount},
+              backfill_done = ${isDone ? 1 : 0},
+              last_synced_at = ${syncedAt}
+            WHERE id = 1
+          `;
+          return { syncedCount, maybeNextPageToken };
+        });
+
+      const deleteMessagesLocal = (ids: ReadonlyArray<MessageId>) =>
+        Effect.forEach(ids, (id) =>
+          Effect.all([
+            sql`DELETE FROM message_attachments WHERE message_id = ${id}`,
+            sql`DELETE FROM message_images WHERE message_id = ${id}`,
+            sql`DELETE FROM message_bodies WHERE message_id = ${id}`,
+            sql`DELETE FROM message_labels WHERE message_id = ${id}`,
+            sql`DELETE FROM messages WHERE id = ${id}`,
+          ]),
+        );
+
+      const deleteThreadLocal = (id: ThreadId) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`SELECT id FROM messages WHERE thread_id = ${id}`;
+          const rows = yield* decodeDbMessageIds(raw).pipe(Effect.orDie);
+          yield* deleteMessagesLocal(rows.map((row) => row.id));
+          yield* sql`DELETE FROM threads WHERE id = ${id}`;
+        });
+
+      // The incremental pass: everything that changed since the cursor,
+      // applied locally. Cheap when nothing changed (one request), targeted
+      // when something did (full re-sync of just the touched threads).
+      const applyHistory = (
+        startHistoryId: HistoryId,
+      ): Effect.Effect<HistoryResult, GmailError | SqlError> =>
+        Effect.gen(function* () {
+          const touched = new Set<ThreadId>();
+          const deletedMessages: Array<MessageId> = [];
+          let latest = startHistoryId;
+          let pageToken: PageToken | undefined = undefined;
+
+          do {
+            const page: ListHistoryResponse = yield* gmail.listHistory({
+              startHistoryId,
+              maxResults: HISTORY_PAGE_SIZE,
+              ...(pageToken === undefined ? {} : { pageToken }),
+            });
+            for (const record of page.history ?? []) {
+              for (const added of record.messagesAdded ?? []) {
+                touched.add(added.message.threadId);
+              }
+              for (const removed of record.messagesDeleted ?? []) {
+                deletedMessages.push(removed.message.id);
+                touched.add(removed.message.threadId);
+              }
+              for (const change of [
+                ...(record.labelsAdded ?? []),
+                ...(record.labelsRemoved ?? []),
+              ]) {
+                touched.add(change.message.threadId);
+              }
+            }
+            if (page.historyId !== undefined) latest = page.historyId;
+            pageToken = page.nextPageToken;
+          } while (pageToken !== undefined);
+
+          if (touched.size > HISTORY_RESYNC_CAP) {
+            return Overflowed();
+          }
+
+          yield* deleteMessagesLocal(deletedMessages);
+          // syncThreads already treats a 404 as "the thread is gone" and
+          // drops the local copy, which is exactly the history case too.
+          yield* syncThreads([...touched]);
+
+          const syncedAt = yield* Clock.currentTimeMillis;
+          yield* sql`
+            UPDATE sync_state SET history_id = ${latest}, last_synced_at = ${syncedAt}
+            WHERE id = 1
+          `;
+          return Applied({
+            historyId: latest,
+            changedCount: touched.size,
+            syncedAt,
+          });
+        }).pipe(
+          // On listHistory a 404 means the cursor expired, not a missing
+          // resource — the machine full-resyncs from Priming.
+          Effect.catchTag("GmailNotFound", () =>
+            Effect.succeed(Expired()),
+          ),
+        );
+
+      // IMAGE PASS
+      //
+      // Runs as its own loop, concurrently with the Gmail backfill above,
+      // because the two are bound by different things: the backfill by
+      // Gmail's quota bucket, this by the proxy and the browser's connection
+      // pool. Sequencing them would idle whichever resource wasn't in use.
+      //
+      // Work is queued in the threads table rather than a separate queue:
+      // images_cached_at = 0 means pending, and that is decidable from the
+      // same row the backfill already writes.
+
+      // The boundary of the hot window: the latest_date of the
+      // HOT_THREAD_COUNT-th newest thread. Below HOT_THREAD_COUNT threads
+      // there is no row at that offset and everything is hot, which is
+      // exactly right for a mailbox mid-backfill.
+      const hotCutoffDate = Effect.gen(function* () {
+        const raw = yield* sql`
+          SELECT latest_date FROM threads
+          WHERE in_inbox = 1
+          ORDER BY latest_date DESC
+          LIMIT 1 OFFSET ${HOT_THREAD_COUNT - 1}
+        `;
+        const rows = yield* decodeDbCutoffs(raw).pipe(Effect.orDie);
+        return rows[0]?.latest_date ?? 0;
+      });
+
+      // The queue, in priority order: threads you opened come first (their
+      // images are wanted now), then the hot window newest-first. Threads
+      // outside the window that you never opened are never prefetched —
+      // that is the tier.
+      const pendingImageThreadIds = (cutoffDate: number) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT id FROM threads
+            WHERE images_cached_at = 0
+              AND (images_used_at > 0 OR latest_date >= ${cutoffDate})
+            ORDER BY images_used_at DESC, latest_date DESC
+            LIMIT ${IMAGE_BATCH_THREADS}
+          `;
+          const rows = yield* decodeDbThreadIds(raw).pipe(Effect.orDie);
+          return rows.map((row) => row.id);
+        });
+
+      // Every remote url one thread references that isn't already stored.
+      // Bodies are the source: they are already local, so building the work
+      // list costs no network at all.
+      const uncachedImageUrls = (id: ThreadId) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT b.message_id, b.mime_type, b.data, b.codec
+            FROM message_bodies b
+            JOIN messages m ON m.id = b.message_id
+            WHERE m.thread_id = ${id}
+          `;
+          const bodies = yield* decodeDbBodies(raw).pipe(Effect.orDie);
+
+          const wanted = new Map<string, MessageId>();
+          for (const stored of bodies) {
+            if (stored.mime_type !== "text/html") continue;
+            // A body that won't decompress costs its own images, nothing
+            // more — this pass is an optimization and must never be the
+            // thing that fails a sync.
+            const body = yield* compression
+              .decompress(stored)
+              .pipe(Effect.catchCause(() => Effect.succeed("")));
+            for (const url of remoteImageUrls(body)) {
+              if (!wanted.has(url)) wanted.set(url, stored.message_id);
+            }
+          }
+
+          // `sql.in` with an empty list is a syntax error, and a thread with
+          // no remote images at all is the common case.
+          if (wanted.size === 0) return [];
+          const knownRaw = yield* sql`
+            SELECT url FROM message_images
+            WHERE ${sql.in("message_id", [...new Set(wanted.values())])}
+          `;
+          const known = new Set(
+            (yield* decodeDbUrls(knownRaw).pipe(Effect.orDie)).map(
+              (row) => row.url,
+            ),
+          );
+
+          return [...wanted]
+            .filter(([url]) => !known.has(url))
+            .map(([url, messageId]) => ({ url, messageId }));
+        });
+
+      // Fetch first, then commit — same split as the thread sync, and for
+      // the same reason: a transaction must not be held open across the
+      // network.
+      const cacheThreadImages = (id: ThreadId) =>
+        Effect.gen(function* () {
+          const wanted = yield* uncachedImageUrls(id);
+          const fetched = yield* Effect.forEach(
+            wanted,
+            ({ url, messageId }) =>
+              imageFetcher
+                .fetchImage(url)
+                .pipe(
+                  Effect.map(
+                    Option.map((image) => ({
+                      message_id: messageId,
+                      url,
+                      mime_type: image.mimeType,
+                      bytes: image.bytes,
+                    })),
+                  ),
+                ),
+            { concurrency: IMAGE_CONCURRENCY },
+          ).pipe(Effect.map(Arr.getSomes));
+
+          const cachedAt = yield* Clock.currentTimeMillis;
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              yield* Effect.forEach(
+                fetched,
+                (row) =>
+                  sql`INSERT OR REPLACE INTO message_images ${sql.insert([row])}`,
+                { discard: true },
+              );
+              // Stamped even when nothing was fetched: a thread whose images
+              // are all dead links is *done*, and leaving it at 0 would put
+              // it back at the head of the queue forever.
+              yield* sql`
+                UPDATE threads SET images_cached_at = ${cachedAt} WHERE id = ${id}
+              `;
+            }),
+          );
+        });
+
+      // Bounded storage: outside the hot window we keep only the
+      // OPENED_LRU_COUNT most recently opened threads' images. Evicted
+      // threads go back to images_used_at = 0 — cold again, and so out of
+      // the queue rather than churning straight back into it.
+      //
+      // Capped per cycle and folded into a single transaction. Selecting the
+      // whole cold tail and opening a transaction per thread cost one worker
+      // round trip each, so a large store spent hundreds of milliseconds of
+      // main thread time every four seconds, which lands as dropped frames in
+      // whatever happens to be animating. The leftovers drain on later turns.
+      const evictColdImages = (cutoffDate: number) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT id FROM threads
+            WHERE images_cached_at > 0 AND latest_date < ${cutoffDate}
+            ORDER BY images_used_at DESC, latest_date DESC
+            LIMIT ${IMAGE_EVICT_BATCH} OFFSET ${OPENED_LRU_COUNT}
+          `;
+          const rows = yield* decodeDbThreadIds(raw).pipe(Effect.orDie);
+          // `sql.in` with an empty list is a syntax error.
+          if (Arr.isReadonlyArrayEmpty(rows)) return;
+          const ids = rows.map((row) => row.id);
+          yield* sql.withTransaction(
+            Effect.all([
+              sql`
+                DELETE FROM message_images WHERE message_id IN
+                  (SELECT id FROM messages WHERE ${sql.in("thread_id", ids)})
+              `,
+              sql`
+                UPDATE threads
+                SET images_cached_at = 0, images_used_at = 0
+                WHERE ${sql.in("id", ids)}
+              `,
+            ]),
+          );
+        });
+
+      // Requires a *full* window, not just an empty queue: on a mailbox of
+      // 300 threads mid-backfill the queue also runs dry, and reporting "your
+      // latest 1,000 are ready" there would be a claim about threads that
+      // haven't been downloaded yet.
+      const isHotWindowReady = (cutoffDate: number) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT
+              (SELECT COUNT(*) FROM threads WHERE in_inbox = 1) AS total,
+              (SELECT COUNT(*) FROM threads
+                WHERE in_inbox = 1
+                  AND latest_date >= ${cutoffDate}
+                  AND images_cached_at = 0) AS pending
+          `;
+          const rows = yield* S.decodeUnknownEffect(
+            S.Array(S.Struct({ total: S.Number, pending: S.Number })),
+          )(raw).pipe(Effect.orDie);
+          const row = rows[0];
+          return (
+            row !== undefined &&
+            row.total >= HOT_THREAD_COUNT &&
+            row.pending === 0
+          );
+        });
+
+      const cacheImageBatch: Effect.Effect<ImageBatchResult, SqlError> =
+        Effect.gen(function* () {
+          const cutoffDate = yield* hotCutoffDate;
+          const ids = yield* pendingImageThreadIds(cutoffDate);
+          yield* Effect.forEach(ids, cacheThreadImages, { discard: true });
+          yield* evictColdImages(cutoffDate);
+          return {
+            isIdle: Arr.isReadonlyArrayEmpty(ids),
+            isRecentReady: yield* isHotWindowReady(cutoffDate),
+          };
+        });
+
+      // READS
+
+      // The whole store, newest first. VirtualList renders a fixed window
+      // regardless of length, so the full mailbox rides in the model.
       const selectInbox = Effect.gen(function* () {
         const raw = yield* sql`
-          SELECT id, subject, snippet, participants, latest_date, is_unread, category
+          SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
           FROM threads
+          WHERE in_inbox = 1
           ORDER BY latest_date DESC
-          LIMIT ${PULL_LIMIT}
         `;
-        const rows = yield* decodeDbRows(raw).pipe(Effect.orDie);
-        return rows.map(
-          (row): ThreadRow => ({
-            id: row.id,
-            subject: row.subject,
-            sender: (JSON.parse(row.participants) as string[])[0] ?? "",
-            snippet: row.snippet,
-            date: row.latest_date,
-            unread: row.is_unread !== 0,
-            category: row.category,
-          }),
-        );
+        return yield* decodeThreadRows(raw);
       });
 
-      // Local-first: a synced store answers straight from SQLite; only an
-      // empty store triggers the sync pass first.
-      const loadInbox = Effect.gen(function* () {
-        const local = yield* selectInbox;
-        if (local.length > 0) return local;
-        yield* syncInbox;
-        return yield* selectInbox;
-      });
+      // Local-first: reads never touch the network. Filling the store is
+      // entirely the sync machine's job.
+      const loadInbox = selectInbox;
 
-      // Inline image bytes reach the html as blob: urls (not data: URIs —
-      // inlining megabytes of base64 into the body string is slow and can
-      // OOM the tab). Each thread's urls are revoked on its next load.
-      const threadObjectUrls = new Map<ThreadId, Array<string>>();
+      // Image bytes reach the html as blob: urls (not data: URIs — inlining
+      // megabytes of base64 into the body string is slow and can OOM the
+      // tab).
+      //
+      // One registry for the whole engine, not one per thread. A blob: url
+      // pins its bytes in memory until it is revoked, and only one thread is
+      // ever on screen, so everything from the previous open is garbage the
+      // moment the next one starts. Keying this by thread — revoking only
+      // the urls of the thread being *re*-opened — leaked every other
+      // thread's images for the life of the tab: at ~13 remote images per
+      // thread averaging 76 KB, about a megabyte per thread opened, forever.
+      // (It was invisible before remote images: `cid:` attachments are 47
+      // rows in a 30,000-thread store.)
+      const liveObjectUrls: Array<string> = [];
+      const revokeObjectUrls = Effect.sync(() => {
+        for (const url of liveObjectUrls) URL.revokeObjectURL(url);
+        liveObjectUrls.length = 0;
+      });
       const registerObjectUrl = (
         registry: Array<string>,
         mimeType: string,
@@ -395,16 +1145,13 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           `;
           const rows = yield* decodeDbMessages(rowsRaw).pipe(Effect.orDie);
 
-          for (const url of threadObjectUrls.get(id) ?? []) {
-            URL.revokeObjectURL(url);
-          }
-          const objectUrls: Array<string> = [];
-          threadObjectUrls.set(id, objectUrls);
+          yield* revokeObjectUrls;
+          const objectUrls = liveObjectUrls;
 
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {
               const bodyRaw = yield* sql`
-                SELECT message_id, mime_type, body
+                SELECT message_id, mime_type, data, codec
                 FROM message_bodies
                 WHERE message_id = ${row.id}
               `;
@@ -419,14 +1166,41 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
               const images = yield* decodeDbImages(imagesRaw).pipe(
                 Effect.orDie,
               );
+              const remoteRaw = yield* sql`
+                SELECT url, mime_type, bytes
+                FROM message_images
+                WHERE message_id = ${row.id}
+              `;
+              const remote = yield* decodeDbRemoteImages(remoteRaw).pipe(
+                Effect.orDie,
+              );
 
-              let body = stored?.body ?? "";
+              // Decompress before the cid: rewrite below — that is a string
+              // replacement and this is where the string comes from.
+              let body =
+                stored === undefined
+                  ? ""
+                  : yield* compression.decompress(stored);
               for (const image of images) {
                 body = body.replaceAll(
                   `cid:${image.content_id}`,
                   registerObjectUrl(objectUrls, image.mime_type, image.bytes),
                 );
               }
+              // Cached remote images become blobs too, so the render is
+              // local and the sender's tracking pixels never fire on open.
+              // Uncached urls are left alone — they load live, exactly as
+              // they did before, which is what keeps a cold thread readable
+              // rather than half-broken.
+              body = rewriteImageUrls(
+                body,
+                new Map(
+                  remote.map((image) => [
+                    image.url,
+                    registerObjectUrl(objectUrls, image.mime_type, image.bytes),
+                  ]),
+                ),
+              );
 
               return {
                 id: row.id,
@@ -441,17 +1215,45 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             }),
           );
 
+          // The LRU stamp, and the only way a thread outside the hot window
+          // ever enters the image queue: opening it is the signal that its
+          // images are worth keeping. The next batch picks it up, so this
+          // open renders remote images live and every later one is local.
+          const usedAt = yield* Clock.currentTimeMillis;
+          yield* sql`
+            UPDATE threads SET images_used_at = ${usedAt} WHERE id = ${id}
+          `;
+
           return { id, subject, messages } satisfies ThreadDetail;
         });
 
-      return { loadInbox, loadThread, syncInbox } as const;
+      return {
+        cacheImageBatch,
+        loadInbox,
+        loadThread,
+        localSizeBytes,
+        readCheckpoint,
+        primeInbox,
+        syncBatch,
+        applyHistory,
+      } as const;
     }),
   },
 ) {
   static readonly layer = Layer.effect(this, this.make).pipe(
-    Layer.provide(Layer.mergeAll(Gmail.layer, SqlLive)),
+    Layer.provide(
+      Layer.mergeAll(
+        Gmail.layer,
+        SqlLive,
+        Compression.layer,
+        ImageFetcher.layer,
+      ),
+    ),
   );
 }
 
-export type LoadInboxError = GmailError | SqlError;
-export type LoadThreadError = SqlError;
+export type LoadInboxError = SqlError;
+// Decompression is in this path and can fail on bytes that don't match their
+// stored codec. That surfaces as FailedLoadThread rather than dying: a single
+// corrupt body should cost you that thread, not the app.
+export type LoadThreadError = SqlError | CompressionError;

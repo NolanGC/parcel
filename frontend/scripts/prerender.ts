@@ -23,10 +23,35 @@ if (!baseHtml.includes(ROOT_PLACEHOLDER)) {
 
 GlobalRegistrator.register({ url: "http://localhost/" });
 
-const [{ Runtime }, main] = await Promise.all([
+const [{ Runtime }, { Layer }, main, auth, sync, search] = await Promise.all([
   import("foldkit"),
+  import("effect"),
   import("../src/main"),
+  import("../src/auth"),
+  import("../src/sync"),
+  import("../src/search"),
 ]);
+
+// The application's resource layer is all-or-nothing at the type level, but
+// the landing page is logged out: the only Command init issues at "/" is
+// CheckSession, which needs AuthClient and nothing else. SyncEngine and
+// Search both build a SQLite worker over OPFS, which does not exist under
+// happy-dom, so providing the real layers here either dies in the migrations
+// or hangs waiting for a worker that never boots.
+//
+// AuthClient and the session store are real (both are safe outside a browser:
+// one constructs a fetch wrapper, the other reads happy-dom's localStorage).
+// The two database services are stubs that throw on any access, so if a
+// future landing page starts reading the local store this fails loudly here
+// instead of quietly prerendering an empty shell.
+const unreachable = <Service extends object>(name: string): Service =>
+  new Proxy({} as Service, {
+    get: (_target, property) => {
+      throw new Error(
+        `Prerendering "/" reached ${name}.${String(property)}, which has no local database under happy-dom.`,
+      );
+    },
+  });
 
 const container = document.createElement("div");
 container.id = "root";
@@ -42,6 +67,12 @@ Runtime.run(
     view: main.view,
     subscriptions: main.subscriptions,
     managedResources: main.managedResources,
+    resources: Layer.mergeAll(
+      auth.AuthClient.layer,
+      auth.sessionStorageLayer,
+      Layer.succeed(sync.SyncEngine, unreachable("SyncEngine")),
+      Layer.succeed(search.Search, unreachable("Search")),
+    ),
     container,
     routing: {
       onUrlRequest: (request) => main.ClickedLink({ request }),

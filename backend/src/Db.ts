@@ -1,15 +1,15 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
-import * as Planetscale from "alchemy/Planetscale";
+import * as Neon from "alchemy/Neon";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 /**
  * Provider-agnostic Postgres service. Anything that needs a database
- * depends on this tag — never on Neon or PlanetScale directly. Swap
- * providers via the `PostgresLive` export below.
+ * depends on this tag — never on the provider directly. Swap providers by
+ * pointing the `PostgresLive` export at a different layer.
  */
 export class Postgres extends Context.Service<
   Postgres,
@@ -26,45 +26,36 @@ const Schema = Drizzle.Schema("app-schema", {
   out: "./migrations",
 });
 
-export const PlanetscalePostgresLive = Layer.effect(
+export const NeonPostgresLive = Layer.effect(
   Postgres,
   Effect.gen(function* () {
     const { stage } = yield* Alchemy.Stack;
     const schema = yield* Schema;
 
-    // Two persistent databases total: `production` and `staging` each own
-    // one. Every other stage (local `bun dev`, `pr-*` previews, and the integ
-    // `test` stage) refs the staging database and gets its own isolated
-    // branch on it — near-instant, no cluster provisioning. Those stages
-    // therefore require staging to have been deployed at least once (push to
-    // main, or `alchemy deploy --stage staging`).
-    const ownsDatabase = stage === "production" || stage === "staging";
-    const database = ownsDatabase
-      ? yield* Planetscale.PostgresDatabase("app-db", {
-          region: { slug: "us-east" },
-          clusterSize: "PS_10",
-        })
-      : yield* Planetscale.PostgresDatabase.ref("app-db", {
-          stage: "staging",
-        });
+    // Two projects total: `production` and `staging` each own one. Every
+    // other stage (local `bun dev`, `pr-*` previews, and the integ `test`
+    // stage) refs the staging project and gets its own isolated branch on it.
+    // Branches are copy-on-write, so a preview costs nothing until written to.
+    // Those stages therefore require staging to have been deployed at least
+    // once (push to main, or `alchemy deploy --stage staging`).
+    const ownsProject = stage === "production" || stage === "staging";
+    const project = ownsProject
+      ? yield* Neon.Project("app-project", { region: "aws-us-east-1" })
+      : yield* Neon.Project.ref("app-project", { stage: "staging" });
 
-    const branch = yield* Planetscale.PostgresBranch("app-branch", {
-      database,
+    // The branch carries its own role, and `origin` already holds connectable
+    // credentials, so there is no separate role resource to declare here.
+    const branch = yield* Neon.Branch("app-project-branch", {
+      project,
       migrationsDir: schema.out,
     });
 
-    const role = yield* Planetscale.PostgresRole("app-role", {
-      database,
-      branch,
-      inheritedRoles: ["postgres"],
-    });
-
-    return { origin: role.origin, branchId: branch.name };
+    return { origin: branch.origin, branchId: branch.branchId };
   }),
 );
 
 /** The active database provider. */
-export const PostgresLive = PlanetscalePostgresLive;
+export const PostgresLive = NeonPostgresLive;
 
 export const Hyperdrive = Effect.gen(function* () {
   const { origin } = yield* Postgres;

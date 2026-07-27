@@ -373,6 +373,43 @@ html.transitioning *::after {
 }
 
 /* ============================================================================
+   fk-braille — the sync spinner. The ten-frame Unicode braille cycle
+   (U+2800 block) from grixate/dot-loaders, replicated here rather than
+   pulled in: it is one keyframe list and no dependency.
+
+   Driven by animating `content` on a pseudo-element, so it costs no model
+   state, no timer message, and no re-render per frame — the compositor owns
+   it. Ten frames at 80ms is the conventional cadence.
+============================================================================ */
+
+.fk-braille::before {
+  content: "\2800";
+  animation: fk-braille-spin 800ms steps(1, end) infinite;
+}
+
+@keyframes fk-braille-spin {
+  0%   { content: "\280B"; }
+  10%  { content: "\2819"; }
+  20%  { content: "\2839"; }
+  30%  { content: "\2838"; }
+  40%  { content: "\283C"; }
+  50%  { content: "\2834"; }
+  60%  { content: "\2826"; }
+  70%  { content: "\2827"; }
+  80%  { content: "\2807"; }
+  90%  { content: "\280F"; }
+}
+
+/* Reduced motion: hold a single frame rather than cycling. The element still
+   marks "work in progress" through the surrounding label and aria-live. */
+@media (prefers-reduced-motion: reduce) {
+  .fk-braille::before {
+    animation: none;
+    content: "\283F";
+  }
+}
+
+/* ============================================================================
    6. HIDDEN SCROLLBARS
    ----------------------------------------------------------------------------
    Scrolling still works everywhere; the bars just never paint.

@@ -4,6 +4,7 @@ import { Runtime } from "foldkit";
 import { overlay } from "@foldkit/devtools";
 
 import { AuthClient, sessionStorageLayer } from "./auth";
+import { Search } from "./search";
 import { SyncEngine } from "./sync";
 import {
   ChangedUrl,
@@ -32,10 +33,15 @@ const application = Runtime.makeApplication({
   // orDie: resources must be a never-failing layer, and SyncEngine's
   // build runs the local database migrations — if those fail the app has
   // no working store, so dying (crash screen) is the honest outcome.
+  //
+  // Search and SyncEngine each provide SqlLive, and Layer memoizes by
+  // reference within one build — so they share a single worker, a single
+  // OPFS handle, and one migration run.
   resources: Layer.mergeAll(
     AuthClient.layer,
     sessionStorageLayer,
     Layer.orDie(SyncEngine.layer),
+    Layer.orDie(Search.layer),
   ),
   container: document.getElementById("root"),
   routing: {

@@ -1,22 +1,15 @@
 import { Dialog as BaseDialog } from "@foldkit/ui";
-import { Effect, Option, Schema as S } from "effect";
+import { Array as Arr, Effect, Match as M, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { evo } from "foldkit/struct";
 
-import { icon, type IconView } from "./icon";
+import { icon, type IconNode, type IconView } from "./icon";
 import { paletteBackdrop, palettePanel } from "./motion";
 import { measureRect, Rect } from "./rect";
 import { DIALOG_OFFSET, elevate, surface, type SurfaceLevel } from "./surface";
-import {
-  ArrowDown,
-  ArrowUp,
-  Command as CommandKey,
-  CornerDownLeft,
-  Search,
-  Settings,
-} from "lucide";
+import { CommandIcon, Search01Icon } from "@hugeicons/core-free-icons";
 
 /**
  * FoldkitUI · Palette — a ⌘K command palette composed from Fluid
@@ -32,10 +25,11 @@ import {
  * - Labels: the active row lifts weight via `weightLabel`, no reflow.
  *
  * Behavior rides @foldkit/ui's Dialog (native <dialog>, focus trap, scroll
- * lock, Esc, animation lifecycle). Filtering is a pure view-side function
- * over the static corpus in `viewInputs.groups` — no command round-trip per
- * keystroke; the only DOM work is re-measuring row rects (a Command, same
- * pattern as Menu). Items are plain strings, so this module mirrors Menu's
+ * lock, Esc, animation lifecycle). This module does no matching: the parent
+ * owns the query (`model.query`) and supplies `groups` already filtered and
+ * ranked for it — the inbox's Search service. The view renders them in the
+ * order given. DOM work is limited to re-measuring row rects (a Command,
+ * same pattern as Menu). Items are plain strings, so this mirrors Menu's
  * `create<Item>()` factory: `update` returns the selected Item as an
  * out-value and closes itself.
  */
@@ -73,21 +67,21 @@ const itemId = (id: string, index: number): string => `${id}-item-${index}`;
 
 // MESSAGE
 
-export const GotDialogMessage = m("PaletteGotDialogMessage", {
+export const GotDialogMessage = m("GotDialogMessage", {
   message: BaseDialog.Message,
 });
-export const ChangedQuery = m("PaletteChangedQuery", { query: S.String });
+export const ChangedQuery = m("ChangedQuery", { query: S.String });
 /** Arrow-key movement; `count` rides along because only the view knows the
  *  filtered result length. */
-export const MovedActive = m("PaletteMovedActive", {
+export const MovedActive = m("MovedActive", {
   delta: S.Number,
   count: S.Number,
 });
-export const PointedItem = m("PalettePointedItem", { index: S.Number });
+export const PointedItem = m("PointedItem", { index: S.Number });
 /** Click or Enter. The view resolves `activeIndex` to the concrete item, so
  *  update never needs to re-run the filter. */
-export const PickedItem = m("PalettePickedItem", { item: S.String });
-export const GotItemRects = m("PaletteGotItemRects", {
+export const SelectedItem = m("SelectedItem", { item: S.String });
+export const MeasuredItemRects = m("MeasuredItemRects", {
   rects: S.Array(Rect),
 });
 
@@ -96,8 +90,8 @@ export const Message = S.Union([
   ChangedQuery,
   MovedActive,
   PointedItem,
-  PickedItem,
-  GotItemRects,
+  SelectedItem,
+  MeasuredItemRects,
 ]);
 export type Message = typeof Message.Type;
 
@@ -106,10 +100,10 @@ export type Message = typeof Message.Type;
 // Measures the rendered result rows relative to the results container (the
 // offsetParent). Row count is discovered by probing ids, so the command
 // doesn't need to know the filter's output length.
-const MeasureItemRects = Command.define(
-  "MeasurePaletteItemRects",
+export const MeasureItemRects = Command.define(
+  "MeasureItemRects",
   { id: S.String },
-  GotItemRects,
+  MeasuredItemRects,
 )(({ id }) =>
   Effect.sync(() => {
     const rects: Array<Rect> = [];
@@ -118,28 +112,9 @@ const MeasureItemRects = Command.define(
       if (!(element instanceof HTMLElement)) break;
       rects.push(measureRect(element));
     }
-    return GotItemRects({ rects });
+    return MeasuredItemRects({ rects });
   }),
 );
-
-// FILTERING
-//
-// Pure and cheap: one pass per item per keystroke, no allocation beyond the
-// result arrays. Prefix beats word-boundary beats substring beats
-// subsequence; zero drops the item.
-
-const matchScore = (query: string, text: string): number => {
-  if (query === "") return 1;
-  const t = text.toLowerCase();
-  const foundAt = t.indexOf(query);
-  if (foundAt === 0) return 4;
-  if (foundAt > 0) return t[foundAt - 1] === " " ? 3 : 2;
-  let matched = 0;
-  for (let i = 0; i < t.length && matched < query.length; i++) {
-    if (t[i] === query[matched]) matched += 1;
-  }
-  return matched === query.length ? 1 : 0;
-};
 
 // VIEW INPUTS
 
@@ -148,13 +123,15 @@ export type PaletteItemSpec = Readonly<{
   /** Leading 28px avatar image; wins over `icon` when both are set. */
   avatarSrc?: string;
   label: string;
+  /** Muted secondary line beside the label (sender, path, …). Squeezed
+   *  before the label is when space runs out. */
+  detail?: string;
   /** Trailing tag chip (category, kind) — a pill with a small icon. */
   tag?: Readonly<{ icon: IconView; label: string }>;
-  /** Extra text the filter matches beyond the label. */
-  keywords?: string;
 }>;
 
 export type Group<Item extends string> = Readonly<{
+  /** Empty renders no header — the shape for a single unlabeled result list. */
   label: string;
   items: ReadonlyArray<Item>;
 }>;
@@ -163,6 +140,8 @@ export type ViewInputs<Item extends string> = Readonly<{
   groups: ReadonlyArray<Group<Item>>;
   itemSpec: (item: Item) => PaletteItemSpec;
   placeholder?: string;
+  /** Shown when there are no items — the place a search error surfaces. */
+  emptyLabel?: string;
   /** Surface level of the page under the palette; the panel settles at
    *  `substrate + 4` (dialog convention). */
   substrate: SurfaceLevel;
@@ -173,40 +152,32 @@ type FilteredGroup<Item extends string> = Readonly<{
   items: ReadonlyArray<Readonly<{ item: Item; flatIndex: number }>>;
 }>;
 
-const filterGroups = <Item extends string>(
-  query: string,
+// Numbers the rows so the overlay, the arrow keys, and ⌘1-9 all agree on
+// what "the third result" means. The palette does no matching of its own —
+// `groups` is already the answer to `model.query`.
+const numberRows = <Item extends string>(
   groups: ReadonlyArray<Group<Item>>,
-  itemSpec: (item: Item) => PaletteItemSpec,
 ): ReadonlyArray<FilteredGroup<Item>> => {
-  const q = query.trim().toLowerCase();
   let flatIndex = 0;
-  const filtered: Array<FilteredGroup<Item>> = [];
-  for (const group of groups) {
-    const items: Array<{ item: Item; flatIndex: number }> = [];
-    for (const item of group.items) {
-      const spec = itemSpec(item);
-      const corpus =
-        spec.keywords === undefined
-          ? spec.label
-          : `${spec.label} ${spec.keywords}`;
-      if (matchScore(q, corpus) > 0) {
-        items.push({ item, flatIndex });
-        flatIndex += 1;
-      }
-    }
-    if (items.length > 0) filtered.push({ label: group.label, items });
-  }
-  return filtered;
+  return groups.flatMap((group) =>
+    Arr.isReadonlyArrayEmpty(group.items)
+      ? []
+      : [
+          {
+            label: group.label,
+            items: group.items.map((item) => ({
+              item,
+              flatIndex: flatIndex++,
+            })),
+          },
+        ],
+  );
 };
 
 // CREATE
 
-const searchIcon = icon(Search);
-const enterIcon = icon(CornerDownLeft);
-const arrowUpIcon = icon(ArrowUp);
-const arrowDownIcon = icon(ArrowDown);
-const settingsIcon = icon(Settings);
-const commandIcon = icon(CommandKey);
+const searchIcon = icon(Search01Icon as IconNode);
+const commandIcon = icon(CommandIcon as IconNode);
 
 /** Bordered keycap chip (the mock's Kbd): reads as a physical key at any
  *  elevation because border and text ride the theme tokens. */
@@ -258,78 +229,76 @@ export const create = <Item extends string>() => {
           BaseDialog.open(model.dialog),
         );
 
-  const update = (model: Model, message: Message): UpdateReturn => {
-    switch (message._tag) {
-      case "PaletteGotDialogMessage": {
-        const [dialog, commands] = BaseDialog.update(
-          model.dialog,
-          message.message,
-        );
-        // Rows exist in the DOM once the show command completes; that's the
-        // earliest correct moment to measure (same trigger discipline as
-        // Menu's CompletedAnchorMenu).
-        const isPanelReady = message.message._tag === "CompletedShowDialog";
-        return [
-          evo(model, { dialog: () => dialog }),
-          [
-            ...Command.mapMessages(commands, (message) =>
-              GotDialogMessage({ message }),
-            ),
-            ...(isPanelReady
-              ? [MeasureItemRects({ id: model.dialog.id })]
-              : []),
-          ],
-          Option.none(),
-        ];
-      }
+  const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
-      case "PaletteChangedQuery":
-        return [
+  const update = (model: Model, message: Message): UpdateReturn =>
+    M.value(message).pipe(
+      withUpdateReturn,
+      M.tagsExhaustive({
+        GotDialogMessage: ({ message }) => {
+          const [dialog, commands] = BaseDialog.update(model.dialog, message);
+          // Rows exist in the DOM once the show command completes; that's the
+          // earliest correct moment to measure (same trigger discipline as
+          // Menu's CompletedAnchorMenu).
+          const isPanelReady = message._tag === "CompletedShowDialog";
+          return [
+            evo(model, { dialog: () => dialog }),
+            [
+              ...Command.mapMessages(commands, (message) =>
+                GotDialogMessage({ message }),
+              ),
+              ...(isPanelReady
+                ? [MeasureItemRects({ id: model.dialog.id })]
+                : []),
+            ],
+            Option.none(),
+          ];
+        },
+
+        ChangedQuery: ({ query }) => [
           evo(model, {
-            query: () => message.query,
+            query: () => query,
             activeIndex: () => 0,
           }),
           // Re-measure after the filtered list re-renders.
           [MeasureItemRects({ id: model.dialog.id })],
           Option.none(),
-        ];
+        ],
 
-      case "PaletteMovedActive": {
-        if (message.count === 0) return [model, [], Option.none()];
-        // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
-        // still rather than jumping to the opposite end.
-        const next = Math.max(
-          0,
-          Math.min(message.count - 1, model.activeIndex + message.delta),
-        );
-        return [evo(model, { activeIndex: () => next }), [], Option.none()];
-      }
+        MovedActive: ({ count, delta }) => {
+          if (count === 0) return [model, [], Option.none()];
+          // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
+          // still rather than jumping to the opposite end.
+          const next = Math.max(
+            0,
+            Math.min(count - 1, model.activeIndex + delta),
+          );
+          return [evo(model, { activeIndex: () => next }), [], Option.none()];
+        },
 
-      case "PalettePointedItem":
-        return [
-          evo(model, { activeIndex: () => message.index }),
+        PointedItem: ({ index }) => [
+          evo(model, { activeIndex: () => index }),
           [],
           Option.none(),
-        ];
+        ],
 
-      case "PalettePickedItem": {
-        const [next, commands] = delegateDialog(
-          model,
-          BaseDialog.close(model.dialog),
-        );
-        // Items originate from viewInputs.groups, so the string is a
-        // round-tripped Item by construction.
-        return [next, commands, Option.some(message.item as Item)];
-      }
+        SelectedItem: ({ item }) => {
+          const [next, commands] = delegateDialog(
+            model,
+            BaseDialog.close(model.dialog),
+          );
+          // Items originate from viewInputs.groups, so the string is a
+          // round-tripped Item by construction.
+          return [next, commands, Option.some(item as Item)];
+        },
 
-      case "PaletteGotItemRects":
-        return [
-          evo(model, { rects: () => [...message.rects] }),
+        MeasuredItemRects: ({ rects }) => [
+          evo(model, { rects: () => Arr.copy(rects) }),
           [],
           Option.none(),
-        ];
-    }
-  };
+        ],
+      }),
+    );
 
   const view = Submodel.defineView<Model, Message, ViewInputs<Item>>(
     (model, viewInputs): Html => {
@@ -338,13 +307,18 @@ export const create = <Item extends string>() => {
         groups,
         itemSpec,
         placeholder = "Search…",
+        emptyLabel = "No results",
         substrate,
       } = viewInputs;
 
-      const filtered = filterGroups(model.query, groups, itemSpec);
+      const filtered = numberRows(groups);
       const flat = filtered.flatMap((group) => group.items);
       const count = flat.length;
       const activeIndex = Math.min(model.activeIndex, Math.max(0, count - 1));
+
+      const listboxId = `${model.dialog.id}-results`;
+      const activeItemId =
+        count === 0 ? undefined : itemId(model.dialog.id, activeIndex);
 
       const inputRow = h.div(
         [h.Class("flex h-12 items-center gap-3 border-b border-border px-5")],
@@ -356,10 +330,24 @@ export const create = <Item extends string>() => {
             h.Value(model.query),
             h.Placeholder(placeholder),
             h.Autocomplete("off"),
+            // Combobox semantics: the input owns the results list and
+            // publishes which row the arrow keys have landed on. The visual
+            // cue is the traveling overlay, which a screen reader can't see —
+            // activedescendant is what makes the same state audible.
+            h.Role("combobox"),
+            h.AriaLabel(placeholder),
+            h.AriaExpanded(count > 0),
+            h.AriaControls(listboxId),
+            h.AriaAutocomplete("list"),
+            ...(activeItemId === undefined
+              ? []
+              : [h.AriaActiveDescendant(activeItemId)]),
             h.Class(
               // h-full + a fixed 24px line box: the caret's height is the
               // line-height, so an explicit leading well above the font size
               // keeps it from clipping regardless of the body's 100% leading.
+              // outline-none is safe here: the dialog traps focus into this
+              // input, so it is the only focusable thing on screen.
               "h-full w-full bg-transparent leading-6 text-foreground outline-none placeholder:text-muted-foreground/60",
             ),
             h.OnInput((query) => ChangedQuery({ query })),
@@ -372,11 +360,11 @@ export const create = <Item extends string>() => {
               if (modifiers.metaKey && key >= "1" && key <= "9") {
                 const target = flat[Number(key) - 1];
                 if (target !== undefined)
-                  return Option.some(PickedItem({ item: target.item }));
+                  return Option.some(SelectedItem({ item: target.item }));
               }
               const active = flat[activeIndex];
               if (key === "Enter" && active !== undefined)
-                return Option.some(PickedItem({ item: active.item }));
+                return Option.some(SelectedItem({ item: active.item }));
               return Option.none();
             }),
           ]),
@@ -394,6 +382,7 @@ export const create = <Item extends string>() => {
           // the same key, so travel between rows still glides.
           `overlay-${model.session}-${model.query}`,
           [
+            h.Role("presentation"),
             h.Class("fk-hover-overlay rounded-lg"),
             h.Style({
               top: `${rect.top}px`,
@@ -433,11 +422,13 @@ export const create = <Item extends string>() => {
         return h.div(
           [
             h.Id(itemId(model.dialog.id, flatIndex)),
+            h.Role("option"),
+            h.AriaSelected(flatIndex === activeIndex),
             h.Class(
               "flex cursor-default items-center gap-3 rounded-lg px-3 py-1 text-foreground",
             ),
             h.OnMouseEnter(PointedItem({ index: flatIndex })),
-            h.OnClick(PickedItem({ item })),
+            h.OnClick(SelectedItem({ item })),
           ],
           [
             leading,
@@ -445,6 +436,16 @@ export const create = <Item extends string>() => {
               [h.Class("min-w-0 flex-1 truncate text-left")],
               [spec.label],
             ),
+            spec.detail === undefined
+              ? h.empty
+              : h.span(
+                  [
+                    h.Class(
+                      "min-w-0 max-w-[40%] shrink truncate text-[13px] text-muted-foreground",
+                    ),
+                  ],
+                  [spec.detail],
+                ),
             spec.tag === undefined
               ? h.empty
               : h.span(
@@ -469,72 +470,65 @@ export const create = <Item extends string>() => {
         );
       };
 
-      const results =
-        count === 0
-          ? h.div(
-              [h.Class("px-5 py-10 text-center text-muted-foreground")],
-              ["No results"],
-            )
-          : h.div(
-              [
-                h.Class(
-                  "relative max-h-[min(480px,55vh)] overflow-y-auto px-2 pb-1.5 pt-1.5",
-                ),
-              ],
-              [
-                overlay,
-                ...filtered.flatMap((group, groupIndex) => [
-                  // Groups after the first separate with a hairline rather
-                  // than stacking two labels against each other.
-                  ...(groupIndex === 0
-                    ? []
-                    : [
-                        h.div(
-                          [h.Class("mx-3 my-1.5 border-t border-border")],
-                          [],
-                        ),
-                      ]),
-                  h.div(
-                    [
-                      h.Class(
-                        "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
-                      ),
-                    ],
-                    [group.label],
-                  ),
-                  ...group.items.map(({ item, flatIndex }) =>
-                    itemRow(item, flatIndex),
-                  ),
-                ]),
-              ],
-            );
-
-      const footer = h.div(
-        [
-          h.Class(
-            "flex items-center gap-4 border-t border-border bg-hover px-5 py-2 text-[12px] text-muted-foreground",
-          ),
-        ],
-        [
-          h.span(
-            [h.Class("flex items-center gap-2")],
+      // The listbox is rendered in both branches so `aria-controls` always
+      // resolves to a live element; empty simply carries no options and the
+      // status line announces why.
+      const results = Arr.match(flat, {
+        onEmpty: () =>
+          h.div(
+            [h.Class("px-5 py-10 text-center text-muted-foreground")],
             [
-              kbd([arrowUpIcon("h-3.5 w-3.5")]),
-              kbd([arrowDownIcon("h-3.5 w-3.5")]),
-              "navigate",
+              h.div(
+                [h.Id(listboxId), h.Role("listbox"), h.AriaLabel(placeholder)],
+                [],
+              ),
+              h.div([h.Role("status")], [emptyLabel]),
             ],
           ),
-          h.span(
-            [h.Class("flex items-center gap-2")],
-            [kbd([enterIcon("h-3.5 w-3.5")]), "open"],
+        onNonEmpty: () =>
+          h.div(
+            [
+              h.Id(listboxId),
+              h.Role("listbox"),
+              h.AriaLabel(placeholder),
+              h.Class(
+                "relative max-h-[min(480px,55vh)] overflow-y-auto px-2 pb-1.5 pt-1.5",
+              ),
+            ],
+            [
+              overlay,
+              ...filtered.flatMap((group, groupIndex) => [
+                // Groups after the first separate with a hairline rather
+                // than stacking two labels against each other.
+                ...(groupIndex === 0
+                  ? []
+                  : [
+                      h.div(
+                        [
+                          h.Role("presentation"),
+                          h.Class("mx-3 my-1.5 border-t border-border"),
+                        ],
+                        [],
+                      ),
+                    ]),
+                group.label === ""
+                  ? h.empty
+                  : h.div(
+                      [
+                        h.Role("presentation"),
+                        h.Class(
+                          "px-3 pb-0.5 pt-1 text-[13px] text-muted-foreground/70",
+                        ),
+                      ],
+                      [group.label],
+                    ),
+                ...group.items.map(({ item, flatIndex }) =>
+                  itemRow(item, flatIndex),
+                ),
+              ]),
+            ],
           ),
-          h.span([h.Class("flex items-center gap-2")], [kbd(["esc"]), "close"]),
-          h.span(
-            [h.Class("ml-auto")],
-            [settingsIcon("h-[18px] w-[18px] text-muted-foreground/70")],
-          ),
-        ],
-      );
+      });
 
       return h.submodel({
         slotId: `${model.dialog.id}-dialog`,
@@ -545,6 +539,11 @@ export const create = <Item extends string>() => {
             h.dialog(
               [
                 ...render.dialog,
+                // NOTE: outline-none without a focus-visible: partner is
+                // deliberate. The native <dialog> takes focus on open before
+                // handing it to the query input; it is not a tab stop, so a
+                // ring here would flash on open without marking anything the
+                // user navigated to.
                 h.Class("h-full w-full bg-transparent p-0 outline-none"),
               ],
               render.isVisible
@@ -574,7 +573,7 @@ export const create = <Item extends string>() => {
                           )} ${palettePanel}`,
                         ),
                       ],
-                      [inputRow, results, footer],
+                      [inputRow, results],
                     ),
                   ]
                 : [],

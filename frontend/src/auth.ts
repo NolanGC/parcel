@@ -22,7 +22,7 @@ const SESSION_STORAGE_KEY = "parcel-foldkit-session";
 
 // MESSAGE
 
-export const GotSession = m("GotSession", {
+export const SucceededCheckSession = m("SucceededCheckSession", {
   maybeSession: S.Option(Session),
 });
 export const FailedCheckSession = m("FailedCheckSession", { error: S.String });
@@ -81,7 +81,7 @@ const errorMessage = (
 // authority; the localStorage copy only provides instant first paint.
 export const CheckSession = Command.define(
   "CheckSession",
-  GotSession,
+  SucceededCheckSession,
   FailedCheckSession,
 )(
   Effect.gen(function* () {
@@ -92,7 +92,7 @@ export const CheckSession = Command.define(
         error: errorMessage(error, "Could not check the session."),
       });
     }
-    return GotSession({
+    return SucceededCheckSession({
       maybeSession: Option.map(decodeUserPayload(data), toSession),
     });
   }).pipe(
@@ -214,7 +214,7 @@ export const ClearSession = Command.define(
     store.remove(SESSION_STORAGE_KEY),
   ).pipe(
     // Best-effort: if the eviction fails, the next boot paints logged-in
-    // from the stale cache until GotSession(none) corrects it.
+    // from the stale cache until SucceededCheckSession(none) corrects it.
     Effect.tapError((error) =>
       Effect.logWarning("session cache eviction failed", error),
     ),

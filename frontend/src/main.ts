@@ -15,13 +15,14 @@ import {
   CompletedSessionPersistence,
   CompletedSignOut,
   FailedCheckSession,
-  GotSession,
+  SucceededCheckSession,
   SaveSession,
   Session,
   SignOut,
   readStoredSession,
 } from "./auth";
 import { Inbox, Login } from "./page";
+import { landingView, notFoundView } from "./page/landing";
 import {
   AppRoute,
   homeRouter,
@@ -29,6 +30,7 @@ import {
   loginRouter,
   urlToAppRoute,
 } from "./route";
+import { Search } from "./search";
 import { SyncEngine } from "./sync";
 import * as Ui from "./ui";
 
@@ -79,7 +81,7 @@ export const Message = S.Union([
   GotLoginMessage,
   GotInboxMessage,
   ClickedSignOut,
-  GotSession,
+  SucceededCheckSession,
   FailedCheckSession,
   CompletedSignOut,
   CompletedSessionPersistence,
@@ -101,6 +103,14 @@ export const flags: Effect.Effect<Flags> = readStoredSession.pipe(
 );
 
 // INIT
+
+// Both `init` and `update` return the same pair: the next model plus
+// command descriptions for the runtime to execute.
+type UpdateReturn = readonly [
+  Model,
+  ReadonlyArray<Command.Command<Message, never, AppResources>>,
+];
+const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
 const initLoggedOut = (
   route: AppRoute,
@@ -139,14 +149,16 @@ const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
 export type AppResources =
   | AuthClient
   | KeyValueStore.KeyValueStore
-  | SyncEngine;
+  | SyncEngine
+  | Search;
 
-// The inbox page owns the LoadInbox command; wrapping its messages here
-// keeps the parent/child message boundary intact.
-const loadInboxCommands = (): ReadonlyArray<
-  Command.Command<Message, never, AppResources>
-> =>
-  Command.mapMessages([Inbox.LoadInbox()], (message) =>
+// The inbox page owns its boot (the first local read plus the sync
+// machine's checkpoint read); wrapping its messages here keeps the
+// parent/child message boundary intact.
+const loadInboxCommands = (
+  accountEmail: string,
+): ReadonlyArray<Command.Command<Message, never, AppResources>> =>
+  Command.mapMessages(Inbox.bootCommands(accountEmail), (message) =>
     GotInboxMessage({ message }),
   );
 
@@ -161,41 +173,65 @@ export const init: Runtime.RoutingApplicationInit<
   // Pure: returns the starting model plus command *descriptions* — the
   // runtime executes them after boot. Every branch revalidates with
   // CheckSession because the cached session is only an optimistic first
-  // paint; the cookie's verdict arrives later as GotSession.
+  // paint; the cookie's verdict arrives later as SucceededCheckSession.
   return Option.match(flags.maybeSession, {
-    onNone: () =>
-      route._tag === "Inbox"
-        ? // No cached session but the URL asks for the gated inbox: start
-          // on the login page instead (replaceUrl, so /inbox doesn't
-          // pollute history) while the session check runs.
-          ([
+    onNone: () => {
+      // No cached session: render the route logged out, with the session
+      // check still in flight so the login page can show a spinner.
+      const browsable = (route: AppRoute): UpdateReturn => [
+        initLoggedOut(route, true),
+        [CheckSession()],
+      ];
+
+      return M.value(route).pipe(
+        withUpdateReturn,
+        M.tagsExhaustive({
+          // The URL asks for the gated inbox: start on the login page
+          // instead (replaceUrl, so /inbox doesn't pollute history) while
+          // the session check runs.
+          Inbox: () => [
             initLoggedOut(LoginRouteValue, true),
             [RedirectToLogin(), CheckSession()],
-          ] as const)
-        : // No cached session on a public route: render it as requested.
-          // This is also where a failed OAuth round-trip lands
-          // (/login?error=...), so surface that error on the login page.
-          ([
-            initLoggedOut(route, true, oauthErrorFromUrl(url)),
+          ],
+          // A failed OAuth round-trip lands here (/login?error=...), so
+          // surface that error on the login page.
+          Login: (login) => [
+            initLoggedOut(login, true, oauthErrorFromUrl(url)),
             [CheckSession()],
-          ] as const),
-    onSome: (session) =>
-      route._tag === "Login"
-        ? // Cached session but the URL is /login: nothing to sign into —
-          // bounce straight to the inbox.
-          ([
+          ],
+          Home: browsable,
+          NotFound: browsable,
+        }),
+      );
+    },
+    onSome: (session) => {
+      // Cached session: paint logged-in immediately; SucceededCheckSession later
+      // confirms or evicts (the "cached profile lied" transition in
+      // update). The inbox pull starts on the optimistic session — a stale
+      // cookie surfaces as the pull's own auth error, not a blank list.
+      const optimistic = (route: AppRoute): UpdateReturn => [
+        initLoggedIn(route, session),
+        [CheckSession(), ...loadInboxCommands(session.email)],
+      ];
+
+      return M.value(route).pipe(
+        withUpdateReturn,
+        M.tagsExhaustive({
+          // Nothing to sign into — bounce straight to the inbox.
+          Login: () => [
             initLoggedIn(InboxRouteValue, session),
-            [RedirectToInbox(), CheckSession(), ...loadInboxCommands()],
-          ] as const)
-        : // Cached session on any other route: paint logged-in
-          // immediately; GotSession later confirms or evicts (the
-          // "cached profile lied" transition in update). The inbox pull
-          // starts on the optimistic session — a stale cookie surfaces as
-          // the pull's own auth error, not a blank list.
-          ([
-            initLoggedIn(route, session),
-            [CheckSession(), ...loadInboxCommands()],
-          ] as const),
+            [
+              RedirectToInbox(),
+              CheckSession(),
+              ...loadInboxCommands(session.email),
+            ],
+          ],
+          Inbox: optimistic,
+          Home: optimistic,
+          NotFound: optimistic,
+        }),
+      );
+    },
   });
 };
 
@@ -234,17 +270,15 @@ const RedirectToHome = Command.define(
 
 // UPDATE
 
-type UpdateReturn = readonly [
-  Model,
-  ReadonlyArray<Command.Command<Message, never, AppResources>>,
-];
-const withUpdateReturn = M.withReturnType<UpdateReturn>();
-
 // Entering the logged-in world from anywhere: land in the inbox, persist
 // the profile cache, and start the first real pull.
 const enterLoggedIn = (session: Session): UpdateReturn => [
   initLoggedIn(InboxRouteValue, session),
-  [SaveSession({ session }), RedirectToInbox(), ...loadInboxCommands()],
+  [
+    SaveSession({ session }),
+    RedirectToInbox(),
+    ...loadInboxCommands(session.email),
+  ],
 ];
 
 const leaveLoggedIn = (): UpdateReturn => [
@@ -275,21 +309,49 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       ChangedUrl: ({ url }) => {
         const route = urlToAppRoute(url);
 
-        if (model._tag === "LoggedOut") {
-          // The inbox is gated; everything else is browsable while logged out.
-          return route._tag === "Inbox"
-            ? [model, [RedirectToLogin()]]
-            : [evo(model, { route: () => route }), []];
-        }
+        return M.value(model).pipe(
+          withUpdateReturn,
+          M.tagsExhaustive({
+            LoggedOut: (loggedOut) => {
+              const stay = (route: AppRoute): UpdateReturn => [
+                evo(loggedOut, { route: () => route }),
+                [],
+              ];
 
-        if (route._tag === "Login") {
-          return [model, [RedirectToInbox()]];
-        }
+              return M.value(route).pipe(
+                withUpdateReturn,
+                M.tagsExhaustive({
+                  // The inbox is gated; every other route is browsable
+                  // while logged out.
+                  Inbox: () => [loggedOut, [RedirectToLogin()]],
+                  Home: stay,
+                  Login: stay,
+                  NotFound: stay,
+                }),
+              );
+            },
+            LoggedIn: (loggedIn) => {
+              const stay = (route: AppRoute): UpdateReturn => [
+                evo(loggedIn, { route: () => route }),
+                [],
+              ];
 
-        return [evo(model, { route: () => route }), []];
+              return M.value(route).pipe(
+                withUpdateReturn,
+                M.tagsExhaustive({
+                  // Nothing to sign into with a session in hand.
+                  Login: () => [loggedIn, [RedirectToInbox()]],
+                  Home: stay,
+                  Inbox: stay,
+                  NotFound: stay,
+                }),
+              );
+            },
+          }),
+        );
       },
 
-      GotSession: ({ maybeSession }) =>
+      SucceededCheckSession: ({ maybeSession }) =>
         M.value(model).pipe(
           withUpdateReturn,
           M.tagsExhaustive({
@@ -319,29 +381,43 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // A network failure isn't evidence the session is invalid, so stay
       // put; gated requests will surface real 401s on their own.
       FailedCheckSession: () =>
-        model._tag === "LoggedOut"
-          ? [
-              evo(model, {
+        M.value(model).pipe(
+          withUpdateReturn,
+          M.tagsExhaustive({
+            LoggedOut: (loggedOut) => [
+              evo(loggedOut, {
                 loginPage: (loginPage) =>
                   Login.setCheckingSession(loginPage, false),
               }),
               [],
-            ]
-          : [model, []],
+            ],
+            LoggedIn: (loggedIn) => [loggedIn, []],
+          }),
+        ),
 
-      GotLoginMessage: ({ message }) => {
-        // Sign-in completes via a full-page OAuth redirect, not a submodel
-        // message: the returning visit's boot-time CheckSession performs
-        // the logged-in transition (GotSession above).
-        if (model._tag !== "LoggedOut") return [model, []];
-        const [loginPage, commands] = Login.update(model.loginPage, message);
-        return [
-          evo(model, { loginPage: () => loginPage }),
-          Command.mapMessages(commands, (message) =>
-            GotLoginMessage({ message }),
-          ),
-        ];
-      },
+      GotLoginMessage: ({ message }) =>
+        M.value(model).pipe(
+          withUpdateReturn,
+          M.tagsExhaustive({
+            LoggedOut: (loggedOut) => {
+              const [loginPage, commands] = Login.update(
+                loggedOut.loginPage,
+                message,
+              );
+              return [
+                evo(loggedOut, { loginPage: () => loginPage }),
+                Command.mapMessages(commands, (message) =>
+                  GotLoginMessage({ message }),
+                ),
+              ];
+            },
+            // Sign-in completes via a full-page OAuth redirect, not a
+            // submodel message: the returning visit's boot-time
+            // CheckSession performs the logged-in transition (SucceededCheckSession
+            // above).
+            LoggedIn: (loggedIn) => [loggedIn, []],
+          }),
+        ),
 
       GotInboxMessage: ({ message }) => {
         const [inboxPage, commands] = Inbox.update(model.inboxPage, message);
@@ -351,13 +427,17 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
           // The inbox's account popover offers sign-out, but the session is
           // this model's to end — the page only closes its popover.
-          ...(message._tag === "InboxClickedSignOut" ? [SignOut()] : []),
+          ...(message._tag === "ClickedAccountSignOut" ? [SignOut()] : []),
         ];
         // The arms are intentionally identical: `evo` needs the union
         // narrowed to a concrete variant, and both variants carry inboxPage.
-        return model._tag === "LoggedOut"
-          ? [evo(model, { inboxPage: () => inboxPage }), mapped]
-          : [evo(model, { inboxPage: () => inboxPage }), mapped];
+        return M.value(model).pipe(
+          withUpdateReturn,
+          M.tagsExhaustive({
+            LoggedOut: (m) => [evo(m, { inboxPage: () => inboxPage }), mapped],
+            LoggedIn: (m) => [evo(m, { inboxPage: () => inboxPage }), mapped],
+          }),
+        );
       },
 
       ClickedSignOut: () => [model, [SignOut()]],
@@ -387,7 +467,7 @@ const keyboardSubscriptions = Subscription.make<Model, Message>()((entry) => ({
               if ((event.metaKey || event.ctrlKey) && event.key === "k") {
                 event.preventDefault();
                 return Option.some(
-                  GotInboxMessage({ message: Inbox.OpenedPalette() }),
+                  GotInboxMessage({ message: Inbox.ToggledPalette() }),
                 );
               }
               return Option.none();
@@ -466,7 +546,13 @@ export const managedResources = undefined;
 // VIEW
 
 export const view = (model: Model): Document =>
-  model._tag === "LoggedOut" ? loggedOutView(model) : loggedInView(model);
+  M.value(model).pipe(
+    M.withReturnType<Document>(),
+    M.tagsExhaustive({
+      LoggedOut: loggedOutView,
+      LoggedIn: loggedInView,
+    }),
+  );
 
 const inboxView = (inboxPage: Inbox.Model, session: Session): Html => {
   const h = html<Message>();
@@ -482,30 +568,41 @@ const inboxView = (inboxPage: Inbox.Model, session: Session): Html => {
   });
 };
 
-const loggedOutView = (model: LoggedOut): Document => {
+// The 404 renders identically whether or not there's a session, so both
+// route matchers land here rather than each carrying a copy.
+const notFoundDocument = (path: string): Document => {
   const h = html<Message>();
 
-  return M.value(model.route).pipe(
+  return {
+    title: "Not Found",
+    body: h.div(
+      [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
+      [notFoundView("Page not found", `No route for ${path}.`)],
+    ),
+  };
+};
+
+const loggedOutView = (model: LoggedOut): Document =>
+  M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(false) }),
+      Home: () => ({
+        title: APP_NAME,
+        body: landingView(false, ClickedSignOut()),
+      }),
       // Redirect in flight; render the landing rather than a flash of the
       // gated inbox.
-      Inbox: () => ({ title: APP_NAME, body: landingView(false) }),
+      Inbox: () => ({
+        title: APP_NAME,
+        body: landingView(false, ClickedSignOut()),
+      }),
       Login: () => ({
         title: `Sign in — ${APP_NAME}`,
         body: loginView(model),
       }),
-      NotFound: ({ path }) => ({
-        title: "Not Found",
-        body: h.div(
-          [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
-          [notFoundView("Page not found", `No route for ${path}.`)],
-        ),
-      }),
+      NotFound: ({ path }) => notFoundDocument(path),
     }),
   );
-};
 
 const loginView = (model: LoggedOut): Html => {
   const h = html<Message>();
@@ -518,96 +615,24 @@ const loginView = (model: LoggedOut): Html => {
   });
 };
 
-const loggedInView = (model: LoggedIn): Document => {
-  const h = html<Message>();
-
-  return M.value(model.route).pipe(
+const loggedInView = (model: LoggedIn): Document =>
+  M.value(model.route).pipe(
     M.withReturnType<Document>(),
     M.tagsExhaustive({
-      Home: () => ({ title: APP_NAME, body: landingView(true) }),
+      Home: () => ({
+        title: APP_NAME,
+        body: landingView(true, ClickedSignOut()),
+      }),
       // Redirect to the inbox in flight.
-      Login: () => ({ title: APP_NAME, body: landingView(true) }),
+      Login: () => ({
+        title: APP_NAME,
+        body: landingView(true, ClickedSignOut()),
+      }),
       // The inbox is a full-window design; no app chrome around it.
       Inbox: () => ({
         title: `Inbox — ${APP_NAME}`,
         body: inboxView(model.inboxPage, model.session),
       }),
-      NotFound: ({ path }) => ({
-        title: "Not Found",
-        body: h.div(
-          [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
-          [notFoundView("Page not found", `No route for ${path}.`)],
-        ),
-      }),
+      NotFound: ({ path }) => notFoundDocument(path),
     }),
   );
-};
-
-// The marketing landing: the only public page besides sign-in. Static
-// content served from the SPA bundle.
-const landingView = (isLoggedIn: boolean): Html => {
-  const h = html<Message>();
-
-  return h.main(
-    [h.Class("min-h-screen bg-neutral-950 px-6 py-24 text-neutral-100")],
-    [
-      h.div(
-        [h.Class("mx-auto max-w-xl")],
-        [
-          h.h1([h.Class("text-3xl font-bold")], [APP_NAME]),
-          h.p(
-            [h.Class("mt-3 text-neutral-400")],
-            [
-              "A fast, keyboard-first email client for your Gmail. Sign in with Google and your inbox is ready — nothing to configure.",
-            ],
-          ),
-          h.a(
-            [
-              h.Href(isLoggedIn ? inboxRouter() : loginRouter()),
-              h.Class("mt-8 inline-block underline underline-offset-4"),
-            ],
-            [isLoggedIn ? "Open your inbox →" : "Sign in with Google →"],
-          ),
-          isLoggedIn
-            ? h.button(
-                [
-                  h.Type("button"),
-                  h.OnClick(ClickedSignOut()),
-                  h.Class(
-                    "mt-6 block text-sm text-neutral-400 underline underline-offset-4 hover:text-neutral-200",
-                  ),
-                ],
-                ["Sign out"],
-              )
-            : h.empty,
-        ],
-      ),
-    ],
-  );
-};
-
-const notFoundView = (heading: string, detail: string): Html => {
-  const h = html<Message>();
-
-  return h.section(
-    [h.Class("mx-auto max-w-5xl px-4 py-10")],
-    [
-      h.div(
-        [h.Class("border border-neutral-800 bg-neutral-900 p-4")],
-        [
-          h.h1([h.Class("text-2xl font-bold")], [heading]),
-          h.p([h.Class("mt-2 text-neutral-400")], [detail]),
-          h.a(
-            [
-              h.Href(homeRouter()),
-              h.Class(
-                "mt-4 inline-block border border-neutral-700 bg-neutral-800 px-4 py-2 font-medium text-neutral-100 hover:bg-neutral-700",
-              ),
-            ],
-            ["Back home"],
-          ),
-        ],
-      ),
-    ],
-  );
-};

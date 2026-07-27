@@ -1,4 +1,5 @@
-import { Effect, Option, Match as M, Schema as S } from "effect";
+import { Tabs as BaseTabs } from "@foldkit/ui";
+import { Array as Arr, Effect, Match as M, Option, Schema as S } from "effect";
 import { Command, Submodel } from "foldkit";
 import { html, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
@@ -22,17 +23,29 @@ import { measureRect, Rect, ZERO_RECT } from "./rect";
  * Labels lift weight on selection through `weightLabel` (no reflow) and
  * icons thicken their stroke — color/weight carry state, never new hues.
  *
- * Rects are measured when the pointer enters the container (same Command
- * pattern as Table). Until the first measurement the selected tab carries a
- * static bg-active of its own, so the initial render is correct before any
- * pointer interaction; the pill takes over seamlessly at the same geometry.
+ * Behavior rides @foldkit/ui's Tabs: roving tabindex, arrow/Home/End
+ * navigation, the tab/tablist/tabpanel roles, `aria-selected`, and the
+ * tab-to-panel id pairing all come from there. This module supplies visuals
+ * only, plus the rect measurement the pills need — taken when the pointer
+ * enters the container and again on selection, because keyboard activation
+ * can commit a tab before any pointer has entered. Until the first
+ * measurement the selected tab carries a static bg-active of its own, so the
+ * initial render is correct before any interaction and the pill takes over at
+ * the same geometry.
+ *
+ * The base component owns the tab id scheme (`${id}-tab-${index}`), which is
+ * what `tabId` below re-derives to find the elements to measure.
  */
 
 // MODEL
 
 export const Model = S.Struct({
+  base: BaseTabs.Model,
   id: S.String,
-  selectedIndex: S.Number,
+  /** The active tab's label. The base component is stateless about the
+   *  selection — it reads it back from `ViewInputs.selectedValue` — so the
+   *  wrapper is where it lives. */
+  selectedValue: S.String,
   /** Bumped on each container entry; keys the hover overlay so a new
    *  session remounts it (snap + fade-in) instead of sliding in stale. */
   session: S.Number,
@@ -42,11 +55,12 @@ export const Model = S.Struct({
 });
 export type Model = typeof Model.Type;
 
-export type InitConfig = Readonly<{ id: string; selectedIndex?: number }>;
+export type InitConfig = Readonly<{ id: string; selectedValue: string }>;
 
 export const init = (config: InitConfig): Model => ({
+  base: BaseTabs.init({ id: config.id }),
   id: config.id,
-  selectedIndex: config.selectedIndex ?? 0,
+  selectedValue: config.selectedValue,
   session: 0,
   isPointerInside: false,
   maybeHoverIndex: Option.none(),
@@ -57,23 +71,22 @@ const tabId = (id: string, index: number): string => `${id}-tab-${index}`;
 
 // MESSAGE
 
-export const EnteredContainer = m("TabsEnteredContainer", {
+export const GotBaseMessage = m("GotBaseMessage", {
+  message: BaseTabs.Message,
+});
+export const EnteredContainer = m("EnteredContainer", {
   tabCount: S.Number,
 });
-export const LeftContainer = m("TabsLeftContainer");
-export const EnteredTab = m("TabsEnteredTab", { index: S.Number });
-export const ClickedTab = m("TabsClickedTab", {
-  index: S.Number,
-  tabCount: S.Number,
-});
-export const GotTabRects = m("TabsGotTabRects", { rects: S.Array(Rect) });
+export const ExitedContainer = m("ExitedContainer");
+export const EnteredTab = m("EnteredTab", { index: S.Number });
+export const MeasuredTabRects = m("MeasuredTabRects", { rects: S.Array(Rect) });
 
 export const Message = S.Union([
+  GotBaseMessage,
   EnteredContainer,
-  LeftContainer,
+  ExitedContainer,
   EnteredTab,
-  ClickedTab,
-  GotTabRects,
+  MeasuredTabRects,
 ]);
 export type Message = typeof Message.Type;
 
@@ -82,7 +95,7 @@ export type Message = typeof Message.Type;
 const MeasureTabRects = Command.define(
   "MeasureTabRects",
   { id: S.String, count: S.Number },
-  GotTabRects,
+  MeasuredTabRects,
 )(({ count, id }) =>
   Effect.sync(() => {
     const rects: Array<Rect> = [];
@@ -92,19 +105,49 @@ const MeasureTabRects = Command.define(
         element instanceof HTMLElement ? measureRect(element) : ZERO_RECT,
       );
     }
-    return GotTabRects({ rects });
+    return MeasuredTabRects({ rects });
   }),
 );
 
 // UPDATE
 
+// The base component pairs its view and update behind one Value-typed entry
+// point; labels are plain strings here, so `string` is the Value.
+const BaseTabsView = BaseTabs.create<string>();
+
 type UpdateReturn = readonly [Model, ReadonlyArray<Command.Command<Message>>];
+
+const withUpdateReturn = M.withReturnType<UpdateReturn>();
 
 export const update = (model: Model, message: Message): UpdateReturn =>
   M.value(message).pipe(
-    M.withReturnType<UpdateReturn>(),
+    withUpdateReturn,
     M.tagsExhaustive({
-      TabsEnteredContainer: ({ tabCount }) => [
+      GotBaseMessage: ({ message }) => {
+        const [base, commands, maybeSelected] = BaseTabsView.update(
+          model.base,
+          message,
+        );
+        const stepped = evo(model, { base: () => base });
+        const mapped = Command.mapMessages(commands, (message) =>
+          GotBaseMessage({ message }),
+        );
+        // A commit re-measures: keyboard activation can select a tab before
+        // any pointer has entered the container, so without this the pill
+        // would have no rects to travel between.
+        return Option.match(maybeSelected, {
+          onNone: (): UpdateReturn => [stepped, mapped],
+          onSome: ({ value }) => [
+            evo(stepped, { selectedValue: () => value }),
+            [
+              ...mapped,
+              MeasureTabRects({ id: model.id, count: model.rects.length }),
+            ],
+          ],
+        });
+      },
+
+      EnteredContainer: ({ tabCount }) => [
         evo(model, {
           session: (session) => session + 1,
           isPointerInside: () => true,
@@ -113,7 +156,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [MeasureTabRects({ id: model.id, count: tabCount })],
       ],
 
-      TabsLeftContainer: () => [
+      ExitedContainer: () => [
         evo(model, {
           isPointerInside: () => false,
           // Unlike Table rows, tabs keep a visible selected pill — the hover
@@ -123,20 +166,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [],
       ],
 
-      TabsEnteredTab: ({ index }) => [
+      EnteredTab: ({ index }) => [
         evo(model, { maybeHoverIndex: () => Option.some(index) }),
         [],
       ],
 
-      // Keyboard activation can land before any pointer entry, so selection
-      // re-measures — with fresh rects the pill animates to the new tab.
-      TabsClickedTab: ({ index, tabCount }) => [
-        evo(model, { selectedIndex: () => index }),
-        [MeasureTabRects({ id: model.id, count: tabCount })],
-      ],
-
-      TabsGotTabRects: ({ rects }) => [
-        evo(model, { rects: () => [...rects] }),
+      MeasuredTabRects: ({ rects }) => [
+        evo(model, { rects: () => Arr.copy(rects) }),
         [],
       ],
     }),
@@ -160,108 +196,142 @@ export type TabSpec = Readonly<{
 export type ViewInputs = Readonly<{
   tabs: ReadonlyArray<string>;
   tabSpec: (label: string) => TabSpec;
+  /** Names the tablist for screen readers; the base component requires it. */
+  ariaLabel: string;
   className?: string;
 }>;
 
 export const view = Submodel.defineView<Model, Message, ViewInputs>(
   (model, viewInputs): Html => {
     const h = html<Message>();
-    const { tabs, tabSpec, className = "" } = viewInputs;
+    const { tabs, tabSpec, ariaLabel, className = "" } = viewInputs;
     const tabCount = tabs.length;
-
-    const selectedRect = model.rects[model.selectedIndex];
     const hoverIndex = Option.getOrNull(model.maybeHoverIndex);
-    const isHoveringElsewhere =
-      hoverIndex !== null && hoverIndex !== model.selectedIndex;
 
-    // Selected pill: moderate tier, dims while another tab is hovered.
-    const selectedPill =
-      selectedRect === undefined
-        ? h.empty
-        : h.div(
-            [
-              h.Class(
-                `pointer-events-none absolute rounded-lg bg-active transition-all duration-160 ease-out ${
-                  isHoveringElsewhere ? "opacity-80" : ""
-                }`,
-              ),
-              h.Style({
-                top: `${selectedRect.top}px`,
-                left: `${selectedRect.left}px`,
-                width: `${selectedRect.width}px`,
-                height: `${selectedRect.height}px`,
-              }),
-            ],
-            [],
-          );
+    return h.submodel({
+      slotId: `${model.id}-base`,
+      model: model.base,
+      view: BaseTabsView.view,
+      viewInputs: {
+        tabs,
+        selectedValue: model.selectedValue,
+        ariaLabel,
+        toView: (render: BaseTabs.RenderInfo<string>): Html => {
+          const selectedRect = model.rects[render.activeIndex];
+          const isHoveringElsewhere =
+            hoverIndex !== null && hoverIndex !== render.activeIndex;
 
-    // Hover pill: the shared traveling-overlay treatment, suppressed over
-    // the selected tab so the pills never stack.
-    const hoverPill =
-      hoverIndex === null || !isHoveringElsewhere
-        ? h.empty
-        : (() => {
-            const rect = model.rects[hoverIndex];
-            if (rect === undefined) return h.empty;
-            return h.keyed("div")(
-              `hover-${model.session}`,
+          // Selected pill: moderate tier, dims while another tab is hovered.
+          const selectedPill =
+            selectedRect === undefined
+              ? h.empty
+              : h.div(
+                  [
+                    h.Role("presentation"),
+                    h.Class(
+                      `pointer-events-none absolute rounded-lg bg-active transition-all duration-160 ease-out ${
+                        isHoveringElsewhere ? "opacity-80" : ""
+                      }`,
+                    ),
+                    h.Style({
+                      top: `${selectedRect.top}px`,
+                      left: `${selectedRect.left}px`,
+                      width: `${selectedRect.width}px`,
+                      height: `${selectedRect.height}px`,
+                    }),
+                  ],
+                  [],
+                );
+
+          // Hover pill: the shared traveling-overlay treatment, suppressed
+          // over the selected tab so the pills never stack.
+          const hoverPill =
+            hoverIndex === null || !isHoveringElsewhere
+              ? h.empty
+              : (() => {
+                  const rect = model.rects[hoverIndex];
+                  if (rect === undefined) return h.empty;
+                  return h.keyed("div")(
+                    `hover-${model.session}`,
+                    [
+                      h.Role("presentation"),
+                      h.Class("fk-hover-overlay rounded-lg"),
+                      ...(model.isPointerInside
+                        ? []
+                        : [h.DataAttribute("hidden", "")]),
+                      h.Style({
+                        top: `${rect.top}px`,
+                        left: `${rect.left}px`,
+                        width: `${rect.width}px`,
+                        height: `${rect.height}px`,
+                      }),
+                    ],
+                    [],
+                  );
+                })();
+
+          const tabViews = render.tabs.map((info) => {
+            const tab = tabSpec(info.value);
+            const isActive = info.isActive || hoverIndex === info.index;
+
+            return h.button(
               [
-                h.Class("fk-hover-overlay rounded-lg"),
-                ...(model.isPointerInside
-                  ? []
-                  : [h.DataAttribute("hidden", "")]),
-                h.Style({
-                  top: `${rect.top}px`,
-                  left: `${rect.left}px`,
-                  width: `${rect.width}px`,
-                  height: `${rect.height}px`,
-                }),
+                // The base bundle carries Id, Role, AriaSelected,
+                // AriaControls, the roving tabindex, and the click/key
+                // handlers — everything that makes this a real tab.
+                ...info.tab,
+                h.OnMouseEnter(EnteredTab({ index: info.index })),
+                h.Class(
+                  // Static bg-active stands in for the pill until rects exist.
+                  `relative z-10 flex h-8 cursor-pointer select-none items-center gap-2 rounded-lg px-3 outline-none focus-visible:ring-1 focus-visible:ring-focus-ring ${hoverTransition} ${
+                    isActive ? "text-foreground" : "text-muted-foreground"
+                  } ${
+                    info.isActive && selectedRect === undefined
+                      ? "bg-active"
+                      : ""
+                  }`,
+                ),
               ],
-              [],
+              [
+                tab.icon(
+                  `h-[18px] w-[18px] shrink-0 ${tab.iconClass ?? ""}`,
+                  isActive ? "2.25" : "1.75",
+                ),
+                weightLabel({ label: tab.label, isBold: info.isActive }),
+                tab.detail === undefined
+                  ? h.empty
+                  : h.span([h.Class("text-muted-foreground/60")], [tab.detail]),
+              ],
             );
-          })();
+          });
 
-    const tabViews = tabs.map((label, index) => {
-      const tab = tabSpec(label);
-      const isSelected = index === model.selectedIndex;
-      const isActive = isSelected || hoverIndex === index;
+          const activeTab = render.tabs[render.activeIndex];
 
-      return h.button(
-        [
-          h.Type("button"),
-          h.Id(tabId(model.id, index)),
-          h.Role("tab"),
-          h.AriaSelected(isSelected),
-          h.OnMouseEnter(EnteredTab({ index })),
-          h.OnClick(ClickedTab({ index, tabCount })),
-          h.Class(
-            // Static bg-active stands in for the pill until rects exist.
-            `relative z-10 flex h-8 cursor-pointer select-none items-center gap-2 rounded-lg px-3 outline-none focus-visible:ring-1 focus-visible:ring-focus-ring ${hoverTransition} ${
-              isActive ? "text-foreground" : "text-muted-foreground"
-            } ${isSelected && selectedRect === undefined ? "bg-active" : ""}`,
-          ),
-        ],
-        [
-          tab.icon(
-            `h-[18px] w-[18px] shrink-0 ${tab.iconClass ?? ""}`,
-            isActive ? "2.25" : "1.75",
-          ),
-          weightLabel({ label: tab.label, isBold: isSelected }),
-          tab.detail === undefined
-            ? h.empty
-            : h.span([h.Class("text-muted-foreground/60")], [tab.detail]),
-        ],
-      );
+          return h.div(
+            [h.Class("contents")],
+            [
+              h.div(
+                [
+                  ...render.tablist,
+                  h.Class(`relative flex items-center gap-0.5 ${className}`),
+                  h.OnMouseEnter(EnteredContainer({ tabCount })),
+                  h.OnMouseLeave(ExitedContainer()),
+                ],
+                [selectedPill, hoverPill, ...tabViews],
+              ),
+              // The panel each tab's aria-controls points at. These tabs
+              // filter a list that lives outside this submodel, so the panel
+              // is an empty labelled region rather than a content container —
+              // it exists so the tab-to-panel pairing resolves.
+              activeTab === undefined
+                ? h.empty
+                : h.div([...activeTab.panel, h.Class("hidden")], []),
+            ],
+          );
+        },
+      },
+      toParentMessage: (message: BaseTabs.Message) =>
+        GotBaseMessage({ message }),
     });
-
-    return h.div(
-      [
-        h.Class(`relative flex items-center gap-0.5 ${className}`),
-        h.Role("tablist"),
-        h.OnMouseEnter(EnteredContainer({ tabCount })),
-        h.OnMouseLeave(LeftContainer()),
-      ],
-      [selectedPill, hoverPill, ...tabViews],
-    );
   },
 );

@@ -1,6 +1,11 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
+import * as Neon from "alchemy/Neon";
+// TRANSITIONAL: no resource declares PlanetScale any more, but each stage's
+// state still records the database/branch/role from before the Neon swap, and
+// Alchemy needs the provider registered to delete them. Drop this import and
+// the `Planetscale.providers()` entry below once every stage has deployed once.
 import * as Planetscale from "alchemy/Planetscale";
 import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
@@ -19,6 +24,7 @@ export default Alchemy.Stack(
     providers: Layer.mergeAll(
       Cloudflare.providers(),
       Drizzle.providers(),
+      Neon.providers(),
       Planetscale.providers(),
     ),
     state: Cloudflare.state(),
