@@ -1,4 +1,13 @@
-import { Context, Effect, Layer, Option, Schema as S } from "effect";
+import {
+  Array as Arr,
+  Context,
+  Effect,
+  Function,
+  Layer,
+  Match as M,
+  Option,
+  Schema as S,
+} from "effect";
 import {
   FetchHttpClient,
   HttpClient,
@@ -9,21 +18,14 @@ import { RateLimiter } from "effect/unstable/persistence";
 
 import { AuthClient } from "./auth";
 
-// Typed client for the Gmail REST API (the mail-client subset of the 80
-// methods in reference/gmail.json — settings/delegation/S-MIME/CSE are
-// deliberately not modeled). Transport-only: fetch, decode, classify
-// errors. Cursors, paging loops, retry policy, and the local database
+// Typed client for the Gmail REST API. Transport only: fetch, decode,
+// classify errors. Cursors, paging, retry policy, and the local database
 // belong to the SyncEngine in sync.ts.
-//
-// Every response is decoded through a schema before it reaches a caller,
-// so API drift surfaces as a typed GmailDecodeError instead of undefined
-// creeping into the database.
 
 // IDS
 //
-// Branded so a MessageId can never be passed where a ThreadId is expected
-// — the API would accept the string and 404 at runtime; the brand makes it
-// a compile error instead.
+// NOTE: Branded so a MessageId can never be passed where a ThreadId is
+// expected. The API would accept the string and 404 at runtime.
 
 export const MessageId = S.NonEmptyString.pipe(S.brand("GmailMessageId"));
 export type MessageId = typeof MessageId.Type;
@@ -37,27 +39,24 @@ export type LabelId = typeof LabelId.Type;
 export const AttachmentId = S.NonEmptyString.pipe(S.brand("GmailAttachmentId"));
 export type AttachmentId = typeof AttachmentId.Type;
 
-// Monotonic per-mailbox cursor (a stringified uint64 on the wire). The
-// sync engine's incremental pulls hinge on this: persist the latest one,
-// hand it to listHistory, and treat GmailNotFound there as "cursor
-// expired, full resync required".
+// NOTE: Monotonic per-mailbox cursor. GmailNotFound from listHistory means
+// the cursor expired and a full resync is required.
 export const HistoryId = S.NonEmptyString.pipe(S.brand("GmailHistoryId"));
 export type HistoryId = typeof HistoryId.Type;
 
 export const PageToken = S.NonEmptyString.pipe(S.brand("GmailPageToken"));
 export type PageToken = typeof PageToken.Type;
 
-// Gmail body payloads are base64url (RFC 4648 §5, `-`/`_` alphabet), NOT
-// plain base64 — atob() on this without translation corrupts bodies. The
-// brand keeps "already decoded" and "still wire-encoded" strings apart.
+// NOTE: Gmail body payloads are base64url (RFC 4648 §5, `-`/`_` alphabet),
+// not plain base64; atob() without translation corrupts bodies. The brand
+// keeps "already decoded" and "still wire-encoded" strings apart.
 export const Base64Url = S.String.pipe(S.brand("Base64Url"));
 export type Base64Url = typeof Base64Url.Type;
 
 // SCHEMAS
 //
-// Shapes mirror reference/gmail.json `schemas`. Fields the API documents
-// but may omit (format-dependent: metadata vs full vs minimal) are
-// optionalKey, so a decode of a minimal-format message still succeeds.
+// NOTE: Fields the API may omit depending on format (metadata vs full vs
+// minimal) are optionalKey, so a minimal-format decode still succeeds.
 
 export const Profile = S.Struct({
   emailAddress: S.String,
@@ -80,9 +79,9 @@ export const MessagePartBody = S.Struct({
 });
 export type MessagePartBody = typeof MessagePartBody.Type;
 
-// MIME trees are recursive (multipart/* parts contain parts), so the
-// schema needs an explicit interface + suspend. The encoded side is
-// spelled out separately because the brands only exist on the Type side.
+// NOTE: MIME trees are recursive, so the schema needs an explicit interface +
+// suspend. The encoded side is spelled out separately because the brands only
+// exist on the Type side.
 export interface MessagePart {
   readonly partId?: string;
   readonly mimeType?: string;
@@ -120,8 +119,8 @@ export const Message = S.Struct({
   labelIds: S.optionalKey(S.Array(LabelId)),
   snippet: S.optionalKey(S.String),
   historyId: S.optionalKey(HistoryId),
-  // Epoch milliseconds as a string (int64 on the wire); when ordering by
-  // it, Number() first — string comparison misorders across digit counts.
+  // NOTE: Epoch millis as a string. Order by Number(), not the string:
+  // string comparison misorders across digit counts.
   internalDate: S.optionalKey(S.String),
   sizeEstimate: S.optionalKey(S.Number),
   payload: S.optionalKey(MessagePart),
@@ -196,10 +195,8 @@ export type ListHistoryResponse = typeof ListHistoryResponse.Type;
 
 // ERRORS
 //
-// Google's error envelope is uniform across every method:
-//   { error: { code, message, status?, errors?: [{ reason?, domain? }] } }
-// Classified into a closed union so the SyncEngine can catchTag
-// exhaustively — each member dictates a different recovery.
+// Classified into a closed union so the SyncEngine can catchTag exhaustively;
+// each member dictates a different recovery.
 
 const GoogleErrorEnvelope = S.Struct({
   error: S.Struct({
@@ -301,38 +298,62 @@ const RATE_LIMIT_REASONS = new Set([
   "quotaExceeded",
 ]);
 
+const HTTP_UNAUTHORIZED = 401;
+const HTTP_FORBIDDEN = 403;
+const HTTP_NOT_FOUND = 404;
+const HTTP_TOO_MANY_REQUESTS = 429;
+const HTTP_SERVER_ERROR = 500;
+
 const classifyStatus = (
   status: number,
   retryAfterMs: number | undefined,
   body: unknown,
 ): GmailError => {
-  const envelope = decodeEnvelope(body);
-  const message = Option.match(envelope, {
+  const maybeEnvelope = decodeEnvelope(body);
+  const message = Option.match(maybeEnvelope, {
     onNone: () => `Gmail request failed with HTTP ${status}.`,
-    onSome: (e) => e.error.message,
+    onSome: (envelope) => envelope.error.message,
   });
-  const reason = Option.flatMapNullishOr(envelope, (e) =>
-    e.error.errors?.find((detail) => detail.reason !== undefined),
-  ).pipe(Option.flatMapNullishOr((detail) => detail.reason));
+  const maybeReason = Option.flatMap(maybeEnvelope, (envelope) =>
+    Option.flatMap(
+      Arr.findFirst(
+        envelope.error.errors ?? [],
+        (detail) => detail.reason !== undefined,
+      ),
+      (detail) => Option.fromNullishOr(detail.reason),
+    ),
+  );
 
-  if (status === 401) return new GmailAuthError({ message });
-  if (status === 429) return new GmailRateLimited({ message, retryAfterMs });
-  if (status === 403) {
-    return Option.match(
-      Option.filter(reason, (r) => RATE_LIMIT_REASONS.has(r)),
+  // 403 is overloaded: a usage-limit reason means back off, anything else
+  // means the granted scopes don't cover the call.
+  const classifyForbidden = (): GmailError =>
+    Option.match(
+      Option.filter(maybeReason, (reason) => RATE_LIMIT_REASONS.has(reason)),
       {
         onSome: () => new GmailRateLimited({ message, retryAfterMs }),
         onNone: () =>
           new GmailScopeError({
             message,
-            reason: Option.getOrUndefined(reason),
+            reason: Option.getOrUndefined(maybeReason),
           }),
       },
     );
-  }
-  if (status === 404) return new GmailNotFound({ message });
-  if (status >= 500) return new GmailServerError({ message, code: status });
-  return new GmailInvalidRequest({ message, code: status });
+
+  return M.value(status).pipe(
+    M.withReturnType<GmailError>(),
+    M.when(HTTP_UNAUTHORIZED, () => new GmailAuthError({ message })),
+    M.when(
+      HTTP_TOO_MANY_REQUESTS,
+      () => new GmailRateLimited({ message, retryAfterMs }),
+    ),
+    M.when(HTTP_FORBIDDEN, classifyForbidden),
+    M.when(HTTP_NOT_FOUND, () => new GmailNotFound({ message })),
+    M.when(
+      (code) => code >= HTTP_SERVER_ERROR,
+      () => new GmailServerError({ message, code: status }),
+    ),
+    M.orElse(() => new GmailInvalidRequest({ message, code: status })),
+  );
 };
 
 // TRANSPORT
@@ -341,10 +362,11 @@ const BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 type QueryValue = string | number | boolean | ReadonlyArray<string> | undefined;
 
+// Absent, or a non-numeric value, both come back undefined: Number(undefined)
+// is NaN and so fails the finite check on its own.
 const parseRetryAfter = (header: string | undefined): number | undefined => {
-  if (header === undefined) return undefined;
-  const seconds = Number(header);
-  return Number.isFinite(seconds) ? seconds * 1000 : undefined;
+  const milliseconds = Number(header) * 1000;
+  return Number.isFinite(milliseconds) ? milliseconds : undefined;
 };
 
 // SERVICE
@@ -374,12 +396,11 @@ export interface ModifyLabels {
 // QUOTA
 //
 // Gmail's binding limit is 250 quota units per user per second (a moving
-// average). Every request is paced through a token bucket weighted by
-// Google's documented unit costs, with headroom under the ceiling, so
-// sustained sync work never draws 429s in steady state. The limiter also
-// learns from rate-limit/Retry-After response headers and replays 429s
-// through the bucket, so the occasional disagreement self-corrects here
-// before the SyncEngine ever sees a failure.
+// average). Every request is paced through a token bucket weighted by Google's
+// documented unit costs, with headroom under the ceiling, so sustained sync
+// work never draws 429s in steady state. The limiter also learns from
+// Retry-After headers and replays 429s through the bucket, so the occasional
+// disagreement self-corrects before the SyncEngine sees a failure.
 
 const QUOTA_WINDOW = "1 second";
 const QUOTA_UNITS_PER_WINDOW = 200;
@@ -387,27 +408,32 @@ const QUOTA_UNITS_PER_WINDOW = 200;
 /** What one thread costs to fetch (`threads.get`), per Google's table. */
 const THREAD_GET_UNITS = 10;
 
-/** Sustained thread throughput the bucket allows. The bucket — not the
- *  concurrency setting — is what binds the backfill, so this is the real
- *  steady-state rate and the honest basis for a sync time estimate.
- *
- *  At 200 units/sec this is 20 threads/sec against a possible 25; the
- *  headroom is deliberate (see above). Raising QUOTA_UNITS_PER_WINDOW moves
- *  this number and the estimate together. */
+/** Sustained thread throughput the bucket allows. The bucket, not the
+ *  concurrency setting, is what binds the backfill, so this is the real
+ *  steady-state rate and the basis for the sync time estimate. Raising
+ *  QUOTA_UNITS_PER_WINDOW moves this number and the estimate together. */
 export const THREADS_PER_SECOND = QUOTA_UNITS_PER_WINDOW / THREAD_GET_UNITS;
 
-// Google's per-method quota unit table, keyed by URL shape. Order matters:
-// an attachment URL also contains /messages/.
-const quotaUnits = (request: HttpClientRequest.HttpClientRequest): number => {
-  const url = request.url;
-  if (url.includes("/attachments/")) return 5;
-  if (url.includes("/history")) return 2;
-  if (url.includes("/profile")) return 1;
-  if (url.includes("/labels")) return 1;
-  if (url.includes("/threads")) return 10;
-  if (url.includes("/messages")) return 5;
-  return 10;
-};
+// Google's per-method quota unit table, keyed by URL shape.
+// NOTE: Order matters. An attachment URL also contains /messages/, so the
+// first match wins and the narrower fragments come first.
+const QUOTA_UNITS_BY_PATH: ReadonlyArray<readonly [string, number]> = [
+  ["/attachments/", 5],
+  ["/history", 2],
+  ["/profile", 1],
+  ["/labels", 1],
+  ["/threads", 10],
+  ["/messages", 5],
+];
+const DEFAULT_QUOTA_UNITS = 10;
+
+const quotaUnits = (request: HttpClientRequest.HttpClientRequest): number =>
+  Option.getOrElse(
+    Arr.findFirst(QUOTA_UNITS_BY_PATH, ([fragment, units]) =>
+      request.url.includes(fragment) ? Option.some(units) : Option.none(),
+    ),
+    () => DEFAULT_QUOTA_UNITS,
+  );
 
 export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
   make: Effect.gen(function* () {
@@ -442,20 +468,14 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       ),
     );
 
-    // getAccessToken is a round-trip to our own backend, and it used to run
-    // once per Gmail call — during a backfill that doubles the request count
-    // and puts our server in front of every single API call. Google's tokens
-    // last an hour; caching for five minutes keeps the refresh-on-expiry
-    // behaviour while collapsing thousands of calls into a handful.
-    //
-    // The cache is what makes a 401 possible mid-flight (a token revoked
-    // inside the window), so `request` invalidates and retries once on an
-    // auth-shaped failure rather than letting the sync machine park in its
-    // terminal NeedsAuth state over a stale string.
-    const [accessToken, invalidateAccessToken] = yield* Effect.cachedInvalidateWithTTL(
-      fetchAccessToken,
-      "5 minutes",
-    );
+    // NOTE: getAccessToken is a round-trip to our own backend, so running it
+    // per Gmail call put our server in front of every API call and doubled a
+    // backfill's request count. Google's tokens last an hour; a five-minute
+    // cache keeps refresh-on-expiry while collapsing thousands of calls into a
+    // handful. It is also what makes a mid-flight 401 possible, which is why
+    // `request` below invalidates and retries once.
+    const [accessToken, invalidateAccessToken] =
+      yield* Effect.cachedInvalidateWithTTL(fetchAccessToken, "5 minutes");
 
     // Effect.fn wraps every call in a named span, so each Gmail request
     // shows up in traces as "Gmail.request" with its own timing.
@@ -477,18 +497,17 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
         // UrlParams drops undefined values and repeats array entries
         // (labelIds=A&labelIds=B) — how the API encodes them.
         HttpClientRequest.appendUrlParams(query),
-        body === undefined ? (r) => r : HttpClientRequest.bodyJsonUnsafe(body),
+        body === undefined
+          ? Function.identity
+          : HttpClientRequest.bodyJsonUnsafe(body),
       );
 
-      // The client only fails on transport problems; non-2xx statuses
-      // come back as responses so we classify them ourselves against
-      // Google's envelope.
-      //
-      // Tracer propagation must stay off: with a tracer active the client
-      // adds traceparent/b3 headers, and Google's CORS preflight rejects
-      // them ("No 'Access-Control-Allow-Origin' header is present") even
-      // though its OPTIONS response claims to allow them. The Gmail.request
-      // span itself is unaffected — only the outgoing headers are dropped.
+      // The client only fails on transport problems; non-2xx statuses come
+      // back as responses, so we classify them against Google's envelope.
+      // NOTE: Tracer propagation must stay off. With a tracer active the
+      // client adds traceparent/b3 headers, and Google's CORS preflight
+      // rejects them even though its OPTIONS response claims to allow them.
+      // Only the outgoing headers are dropped; the Gmail.request span is fine.
       const response = yield* http.execute(req).pipe(
         Effect.provideService(HttpClient.TracerPropagationEnabled, false),
         Effect.mapError(
@@ -514,10 +533,9 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       );
     });
 
-    // An auth failure on a cached token is ambiguous: the grant may really
-    // be gone, or the string may just have gone stale inside the TTL. Drop
-    // the cache and try once more — if it fails again the grant is genuinely
-    // gone and the error is honest.
+    // An auth failure on a cached token is ambiguous: the grant may be gone,
+    // or the string may just have gone stale inside the TTL. Drop the cache
+    // and try once more; a second failure is the genuine answer.
     const request = <A>(
       schema: S.Codec<A, any>,
       method: "GET" | "POST",

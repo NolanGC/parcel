@@ -19,7 +19,7 @@
 // sender would not otherwise have had. So open trackers are filtered out
 // before anything is fetched: see isTrackerUrl and the tiny-image scan.
 
-import { Context, Effect, Layer, Option } from "effect";
+import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 
 import { API_URL } from "./config";
 
@@ -97,49 +97,58 @@ const isTrackingSized = (tag: string): boolean => {
 const decodeEntities = (url: string): string =>
   url.replaceAll("&amp;", "&").replaceAll("&#38;", "&");
 
-// Urls belonging to <img> tags that declare themselves a pixel. Collected in
-// its own pass because SRC_PATTERN matches bare attributes and so cannot see
-// the width and height sitting next to them.
-const trackingSizedUrls = (body: string): ReadonlySet<string> => {
-  const skipped = new Set<string>();
-  for (const [tag] of body.matchAll(IMG_TAG_PATTERN)) {
-    if (!isTrackingSized(tag)) continue;
-    const source = TAG_SRC_PATTERN.exec(tag)?.[1];
-    if (source !== undefined) skipped.add(decodeEntities(source.trim()));
-  }
-  return skipped;
-};
+// NOTE: Collected in its own pass because SRC_PATTERN matches bare attributes
+// and so cannot see the width and height sitting next to them.
+const trackingSizedUrls = (body: string): ReadonlySet<string> =>
+  new Set(
+    Arr.getSomes(
+      Arr.map([...body.matchAll(IMG_TAG_PATTERN)], ([tag]) =>
+        isTrackingSized(tag)
+          ? Option.map(
+              Option.flatMap(
+                Option.fromNullishOr(TAG_SRC_PATTERN.exec(tag)),
+                (match) => Arr.get(match, 1),
+              ),
+              (source) => decodeEntities(source.trim()),
+            )
+          : Option.none(),
+      ),
+    ),
+  );
+
+// NOTE: cid: is the inline-attachment path (message_attachments), data: is
+// already local, and anything else non-http we have no way to fetch.
+const isFetchableUrl = (url: string): boolean =>
+  url.startsWith("http://") || url.startsWith("https://");
 
 export const remoteImageUrls = (body: string): ReadonlyArray<string> => {
   const tiny = trackingSizedUrls(body);
-  const found = new Set<string>();
-  for (const match of body.matchAll(SRC_PATTERN)) {
-    const raw = match[1];
-    if (raw === undefined) continue;
-    const url = decodeEntities(raw.trim());
-    // cid: is the inline-attachment path (message_attachments), data: is
-    // already local, and anything else non-http we have no way to fetch.
-    if (!url.startsWith("http://") && !url.startsWith("https://")) continue;
-    if (tiny.has(url) || isTrackerUrl(url)) continue;
-    found.add(url);
-    if (found.size >= MAX_IMAGES_PER_MESSAGE) break;
-  }
-  return [...found];
+  const candidates = Arr.getSomes(
+    Arr.map([...body.matchAll(SRC_PATTERN)], (match) =>
+      Option.map(Arr.get(match, 1), (raw) => decodeEntities(raw.trim())),
+    ),
+  );
+  return Arr.take(
+    Arr.dedupe(
+      Arr.filter(
+        candidates,
+        (url) => isFetchableUrl(url) && !tiny.has(url) && !isTrackerUrl(url),
+      ),
+    ),
+    MAX_IMAGES_PER_MESSAGE,
+  );
 };
 
-/** Swap cached urls for local blob urls. Anything absent from `local` is
- *  left exactly as it was, so an uncached image still loads from its origin
- *  rather than turning into a broken image. */
+/** Swap cached urls for local blob urls. Anything absent from `local` is left
+ *  exactly as it was, so an uncached image still loads from its origin rather
+ *  than turning into a broken image. */
 export const rewriteImageUrls = (
   body: string,
   local: ReadonlyMap<string, string>,
-): string => {
-  let rewritten = body;
-  for (const [url, blobUrl] of local) {
-    rewritten = rewritten.replaceAll(url, blobUrl);
-  }
-  return rewritten;
-};
+): string =>
+  Arr.reduce([...local], body, (rewritten, [url, blobUrl]) =>
+    rewritten.replaceAll(url, blobUrl),
+  );
 
 export type FetchedImage = Readonly<{
   mimeType: string;
@@ -171,7 +180,9 @@ export class ImageFetcher extends Context.Service<ImageFetcher>()(
             `${API_URL}/api/proxy/image?url=${encodeURIComponent(url)}`,
             { credentials: "include" },
           );
-          if (!response.ok) return Option.none<FetchedImage>();
+          if (!response.ok) {
+            return Option.none<FetchedImage>();
+          }
           const mimeType = response.headers.get("content-type") ?? "image/png";
           const buffer = await response.arrayBuffer();
           return buffer.byteLength > MAX_IMAGE_BYTES

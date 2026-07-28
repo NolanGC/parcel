@@ -217,58 +217,59 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
         selectedValue: model.selectedValue,
         ariaLabel,
         toView: (render: BaseTabs.RenderInfo<string>): Html => {
-          const selectedRect = model.rects[render.activeIndex];
+          const maybeSelectedRect = Arr.get(model.rects, render.activeIndex);
           const isHoveringElsewhere =
             hoverIndex !== null && hoverIndex !== render.activeIndex;
 
           // Selected pill: moderate tier, dims while another tab is hovered.
-          const selectedPill =
-            selectedRect === undefined
-              ? h.empty
-              : h.div(
-                  [
-                    h.Role("presentation"),
-                    h.Class(
-                      `pointer-events-none absolute rounded-lg bg-active transition-all duration-160 ease-out ${
-                        isHoveringElsewhere ? "opacity-80" : ""
-                      }`,
-                    ),
-                    h.Style({
-                      top: `${selectedRect.top}px`,
-                      left: `${selectedRect.left}px`,
-                      width: `${selectedRect.width}px`,
-                      height: `${selectedRect.height}px`,
-                    }),
-                  ],
-                  [],
-                );
+          const selectedPill = Option.match(maybeSelectedRect, {
+            onNone: () => h.empty,
+            onSome: (selectedRect) =>
+              h.div(
+                [
+                  h.Role("presentation"),
+                  h.Class(
+                    `pointer-events-none absolute rounded-lg bg-active transition-all duration-160 ease-out ${
+                      isHoveringElsewhere ? "opacity-80" : ""
+                    }`,
+                  ),
+                  h.Style({
+                    top: `${selectedRect.top}px`,
+                    left: `${selectedRect.left}px`,
+                    width: `${selectedRect.width}px`,
+                    height: `${selectedRect.height}px`,
+                  }),
+                ],
+                [],
+              ),
+          });
 
           // Hover pill: the shared traveling-overlay treatment, suppressed
           // over the selected tab so the pills never stack.
           const hoverPill =
             hoverIndex === null || !isHoveringElsewhere
               ? h.empty
-              : (() => {
-                  const rect = model.rects[hoverIndex];
-                  if (rect === undefined) return h.empty;
-                  return h.keyed("div")(
-                    `hover-${model.session}`,
-                    [
-                      h.Role("presentation"),
-                      h.Class("fk-hover-overlay rounded-lg"),
-                      ...(model.isPointerInside
-                        ? []
-                        : [h.DataAttribute("hidden", "")]),
-                      h.Style({
-                        top: `${rect.top}px`,
-                        left: `${rect.left}px`,
-                        width: `${rect.width}px`,
-                        height: `${rect.height}px`,
-                      }),
-                    ],
-                    [],
-                  );
-                })();
+              : Option.match(Arr.get(model.rects, hoverIndex), {
+                  onNone: () => h.empty,
+                  onSome: (rect) =>
+                    h.keyed("div")(
+                      `hover-${model.session}`,
+                      [
+                        h.Role("presentation"),
+                        h.Class("fk-hover-overlay rounded-lg"),
+                        ...(model.isPointerInside
+                          ? []
+                          : [h.DataAttribute("hidden", "")]),
+                        h.Style({
+                          top: `${rect.top}px`,
+                          left: `${rect.left}px`,
+                          width: `${rect.width}px`,
+                          height: `${rect.height}px`,
+                        }),
+                      ],
+                      [],
+                    ),
+                });
 
           const tabViews = render.tabs.map((info) => {
             const tab = tabSpec(info.value);
@@ -286,7 +287,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                   `relative z-10 flex h-8 cursor-pointer select-none items-center gap-2 rounded-lg px-3 outline-none focus-visible:ring-1 focus-visible:ring-focus-ring ${hoverTransition} ${
                     isActive ? "text-foreground" : "text-muted-foreground"
                   } ${
-                    info.isActive && selectedRect === undefined
+                    info.isActive && Option.isNone(maybeSelectedRect)
                       ? "bg-active"
                       : ""
                   }`,
@@ -305,7 +306,7 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
             );
           });
 
-          const activeTab = render.tabs[render.activeIndex];
+          const maybeActiveTab = Arr.get(render.tabs, render.activeIndex);
 
           return h.div(
             [h.Class("contents")],
@@ -323,9 +324,11 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
               // filter a list that lives outside this submodel, so the panel
               // is an empty labelled region rather than a content container —
               // it exists so the tab-to-panel pairing resolves.
-              activeTab === undefined
-                ? h.empty
-                : h.div([...activeTab.panel, h.Class("hidden")], []),
+              Option.match(maybeActiveTab, {
+                onNone: () => h.empty,
+                onSome: (activeTab) =>
+                  h.div([...activeTab.panel, h.Class("hidden")], []),
+              }),
             ],
           );
         },

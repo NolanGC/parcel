@@ -6,6 +6,7 @@ import {
   Cause,
   Effect,
   Match as M,
+  Number,
   Option,
   Result,
   Schema as S,
@@ -38,6 +39,7 @@ import {
   GotTabsMessage,
   InboxPalette,
   LIST_ID,
+  ListKey,
   Message,
   Model,
   OpeningThread,
@@ -57,6 +59,10 @@ export { view } from "./view";
 
 // COMMAND
 
+const APPEARANCE_CROSSFADE = "220 millis";
+
+// System follows the OS; Light/Dark pin a class on <html> so the light-dark()
+// tokens re-resolve, wrapped in a cross-fade.
 const ApplyAppearance = Command.define(
   "ApplyAppearance",
   { appearance: Appearance },
@@ -67,18 +73,21 @@ const ApplyAppearance = Command.define(
     yield* Effect.sync(() => {
       root.classList.add("transitioning");
       root.classList.remove("light", "dark");
-      if (appearance === "Light") root.classList.add("light");
-      if (appearance === "Dark") root.classList.add("dark");
+      if (appearance === "Light") {
+        root.classList.add("light");
+      }
+      if (appearance === "Dark") {
+        root.classList.add("dark");
+      }
     });
-    yield* Effect.sleep("220 millis");
+    yield* Effect.sleep(APPEARANCE_CROSSFADE);
     yield* Effect.sync(() => root.classList.remove("transitioning"));
     return CompletedApplyAppearance();
   }),
 );
 
-// Selects the whole local store (newest first) — no network; filling the
-// store is the sync machine's job. Runs at boot and again whenever the
-// machine reports enough new rows (see GotSyncMessage).
+/** Selects the whole local store, newest first. No network: filling the store
+ *  is the sync machine's job. */
 export const LoadInbox = Command.define(
   "LoadInbox",
   SucceededLoadInbox,
@@ -109,8 +118,8 @@ export const bootCommands = (
   ),
 ];
 
-// One palette search. `seq` rides through the service untouched so the
-// update can tell a fresh reply from a superseded one.
+/** One palette search. `seq` rides through the service untouched so the update
+ *  can tell a fresh reply from a superseded one. */
 export const RunSearch = Command.define(
   "RunSearch",
   { seq: S.Number, text: S.String },
@@ -128,10 +137,8 @@ export const RunSearch = Command.define(
   }),
 );
 
-// The store's on-disk size, for the sync pill's detail. Read at boot and
-// again whenever the machine reports progress worth repainting for, so the
-// number tracks a running backfill instead of going stale at whatever it was
-// when the app opened.
+/** The store's on-disk size, for the sync pill's detail. Re-read on the same
+ *  cadence as the row refresh so it tracks a running backfill. */
 export const ReadLocalSize = Command.define(
   "ReadLocalSize",
   SucceededReadLocalSize,
@@ -148,19 +155,17 @@ export const ReadLocalSize = Command.define(
   }),
 );
 
-// One turn of the image prefetch loop, re-issued from its own result (see
-// the CompletedCacheImageBatch handler). Deliberately separate from the sync
-// machine and running alongside it: the backfill is bound by Gmail's quota
-// bucket and this by the image proxy, so sequencing them would leave one of
-// the two resources idle for the whole sync.
-//
-// The idle wait lives inside the Command rather than in a Subscription
-// because idleness is a fact the engine discovers, not a schedule: an empty
-// queue mid-backfill means "ask again shortly", and once everything is
-// cached it means "ask again much less often". Both are the same loop.
 const IMAGE_IDLE_WAIT = "4 seconds";
 const IMAGE_RETRY_WAIT = "15 seconds";
 
+/**
+ * One turn of the image prefetch loop, re-issued from its own result. Runs
+ * alongside the sync machine rather than after it: the backfill is bound by
+ * Gmail's quota bucket and this by the image proxy, so sequencing them would
+ * leave one resource idle for the whole sync.
+ */
+// NOTE: The idle wait lives in the Command rather than a Subscription because
+// idleness is a fact the engine discovers, not a schedule.
 export const CacheImageBatch = Command.define(
   "CacheImageBatch",
   CompletedCacheImageBatch,
@@ -184,8 +189,8 @@ export const CacheImageBatch = Command.define(
   }),
 );
 
-// Opens a thread from the local store only: SQLite rows, cid: images
-// rewritten from locally cached bytes — no network.
+/** Opens a thread from the local store only: SQLite rows, cid: images
+ *  rewritten from locally cached bytes. No network. */
 export const LoadThread = Command.define(
   "LoadThread",
   { id: ThreadId },
@@ -203,9 +208,10 @@ export const LoadThread = Command.define(
   }),
 );
 
-// Keeps the keyboard cursor on screen. Row positions are known from the fixed
-// row height, so this scrolls the container directly — the target row need
-// not be mounted (it usually isn't, which is why scrollIntoView won't do).
+/** Keeps the keyboard cursor on screen. */
+// NOTE: Scrolls the container directly rather than using scrollIntoView: the
+// target row usually isn't mounted, and the fixed row height makes its
+// position known anyway.
 export const ScrollListToRow = Command.define(
   "ScrollListToRow",
   { index: S.Number },
@@ -233,33 +239,35 @@ type UpdateReturn = readonly [
   ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>>,
 ];
 
-// Issues a search and claims the next sequence number. Every palette query
-// goes through here so the seq can never be bumped without a search in
-// flight to match it.
+// Every palette query goes through here, so the seq can never be bumped
+// without a search in flight to match it.
 const runSearch = (model: Model, text: string): UpdateReturn => {
-  const seq = model.searchSeq + 1;
+  const seq = Number.increment(model.searchSeq);
   return [evo(model, { searchSeq: () => seq }), [RunSearch({ seq, text })]];
 };
 
 const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
   Option.getOrElse(AsyncData.getData(model.threads), () => []);
 
-// Re-selecting and decoding the whole store costs tens of ms at 10k rows,
-// so backfill progress refreshes the list on a stride, not per batch.
+// NOTE: Re-selecting and decoding the whole store costs tens of ms at 10k
+// rows, so backfill progress refreshes the list on a stride, not per batch.
 const REFRESH_STRIDE = 200;
 
-// The newest threads the user is owed promptly. The backfill already walks
-// newest-first, so these are the first ones fetched — but at a 200 stride a
-// fresh mailbox sits on the prime's handful of rows for the first two pages.
-// Under this many synced, every page repaints, so the list fills visibly
-// (100 rows at a time) instead of jumping once. Above it the stride takes
-// over and the cost of re-decoding the store is amortised again.
+// NOTE: Below this many synced rows every page repaints, so a fresh mailbox
+// fills visibly instead of sitting on the prime's handful of rows for the
+// first two strides. Above it the stride amortises the re-decode again.
 export const PRIORITY_WINDOW = 500;
 
-// Whether a sync-machine fact means the store has enough new rows to be
-// worth re-reading: the prime (first screen), the priority window, a strided
-// slice of the backfill, the backfill's end, or an incremental pass that
-// changed rows.
+const hasCrossedStride = (
+  previousCount: number,
+  syncedCount: number,
+): boolean =>
+  Math.floor(previousCount / REFRESH_STRIDE) !==
+  Math.floor(syncedCount / REFRESH_STRIDE);
+
+// Whether a sync-machine fact leaves enough new rows in the store to be worth
+// re-reading: the prime, the priority window, a strided slice of the backfill,
+// the backfill's end, or an incremental pass that changed rows.
 const shouldRefreshRows = (
   before: SyncMachine.State,
   message: SyncMachine.Message,
@@ -267,35 +275,31 @@ const shouldRefreshRows = (
   M.value(message).pipe(
     M.tags({
       CompletedPrimeInbox: () => true,
-      CompletedSyncBatch: ({ syncedCount, maybeNextPageToken }) => {
-        if (Option.isNone(maybeNextPageToken)) return true;
-        if (syncedCount <= PRIORITY_WINDOW) return true;
-        const previousCount =
-          before._tag === "Backfilling" ? before.syncedCount : 0;
-        return (
-          Math.floor(previousCount / REFRESH_STRIDE) !==
-          Math.floor(syncedCount / REFRESH_STRIDE)
-        );
-      },
+      CompletedSyncBatch: ({ syncedCount, maybeNextPageToken }) =>
+        Option.isNone(maybeNextPageToken) ||
+        syncedCount <= PRIORITY_WINDOW ||
+        hasCrossedStride(
+          before._tag === "Backfilling" ? before.syncedCount : 0,
+          syncedCount,
+        ),
       AppliedHistory: ({ changedCount }) => changedCount > 0,
-      // The whole point of interleaving history into the backfill: mail that
-      // arrives mid-sync reaches the list now, not when the walk finishes.
+      // The point of interleaving history into the backfill: mail arriving
+      // mid-sync reaches the list now, not when the walk finishes.
       RefreshedDuringBackfill: ({ changedCount }) => changedCount > 0,
     }),
     M.orElse(() => false),
   );
 
-// The one open path. The thread is named by id, never by position: the row
-// list is replaced wholesale on strided backfill refreshes and on history
-// passes, so an index captured at paint time can address a different thread
-// by the time the click or keypress lands. `index` only parks the cursor, so
-// closing the thread returns the overlay to the row in place.
+// NOTE: The thread is named by id, never by position. Strided backfill
+// refreshes and history passes replace the row list wholesale, so an index
+// captured at paint time can address a different thread by the time the click
+// lands. `index` only parks the cursor.
 const openThread = (
   model: Model,
   id: ThreadId,
   index: number,
 ): UpdateReturn => {
-  const base = evo(model, { selected: () => Option.some(index) });
+  const base = evo(model, { maybeSelected: () => Option.some(index) });
   if (base.screen._tag === "ShowingThread" && base.screen.detail.id === id) {
     return [base, []];
   }
@@ -305,37 +309,92 @@ const openThread = (
   ];
 };
 
-// Opening from a position — the j/k cursor and Enter. Resolves the row first
+// Opening from a position (the j/k cursor and Enter). Resolves the row first
 // so the id, not the index, is what reaches openThread.
-const openRowAt = (model: Model, index: number): UpdateReturn => {
-  const row = listedRows(model)[index];
-  return row === undefined ? [model, []] : openThread(model, row.id, index);
-};
+const openRowAt = (model: Model, index: number): UpdateReturn =>
+  Option.match(Arr.get(listedRows(model), index), {
+    onNone: (): UpdateReturn => [model, []],
+    onSome: ({ id }) => openThread(model, id, index),
+  });
 
-// Picking a palette result: the item is a thread id. The cursor follows it
-// into the list when the thread is on screen, and simply stays put when the
-// search surfaced something the current list doesn't contain.
-const openThreadId = (model: Model, id: string): UpdateReturn => {
-  const index = listedRows(model).findIndex((row) => row.id === id);
-  return index === -1 ? [model, []] : openRowAt(model, index);
-};
+// Picking a palette result. The cursor follows the thread into the list when
+// it is on screen, and stays put when the search surfaced something the
+// current list doesn't contain.
+const openThreadId = (model: Model, id: string): UpdateReturn =>
+  Option.match(
+    Arr.findFirstIndex(listedRows(model), (row) => row.id === id),
+    {
+      onNone: (): UpdateReturn => [model, []],
+      onSome: (index) => openRowAt(model, index),
+    },
+  );
 
 const closeThread = (model: Model): UpdateReturn => [
-  evo(model, { screen: () => ShowingList({ error: Option.none() }) }),
+  evo(model, { screen: () => ShowingList({ maybeError: Option.none() }) }),
   [],
 ];
+
+const isStaleSearch = (model: Model, seq: number): boolean =>
+  seq !== model.searchSeq;
+
+// NOTE: With no cursor yet, either direction lands on the first row, stated
+// outright rather than falling out of arithmetic on a sentinel.
+const moveCursor = (model: Model, step: number): UpdateReturn => {
+  const rows = listedRows(model);
+  if (Arr.isReadonlyArrayEmpty(rows)) {
+    return [model, []];
+  }
+  const lastIndex = rows.length - 1;
+  const nextIndex = Option.match(model.maybeSelected, {
+    onNone: () => 0,
+    onSome: (current) => Math.min(Math.max(current + step, 0), lastIndex),
+  });
+  return [
+    evo(model, {
+      maybeSelected: () => Option.some(nextIndex),
+      isKeyboardControlled: () => true,
+    }),
+    [ScrollListToRow({ index: nextIndex })],
+  ];
+};
+
+// The palette owns the keyboard while it's open, and inside an open thread
+// only Escape is bound: j/k/Enter are reserved for in-thread navigation.
+const handlePressedListKey =
+  (model: Model) =>
+  (key: ListKey): UpdateReturn => {
+    if (model.palette.dialog.isOpen) {
+      return [model, []];
+    }
+    if (model.screen._tag === "ShowingThread") {
+      return key === "Escape" ? closeThread(model) : [model, []];
+    }
+    return M.value(key).pipe(
+      M.withReturnType<UpdateReturn>(),
+      M.when("Escape", () => [model, []]),
+      M.when("Enter", () =>
+        Option.match(model.maybeSelected, {
+          onNone: (): UpdateReturn => [model, []],
+          onSome: (index) => openRowAt(model, index),
+        }),
+      ),
+      M.when("j", () => moveCursor(model, 1)),
+      M.when("k", () => moveCursor(model, -1)),
+      M.exhaustive,
+    );
+  };
 
 export const update = (model: Model, message: Message): UpdateReturn =>
   M.value(message).pipe(
     M.withReturnType<UpdateReturn>(),
     M.tagsExhaustive({
       GotFolderMenuMessage: ({ message }) => {
-        const [folderMenu, commands] = FolderMenu.update(
+        const [nextFolderMenu, commands] = FolderMenu.update(
           model.folderMenu,
           message,
         );
         return [
-          evo(model, { folderMenu: () => folderMenu }),
+          evo(model, { folderMenu: () => nextFolderMenu }),
           Command.mapMessages(commands, (message) =>
             GotFolderMenuMessage({ message }),
           ),
@@ -345,9 +404,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       CompletedApplyAppearance: () => [model, []],
 
       GotTabsMessage: ({ message }) => {
-        const [tabs, commands] = Ui.Tabs.update(model.tabs, message);
+        const [nextTabs, commands] = Ui.Tabs.update(model.tabs, message);
         return [
-          evo(model, { tabs: () => tabs }),
+          evo(model, { tabs: () => nextTabs }),
           Command.mapMessages(commands, (message) =>
             GotTabsMessage({ message }),
           ),
@@ -355,9 +414,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       },
 
       GotListMessage: ({ message }) => {
-        const [list, commands] = Ui.VirtualList.update(model.list, message);
+        const [nextList, commands] = Ui.VirtualList.update(model.list, message);
         return [
-          evo(model, { list: () => list }),
+          evo(model, { list: () => nextList }),
           Command.mapMessages(commands, (message) =>
             GotListMessage({ message }),
           ),
@@ -367,23 +426,23 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // Real pointer motion always reclaims the overlay from the keyboard.
       HoveredRow: ({ index }) => [
         evo(model, {
-          selected: () => Option.some(index),
-          keyboardControlled: () => false,
+          maybeSelected: () => Option.some(index),
+          isKeyboardControlled: () => false,
         }),
         [],
       ],
 
+      // The cursor is cleared so the overlay stays unmounted until the first
+      // row is hovered, mounting there instead of sliding from wherever the
+      // last session ended. Skipped while the keyboard holds the overlay: the
+      // pointer merely entering the list shouldn't blank a cursor it hasn't
+      // reclaimed.
       EnteredList: () => [
         evo(model, {
-          hoverSession: (session) => session + 1,
+          hoverSession: Number.increment,
           isPointerInside: () => true,
-          // Cleared so the overlay stays unmounted until the first row is
-          // hovered — it then mounts there (snap + fade-in) instead of
-          // sliding from wherever the last session ended. Skipped while the
-          // keyboard holds the overlay: the pointer merely entering the
-          // list shouldn't blank a cursor it hasn't reclaimed.
-          selected: (selected) =>
-            model.keyboardControlled ? selected : Option.none(),
+          maybeSelected: (maybeSelected) =>
+            model.isKeyboardControlled ? maybeSelected : Option.none(),
         }),
         [],
       ],
@@ -397,27 +456,29 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // Opening runs the empty search, so the palette paints its "recent"
       // list in the same frame the dialog appears rather than a beat later.
       ToggledPalette: () => {
-        const [palette, commands] = InboxPalette.toggle(model.palette);
-        const opened = evo(model, { palette: () => palette });
+        const [nextPalette, commands] = InboxPalette.toggle(model.palette);
+        const opened = evo(model, { palette: () => nextPalette });
         const paletteCommands = Command.mapMessages(commands, (message) =>
           GotPaletteMessage({ message }),
         );
-        if (!palette.dialog.isOpen) return [opened, paletteCommands];
+        if (!nextPalette.dialog.isOpen) {
+          return [opened, paletteCommands];
+        }
         const [next, searchCommands] = runSearch(opened, "");
         return [next, [...paletteCommands, ...searchCommands]];
       },
 
       GotPaletteMessage: ({ message }) => {
-        const [palette, commands, maybeSelected] = InboxPalette.update(
+        const [nextPalette, commands, maybeSelectedId] = InboxPalette.update(
           model.palette,
           message,
         );
         const paletteCommands = Command.mapMessages(commands, (message) =>
           GotPaletteMessage({ message }),
         );
-        const stepped = evo(model, { palette: () => palette });
-        // Every item is a thread id — picking one opens that thread.
-        return Option.match(maybeSelected, {
+        const stepped = evo(model, { palette: () => nextPalette });
+        // Every item is a thread id: picking one opens that thread.
+        return Option.match(maybeSelectedId, {
           onSome: (id): UpdateReturn => {
             const [next, openCommands] = openThreadId(stepped, id);
             return [next, [...paletteCommands, ...openCommands]];
@@ -437,68 +498,55 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // Stale replies lost a race to a later keystroke; showing them would
       // flash results for a query the user has already moved past.
       SucceededSearch: ({ seq, rows }) =>
-        seq !== model.searchSeq
+        isStaleSearch(model, seq)
           ? [model, []]
           : [
               evo(model, {
                 searchResults: () => rows,
-                searchError: () => Option.none(),
+                maybeSearchError: () => Option.none(),
               }),
               [],
             ],
 
       FailedSearch: ({ seq, error }) =>
-        seq !== model.searchSeq
+        isStaleSearch(model, seq)
           ? [model, []]
           : [
               evo(model, {
                 searchResults: () => [],
-                searchError: () => Option.some(error),
+                maybeSearchError: () => Option.some(error),
               }),
               [],
             ],
 
       GotAccountPopoverMessage: ({ message }) => {
-        const [accountPopover, commands] = Ui.Popover.update(
+        const [nextAccountPopover, commands] = Ui.Popover.update(
           model.accountPopover,
           message,
         );
         return [
-          evo(model, { accountPopover: () => accountPopover }),
+          evo(model, { accountPopover: () => nextAccountPopover }),
           Command.mapMessages(commands, (message) =>
             GotAccountPopoverMessage({ message }),
           ),
         ];
       },
 
-      // settle folds the fetch outcome into whatever state threads is in:
-      // success replaces the rows; failure keeps any previous rows (Stale)
-      // or lands on Failure when there were none.
-      //
-      // The incoming rows are reconciled against the ones already on screen
-      // first, so unchanged threads keep their object identity and the view
-      // can memoize past them. See reconcileRows.
+      // Reconciled against the rows already on screen so unchanged threads
+      // keep their object identity and the view can memoize past them.
       SucceededLoadInbox: ({ rows }) => [
         evo(model, {
           threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
-            Result.succeed(
-              reconcileRows(
-                Option.getOrElse(
-                  AsyncData.getData(model.threads),
-                  (): ReadonlyArray<ThreadRow> => [],
-                ),
-                rows,
-              ),
-            ),
+            Result.succeed(reconcileRows(listedRows(model), rows)),
           ),
         }),
         [],
       ],
 
       GotSyncMessage: ({ message }) => {
-        const [sync, commands] = SyncMachine.step(model.sync, message);
+        const [nextSync, commands] = SyncMachine.step(model.sync, message);
         return [
-          evo(model, { sync: () => sync }),
+          evo(model, { sync: () => nextSync }),
           [
             ...Command.mapMessages(commands, (message) =>
               GotSyncMessage({ message }),
@@ -510,10 +558,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         ];
       },
 
-      // Re-wrapping an unchanged number in a fresh Option would hand the pill
-      // a new argument and cost it its memoization slot for nothing. The size
-      // read fires on the same strided cadence as the row refresh, so this is
-      // most of them once the store stops growing.
+      // NOTE: Re-wrapping an unchanged number in a fresh Option would hand the
+      // pill a new argument and cost it its memoization slot for nothing.
       SucceededReadLocalSize: ({ bytes }) =>
         Option.contains(model.maybeLocalBytes, bytes)
           ? [model, []]
@@ -523,19 +569,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // nothing) rather than disturbing anything the user is looking at.
       FailedReadLocalSize: () => [model, []],
 
-      // The loop's only turn: ask for the next batch. It never terminates by
-      // design — new mail arriving in a settled mailbox needs its images too,
-      // and the engine's own idle wait is what keeps a fully-cached store
-      // down to one cheap query every few seconds.
-      //
-      // Prefetching is an optimization, so a failure re-arms the loop just
-      // the same: the Command has already waited out its backoff before
-      // either message arrives, which is what stops this from spinning.
-      // Latched, never cleared: new mail lands in the hot window with its
-      // images seconds behind, which would flicker the milestone off and on
-      // every time a message arrives. "Your recent mail is ready offline"
-      // does not stop being true because one email's images are three
-      // seconds late.
+      // The loop re-arms itself on both outcomes; the Command has already
+      // waited out its own backoff, which is what stops this from spinning.
+      // NOTE: isRecentReady latches and is never cleared. New mail lands in
+      // the hot window with its images seconds behind, and flickering the
+      // milestone off for those seconds would be noise, not information.
       CompletedCacheImageBatch: ({ isRecentReady }) => [
         evo(model, {
           isRecentReady: (was) => was || isRecentReady,
@@ -565,49 +603,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         return [evo(model, { screen: () => ShowingThread({ detail }) }), []];
       },
 
-      PressedListKey: ({ key }) => {
-        // The palette owns the keyboard while it's open.
-        if (model.palette.dialog.isOpen) return [model, []];
-
-        if (key === "Escape") {
-          return model.screen._tag === "ShowingThread"
-            ? closeThread(model)
-            : [model, []];
-        }
-        // Inside a thread, j/k/Enter are reserved for future in-thread nav.
-        if (model.screen._tag === "ShowingThread") return [model, []];
-
-        if (key === "Enter") {
-          return Option.match(model.selected, {
-            onNone: (): UpdateReturn => [model, []],
-            onSome: (index) => openRowAt(model, index),
-          });
-        }
-
-        const rows = listedRows(model);
-        if (Arr.isReadonlyArrayEmpty(rows)) return [model, []];
-        const lastIndex = rows.length - 1;
-        // With no cursor yet, either key lands on the first row — stated
-        // outright rather than falling out of arithmetic on a -1 sentinel.
-        const index = Option.match(model.selected, {
-          onNone: () => 0,
-          onSome: (current) =>
-            key === "j"
-              ? Math.min(current + 1, lastIndex)
-              : Math.max(current - 1, 0),
-        });
-        return [
-          evo(model, {
-            selected: () => Option.some(index),
-            keyboardControlled: () => true,
-          }),
-          [ScrollListToRow({ index })],
-        ];
-      },
+      PressedListKey: ({ key }) => handlePressedListKey(model)(key),
 
       FailedLoadThread: ({ error }) => [
         evo(model, {
-          screen: () => ShowingList({ error: Option.some(error) }),
+          screen: () => ShowingList({ maybeError: Option.some(error) }),
         }),
         [],
       ],
@@ -619,11 +619,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // The actual sign-out is main.ts's job; this page just folds the
       // popover shut behind it.
       ClickedAccountSignOut: () => {
-        const [accountPopover, commands] = Ui.Popover.close(
+        const [nextAccountPopover, commands] = Ui.Popover.close(
           model.accountPopover,
         );
         return [
-          evo(model, { accountPopover: () => accountPopover }),
+          evo(model, { accountPopover: () => nextAccountPopover }),
           Command.mapMessages(commands, (message) =>
             GotAccountPopoverMessage({ message }),
           ),

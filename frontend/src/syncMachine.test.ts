@@ -65,7 +65,9 @@ describe("entry from the checkpoint", () => {
   test("no checkpoint primes from scratch", () => {
     const [state, commands] = SyncMachine.step(
       SyncMachine.init(),
-      SyncMachine.SucceededReadSyncCheckpoint({ maybeCheckpoint: Option.none() }),
+      SyncMachine.SucceededReadSyncCheckpoint({
+        maybeCheckpoint: Option.none(),
+      }),
     );
     expect(state._tag).toBe("Priming");
     expect(commandNames(commands)).toEqual(["PrimeInbox"]);
@@ -98,7 +100,9 @@ describe("entry from the checkpoint", () => {
         maybeCheckpoint: Option.some(checkpoint({ isBackfillDone: true })),
       }),
     );
-    expect(state).toEqual(SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 }));
+    expect(state).toEqual(
+      SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 }),
+    );
     expect(commandNames(commands)).toEqual(["ApplyHistory"]);
   });
 
@@ -240,7 +244,10 @@ describe("the sync spine", () => {
   // dropped — applying its cursor here would move CatchingUp's starting point
   // forward past changes the proper history pass has not yet replayed.
   test("a refresh landing after the walk finished is dropped", () => {
-    const catchingUp = SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 });
+    const catchingUp = SyncMachine.CatchingUp({
+      historyId: cursor,
+      attempt: 0,
+    });
     const [state, commands] = SyncMachine.step(
       catchingUp,
       SyncMachine.RefreshedDuringBackfill({
@@ -261,7 +268,9 @@ describe("the sync spine", () => {
         maybeNextPageToken: Option.none(),
       }),
     );
-    expect(state).toEqual(SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 }));
+    expect(state).toEqual(
+      SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 }),
+    );
     expect(commandNames(commands)).toEqual(["ApplyHistory"]);
   });
 
@@ -365,7 +374,10 @@ describe("no state is a dead end", () => {
   });
 
   test("an auth-shaped checkpoint failure parks rather than retrying", () => {
-    const [state] = SyncMachine.step(SyncMachine.init(), failedCheckpoint(true));
+    const [state] = SyncMachine.step(
+      SyncMachine.init(),
+      failedCheckpoint(true),
+    );
     expect(state._tag).toBe("NeedsAuth");
   });
 
@@ -432,9 +444,7 @@ describe("failure edges", () => {
       SyncMachine.CatchingUp({ historyId: cursor, attempt: 0 }),
       failed(),
     );
-    expect(state._tag === "Backoff" && state.resume._tag).toBe(
-      "ResumeHistory",
-    );
+    expect(state._tag === "Backoff" && state.resume._tag).toBe("ResumeHistory");
   });
 
   test("an auth failure parks the machine", () => {

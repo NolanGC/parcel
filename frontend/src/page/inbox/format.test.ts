@@ -14,7 +14,7 @@ import {
   formatEta,
   formatProgress,
   progressPercent,
-  recentReadyLine,
+  RECENT_READY_LINE,
   reconcileRows,
 } from "./model";
 
@@ -72,11 +72,11 @@ describe("formatBytes", () => {
   });
 });
 
-describe("recentReadyLine", () => {
+describe("RECENT_READY_LINE", () => {
   // The sentence names the tier size, so it has to read it from the same
   // constant the queue cutoff and the LRU eviction use.
   test("names the configured tier size rather than a hardcoded number", () => {
-    expect(recentReadyLine()).toContain(HOT_THREAD_COUNT.toLocaleString());
+    expect(RECENT_READY_LINE).toContain(HOT_THREAD_COUNT.toLocaleString());
   });
 });
 
@@ -154,7 +154,7 @@ describe("reconcileRows", () => {
     sender: `sender-${id}@example.com`,
     snippet: `Snippet ${id}`,
     date: 1_700_000_000_000,
-    unread: false,
+    isUnread: false,
     category: "personal",
     ...fields,
   });
@@ -168,14 +168,14 @@ describe("reconcileRows", () => {
 
   test("reuses the untouched rows and replaces only the changed one", () => {
     const previous = [row("a"), row("b"), row("c")];
-    const next = [row("a"), row("b", { unread: true }), row("c")];
+    const next = [row("a"), row("b", { isUnread: true }), row("c")];
     const reconciled = reconcileRows(previous, next);
 
     expect(reconciled).not.toBe(previous);
     expect(reconciled[0]).toBe(previous[0]);
     expect(reconciled[2]).toBe(previous[2]);
     expect(reconciled[1]).not.toBe(previous[1]);
-    expect(reconciled[1]?.unread).toBe(true);
+    expect(reconciled[1]?.isUnread).toBe(true);
   });
 
   test("carries identity across a move, since rows match by id not position", () => {

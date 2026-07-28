@@ -98,8 +98,10 @@ export type Message = typeof Message.Type;
 // COMMAND
 
 // Measures the rendered result rows relative to the results container (the
-// offsetParent). Row count is discovered by probing ids, so the command
-// doesn't need to know the filter's output length.
+// offsetParent).
+// NOTE: The imperative probe is the point. Row count is discovered by walking
+// ids until one is missing, so the Command never has to be told the filter's
+// output length; there is no collection to map over until the walk has run.
 export const MeasureItemRects = Command.define(
   "MeasureItemRects",
   { id: S.String },
@@ -109,7 +111,9 @@ export const MeasureItemRects = Command.define(
     const rects: Array<Rect> = [];
     for (let index = 0; ; index++) {
       const element = document.getElementById(itemId(id, index));
-      if (!(element instanceof HTMLElement)) break;
+      if (!(element instanceof HTMLElement)) {
+        break;
+      }
       rects.push(measureRect(element));
     }
     return MeasuredItemRects({ rects });
@@ -157,22 +161,21 @@ type FilteredGroup<Item extends string> = Readonly<{
 // `groups` is already the answer to `model.query`.
 const numberRows = <Item extends string>(
   groups: ReadonlyArray<Group<Item>>,
-): ReadonlyArray<FilteredGroup<Item>> => {
-  let flatIndex = 0;
-  return groups.flatMap((group) =>
-    Arr.isReadonlyArrayEmpty(group.items)
-      ? []
-      : [
-          {
-            label: group.label,
-            items: group.items.map((item) => ({
-              item,
-              flatIndex: flatIndex++,
-            })),
-          },
-        ],
-  );
-};
+): ReadonlyArray<FilteredGroup<Item>> =>
+  Arr.mapAccum(
+    Arr.filter(groups, (group) => Arr.isReadonlyArrayNonEmpty(group.items)),
+    0,
+    (nextIndex, group) => [
+      nextIndex + group.items.length,
+      {
+        label: group.label,
+        items: Arr.map(group.items, (item, offset) => ({
+          item,
+          flatIndex: nextIndex + offset,
+        })),
+      },
+    ],
+  )[1];
 
 // CREATE
 
@@ -190,6 +193,92 @@ const kbd = (children: ReadonlyArray<Html | string>): Html => {
       ),
     ],
     children,
+  );
+};
+
+// A constant 24px box so labels align whether the row leads with an avatar or
+// an icon.
+const leadingSlot = (spec: PaletteItemSpec): Html => {
+  const h = html<never>();
+  return spec.avatarSrc === undefined
+    ? h.span(
+        [h.Class("flex h-6 w-6 shrink-0 items-center justify-center")],
+        [
+          spec.icon === undefined
+            ? h.empty
+            : spec.icon("h-[18px] w-[18px] text-muted-foreground"),
+        ],
+      )
+    : h.img([
+        h.Src(spec.avatarSrc),
+        h.Alt(""),
+        h.Class("h-6 w-6 shrink-0 rounded-full object-cover"),
+      ]);
+};
+
+/** How many rows advertise a ⌘n shortcut; ⌘1…⌘9 is all the keyboard has. */
+const SHORTCUT_ROW_LIMIT = 9;
+
+// NOTE: The traveling overlay is the ONLY active/hover signal. Text stays at
+// constant color and weight, because lifting either on mouseover reads as
+// flicker when the pointer pans a dense list.
+const itemRowView = (
+  spec: PaletteItemSpec,
+  context: Readonly<{
+    paletteId: string;
+    flatIndex: number;
+    isActive: boolean;
+    item: string;
+  }>,
+): Html => {
+  const h = html<Message>();
+  const { paletteId, flatIndex, isActive, item } = context;
+
+  return h.div(
+    [
+      h.Id(itemId(paletteId, flatIndex)),
+      h.Role("option"),
+      h.AriaSelected(isActive),
+      h.Class(
+        "flex cursor-default items-center gap-3 rounded-lg px-3 py-1 text-foreground",
+      ),
+      h.OnMouseEnter(PointedItem({ index: flatIndex })),
+      h.OnClick(SelectedItem({ item })),
+    ],
+    [
+      leadingSlot(spec),
+      h.span([h.Class("min-w-0 flex-1 truncate text-left")], [spec.label]),
+      spec.detail === undefined
+        ? h.empty
+        : h.span(
+            [
+              h.Class(
+                "min-w-0 max-w-[40%] shrink truncate text-[13px] text-muted-foreground",
+              ),
+            ],
+            [spec.detail],
+          ),
+      spec.tag === undefined
+        ? h.empty
+        : h.span(
+            [
+              h.Class(
+                "flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-2.5 py-0.5 text-[12px] text-muted-foreground",
+              ),
+            ],
+            [spec.tag.icon("h-3.5 w-3.5", "2"), spec.tag.label],
+          ),
+      flatIndex < SHORTCUT_ROW_LIMIT
+        ? h.span(
+            [
+              h.Class(
+                "w-8 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground/60",
+              ),
+            ],
+            [`⌘${flatIndex + 1}`],
+          )
+        : h.empty,
+    ],
   );
 };
 
@@ -266,7 +355,9 @@ export const create = <Item extends string>() => {
         ],
 
         MovedActive: ({ count, delta }) => {
-          if (count === 0) return [model, [], Option.none()];
+          if (count === 0) {
+            return [model, [], Option.none()];
+          }
           // Clamped, not wrapped: Up at the top (or Down at the bottom) holds
           // still rather than jumping to the opposite end.
           const next = Math.max(
@@ -316,6 +407,11 @@ export const create = <Item extends string>() => {
       const count = flat.length;
       const activeIndex = Math.min(model.activeIndex, Math.max(0, count - 1));
 
+      // An index past the end simply selects nothing: ⌘7 on a three-result
+      // list, or Enter on an empty one.
+      const selectAt = (index: number): Option.Option<Message> =>
+        Option.map(Arr.get(flat, index), ({ item }) => SelectedItem({ item }));
+
       const listboxId = `${model.dialog.id}-results`;
       const activeItemId =
         count === 0 ? undefined : itemId(model.dialog.id, activeIndex);
@@ -352,19 +448,19 @@ export const create = <Item extends string>() => {
             ),
             h.OnInput((query) => ChangedQuery({ query })),
             h.OnKeyDownPreventDefault((key, modifiers) => {
-              if (key === "ArrowDown")
+              if (key === "ArrowDown") {
                 return Option.some(MovedActive({ delta: 1, count }));
-              if (key === "ArrowUp")
+              }
+              if (key === "ArrowUp") {
                 return Option.some(MovedActive({ delta: -1, count }));
+              }
               // ⌘1…⌘9 jump-select the first nine results directly.
               if (modifiers.metaKey && key >= "1" && key <= "9") {
-                const target = flat[Number(key) - 1];
-                if (target !== undefined)
-                  return Option.some(SelectedItem({ item: target.item }));
+                return selectAt(Number(key) - 1);
               }
-              const active = flat[activeIndex];
-              if (key === "Enter" && active !== undefined)
-                return Option.some(SelectedItem({ item: active.item }));
+              if (key === "Enter") {
+                return selectAt(activeIndex);
+              }
               return Option.none();
             }),
           ]),
@@ -372,103 +468,39 @@ export const create = <Item extends string>() => {
         ],
       );
 
-      const overlay = (() => {
-        const rect = model.rects[activeIndex];
-        if (count === 0 || rect === undefined) return h.empty;
-        return h.keyed("div")(
-          // Query in the key: each keystroke remounts the overlay so it
-          // snaps to the new top result (fade-in) instead of visibly
-          // sliding across the re-filtered list. Arrow keys and hover keep
-          // the same key, so travel between rows still glides.
-          `overlay-${model.session}-${model.query}`,
-          [
-            h.Role("presentation"),
-            h.Class("fk-hover-overlay rounded-lg"),
-            h.Style({
-              top: `${rect.top}px`,
-              left: `${rect.left}px`,
-              width: `${rect.width}px`,
-              height: `${rect.height}px`,
-            }),
-          ],
-          [],
-        );
-      })();
-
-      const itemRow = (item: Item, flatIndex: number): Html => {
-        const spec = itemSpec(item);
-
-        // Leading slot is a constant 24px box so labels align whether the
-        // row leads with an avatar or an icon.
-        const leading =
-          spec.avatarSrc !== undefined
-            ? h.img([
-                h.Src(spec.avatarSrc),
-                h.Alt(""),
-                h.Class("h-6 w-6 shrink-0 rounded-full object-cover"),
-              ])
-            : h.span(
-                [h.Class("flex h-6 w-6 shrink-0 items-center justify-center")],
-                [
-                  spec.icon === undefined
-                    ? h.empty
-                    : spec.icon("h-[18px] w-[18px] text-muted-foreground"),
-                ],
-              );
-
-        // The traveling overlay is the ONLY active/hover signal. Text stays
-        // at constant color and weight — lifting either on mouseover reads
-        // as flicker when the pointer pans a dense list.
-        return h.div(
-          [
-            h.Id(itemId(model.dialog.id, flatIndex)),
-            h.Role("option"),
-            h.AriaSelected(flatIndex === activeIndex),
-            h.Class(
-              "flex cursor-default items-center gap-3 rounded-lg px-3 py-1 text-foreground",
+      const overlay = Option.match(
+        Option.filter(Arr.get(model.rects, activeIndex), () => count > 0),
+        {
+          onNone: () => h.empty,
+          onSome: (rect) =>
+            h.keyed("div")(
+              // Query in the key: each keystroke remounts the overlay so it
+              // snaps to the new top result (fade-in) instead of visibly
+              // sliding across the re-filtered list. Arrow keys and hover keep
+              // the same key, so travel between rows still glides.
+              `overlay-${model.session}-${model.query}`,
+              [
+                h.Role("presentation"),
+                h.Class("fk-hover-overlay rounded-lg"),
+                h.Style({
+                  top: `${rect.top}px`,
+                  left: `${rect.left}px`,
+                  width: `${rect.width}px`,
+                  height: `${rect.height}px`,
+                }),
+              ],
+              [],
             ),
-            h.OnMouseEnter(PointedItem({ index: flatIndex })),
-            h.OnClick(SelectedItem({ item })),
-          ],
-          [
-            leading,
-            h.span(
-              [h.Class("min-w-0 flex-1 truncate text-left")],
-              [spec.label],
-            ),
-            spec.detail === undefined
-              ? h.empty
-              : h.span(
-                  [
-                    h.Class(
-                      "min-w-0 max-w-[40%] shrink truncate text-[13px] text-muted-foreground",
-                    ),
-                  ],
-                  [spec.detail],
-                ),
-            spec.tag === undefined
-              ? h.empty
-              : h.span(
-                  [
-                    h.Class(
-                      "flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-2.5 py-0.5 text-[12px] text-muted-foreground",
-                    ),
-                  ],
-                  [spec.tag.icon("h-3.5 w-3.5", "2"), spec.tag.label],
-                ),
-            flatIndex < 9
-              ? h.span(
-                  [
-                    h.Class(
-                      "w-8 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground/60",
-                    ),
-                  ],
-                  [`⌘${flatIndex + 1}`],
-                )
-              : h.empty,
-          ],
-        );
-      };
+        },
+      );
+
+      const itemRow = (item: Item, flatIndex: number): Html =>
+        itemRowView(itemSpec(item), {
+          paletteId: model.dialog.id,
+          flatIndex,
+          isActive: flatIndex === activeIndex,
+          item,
+        });
 
       // The listbox is rendered in both branches so `aria-controls` always
       // resolves to a live element; empty simply carries no options and the

@@ -1,6 +1,5 @@
-// View-rendering tests (Foldkit Scene): a model in, semantic queries
-// (roles/labels/text) against the rendered view out. No real browser and no
-// command execution.
+// View tests (Foldkit Scene): a model in, semantic queries (roles, labels,
+// text) against the rendered view out. No real browser.
 //
 // Covers:
 // - Logged out: the login route renders the Google sign-in button; the
@@ -8,14 +7,25 @@
 // - Logged in: the landing page links to the inbox and offers sign-out.
 // - The inbox across every state its Model can be in: loading, failed,
 //   populated, empty, an open thread, the palette open, and the sync pill.
+// - Interactions, driven by clicking rather than by handing `update` a
+//   Message: the sign-in button through both of its outcomes, and closing an
+//   open thread.
 //
 // Does NOT cover:
-// - Click flows or anything visual: layout, styling, focus management.
+// - Anything visual: layout, styling, focus management.
+// - Opening a thread, or any row interaction. Rows live in the VirtualList,
+//   whose container is Unmeasured without a ResizeObserver, so the virtual
+//   window renders none of them. story.test.ts drives those.
+// - Interactions whose Commands fan out into @foldkit/ui internals (opening
+//   the palette, the account popover). Resolving another package's Commands
+//   would couple these tests to its internals without saying anything about
+//   this app; the Model-constructed states below cover the rendering.
 import { UserId } from "@foldkit/backend";
 import { Option } from "effect";
 import { AsyncData, Scene } from "foldkit";
 import { describe, expect, test } from "vitest";
 
+import { FailedAuth, SignInWithGoogle, StartedGoogleRedirect } from "./auth";
 import { HistoryId, MessageId, ThreadId } from "./Gmail";
 import { update, view, type Model } from "./main";
 import { Inbox, Login } from "./page";
@@ -37,7 +47,7 @@ const loggedInModel: Model = {
 const loggedOutModel: Model = {
   _tag: "LoggedOut",
   route: LoginRoute(),
-  loginPage: Login.init(false),
+  loginPage: Login.init(Login.Ready()),
   inboxPage: Inbox.init(),
 };
 
@@ -88,7 +98,10 @@ describe("view", () => {
       { update, view },
       Scene.with({
         ...loggedOutModel,
-        loginPage: Login.init(false, Option.some("Google sign-in failed.")),
+        loginPage: Login.init(
+          Login.Ready(),
+          Option.some("Google sign-in failed."),
+        ),
       }),
       Scene.expect(Scene.role("alert")).toExist(),
       Scene.expect(Scene.text("Google sign-in failed.")).toExist(),
@@ -113,7 +126,59 @@ describe("view", () => {
       Scene.expect(Scene.role("button", { name: "Sign out" })).toExist(),
     );
   });
+});
 
+// Interaction tests: the same views driven by clicks rather than by handing
+// `update` a Message. What these add over the Story tests is the wiring in
+// between, so a button that stops dispatching (or an attribute that stops
+// reflecting the Model) fails here.
+describe("signing in", () => {
+  test("clicking Continue with Google starts the redirect and disables the button", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(loggedOutModel),
+      Scene.click(Scene.role("button", { name: "Continue with Google" })),
+      Scene.expect(
+        Scene.role("button", { name: "Redirecting to Google…" }),
+      ).toBeDisabled(),
+      Scene.Command.resolve(SignInWithGoogle, StartedGoogleRedirect()),
+    );
+  });
+
+  // The button is the only way into the OAuth flow, so a failure to even
+  // start it has to come back to the page rather than leaving a dead button
+  // spinning.
+  test("a failure to start the flow re-enables the button and reports why", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(loggedOutModel),
+      Scene.click(Scene.role("button", { name: "Continue with Google" })),
+      Scene.Command.resolve(
+        SignInWithGoogle,
+        FailedAuth({ error: "popup blocked" }),
+      ),
+      Scene.expect(
+        Scene.role("button", { name: "Continue with Google" }),
+      ).toBeEnabled(),
+      Scene.expect(Scene.role("alert")).toHaveText("popup blocked"),
+    );
+  });
+
+  // While the boot session check is still in flight the button must not be
+  // clickable: a valid cookie would otherwise send the user to Google to
+  // re-authorize a session they already have.
+  test("the button waits while the boot session check is still in flight", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with({
+        ...loggedOutModel,
+        loginPage: Login.init(Login.CheckingSession()),
+      }),
+      Scene.expect(
+        Scene.role("button", { name: "Checking session…" }),
+      ).toBeDisabled(),
+    );
+  });
 });
 
 // The inbox across the states its Model can express. Every one of these
@@ -126,8 +191,23 @@ describe("the inbox", () => {
     sender: "Ada",
     snippet: "hello",
     date: 1,
-    unread: false,
+    isUnread: false,
     category: "none" as const,
+  };
+
+  const openThreadDetail = {
+    id: ThreadId.make("thread-1"),
+    subject: "Hi",
+    messages: [
+      {
+        id: MessageId.make("m1"),
+        fromName: "Ada",
+        fromEmail: "ada@example.com",
+        date: 1,
+        bodyKind: "plain" as const,
+        body: "hello there",
+      },
+    ],
   };
 
   const inboxWith = (page: Partial<Inbox.Model>): Model => ({
@@ -166,7 +246,7 @@ describe("the inbox", () => {
       Scene.with(
         inboxWith({
           threads: AsyncData.succeed([threadRow]),
-          selected: Option.some(0),
+          maybeSelected: Option.some(0),
           isPointerInside: true,
         }),
       ),
@@ -246,22 +326,7 @@ describe("the inbox", () => {
       Scene.with(
         inboxWith({
           threads: AsyncData.succeed([threadRow]),
-          screen: Inbox.ShowingThread({
-            detail: {
-              id: threadRow.id,
-              subject: "Hi",
-              messages: [
-                {
-                  id: MessageId.make("m1"),
-                  fromName: "Ada",
-                  fromEmail: "ada@example.com",
-                  date: 1,
-                  bodyKind: "plain" as const,
-                  body: "hello there",
-                },
-              ],
-            },
-          }),
+          screen: Inbox.ShowingThread({ detail: openThreadDetail }),
         }),
       ),
       Scene.expect(Scene.text("hello there")).toExist(),
@@ -280,25 +345,32 @@ describe("the inbox", () => {
       Scene.with(
         inboxWith({
           threads: AsyncData.succeed([threadRow]),
-          screen: Inbox.ShowingThread({
-            detail: {
-              id: threadRow.id,
-              subject: "Hi",
-              messages: [
-                {
-                  id: MessageId.make("m1"),
-                  fromName: "Ada",
-                  fromEmail: "ada@example.com",
-                  date: 1,
-                  bodyKind: "plain" as const,
-                  body: "hello there",
-                },
-              ],
-            },
-          }),
+          screen: Inbox.ShowingThread({ detail: openThreadDetail }),
         }),
       ),
       Scene.expect(Scene.text("hello there")).toExist(),
+      Scene.expect(Scene.role("list")).toExist(),
+    );
+  });
+
+  // Closing is the one thread-detail interaction that is entirely ours: it
+  // issues no Commands, so what it proves is the back button's wiring and
+  // that the list underneath survived the round trip.
+  // NOTE: Opening a thread is driven from the Story tests instead. Rows live
+  // in the VirtualList, whose container is Unmeasured in a Scene, so the
+  // virtual window renders no rows to click.
+  test("the back button closes an open thread and returns to the list", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          screen: Inbox.ShowingThread({ detail: openThreadDetail }),
+        }),
+      ),
+      Scene.expect(Scene.text("hello there")).toExist(),
+      Scene.click(Scene.role("button", { name: "Back to inbox" })),
+      Scene.expect(Scene.text("hello there")).not.toExist(),
       Scene.expect(Scene.role("list")).toExist(),
     );
   });

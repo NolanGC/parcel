@@ -48,7 +48,9 @@ export class Compression extends Context.Service<Compression>()(
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
 
-      const attempt = <A>(run: () => Promise<A>): Effect.Effect<A, CompressionError> =>
+      const attempt = <A>(
+        run: () => Promise<A>,
+      ): Effect.Effect<A, CompressionError> =>
         Effect.tryPromise(run).pipe(
           Effect.mapError(
             (cause) => new CompressionError({ message: String(cause) }),
@@ -60,7 +62,10 @@ export class Compression extends Context.Service<Compression>()(
       ): Effect.Effect<CompressedBody, CompressionError> => {
         const bytes = encoder.encode(text);
         return bytes.byteLength < MIN_COMPRESS_BYTES
-          ? Effect.succeed({ codec: "none", data: bytes } satisfies CompressedBody)
+          ? Effect.succeed({
+              codec: "none",
+              data: bytes,
+            } satisfies CompressedBody)
           : attempt(() => through(bytes, new CompressionStream("gzip"))).pipe(
               Effect.map(
                 (buffer): CompressedBody => ({

@@ -1,25 +1,18 @@
-// The public pages: the marketing landing and the 404. Static content out
-// of the SPA bundle — no model, no messages, nothing to update. They live
-// here rather than in main.ts because main.ts is the app shell (routing,
-// session, subscriptions) and these are just two documents it can render.
-//
-// Generic in the caller's message type. The landing page's one interaction
-// (sign out) is passed in as a message rather than imported, because the
-// session belongs to main.ts — importing it back would make this a cycle.
-
 import { html, type Html } from "foldkit/html";
 
+import { APP_NAME } from "../config";
 import { homeRouter, inboxRouter, loginRouter } from "../route";
 
-const APP_NAME = "parcel";
+// The public pages: the marketing landing and the 404. No model, no messages,
+// nothing to update. Generic in the caller's message type because the landing
+// page's one interaction (sign out) belongs to main.ts, and importing it back
+// would close a cycle.
 
-// The marketing landing: the only public page besides sign-in. Static
-// content served from the SPA bundle.
-export const landingView = <Msg,>(
+export const landingView = <Message>(
   isLoggedIn: boolean,
-  signOut: Msg,
+  signOut: Message,
 ): Html => {
-  const h = html<Msg>();
+  const h = html<Message>();
 
   return h.main(
     [h.Class("min-h-screen bg-neutral-950 px-6 py-24 text-neutral-100")],
@@ -59,28 +52,33 @@ export const landingView = <Msg,>(
   );
 };
 
-export const notFoundView = <Msg,>(
-  heading: string,
-  detail: string,
-): Html => {
-  const h = html<Msg>();
+export const notFoundView = <Message>(path: string): Html => {
+  const h = html<Message>();
 
-  return h.section(
-    [h.Class("mx-auto max-w-5xl px-4 py-10")],
+  return h.div(
+    [h.Class("min-h-screen bg-neutral-950 text-neutral-100")],
     [
-      h.div(
-        [h.Class("border border-neutral-800 bg-neutral-900 p-4")],
+      h.section(
+        [h.Class("mx-auto max-w-5xl px-4 py-10")],
         [
-          h.h1([h.Class("text-2xl font-bold")], [heading]),
-          h.p([h.Class("mt-2 text-neutral-400")], [detail]),
-          h.a(
+          h.div(
+            [h.Class("border border-neutral-800 bg-neutral-900 p-4")],
             [
-              h.Href(homeRouter()),
-              h.Class(
-                "mt-4 inline-block border border-neutral-700 bg-neutral-800 px-4 py-2 font-medium text-neutral-100 hover:bg-neutral-700",
+              h.h1([h.Class("text-2xl font-bold")], ["Page not found"]),
+              h.p(
+                [h.Class("mt-2 text-neutral-400")],
+                [`No route for ${path}.`],
+              ),
+              h.a(
+                [
+                  h.Href(homeRouter()),
+                  h.Class(
+                    "mt-4 inline-block border border-neutral-700 bg-neutral-800 px-4 py-2 font-medium text-neutral-100 hover:bg-neutral-700",
+                  ),
+                ],
+                ["Back home"],
               ),
             ],
-            ["Back home"],
           ),
         ],
       ),

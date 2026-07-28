@@ -3,12 +3,12 @@ import * as SqliteMigrator from "@effect/sql-sqlite-wasm/SqliteMigrator";
 import { Effect, Layer } from "effect";
 import { Migrator, SqlClient } from "effect/unstable/sql";
 
-// The standards-based worker form (not `?worker` imports): Vite detects
-// this exact `new Worker(new URL(...), import.meta.url)` pattern and
-// bundles the worker, while bun — which imports this module tree directly
-// for the landing-page prerender — parses it as plain code instead of
-// choking on a `?worker` specifier. The worker is only constructed when
-// the layer builds, which the prerender never does.
+// NOTE: The standards-based worker form, not a `?worker` import. Vite detects
+// this exact `new Worker(new URL(...), import.meta.url)` pattern and bundles
+// the worker, while bun (which imports this module tree for the landing-page
+// prerender) parses it as plain code rather than choking on a `?worker`
+// specifier. The worker is only constructed when the layer builds, which the
+// prerender never does.
 const ClientLive = SqliteClient.layer({
   worker: Effect.acquireRelease(
     Effect.sync(
@@ -149,32 +149,26 @@ export const SqlLive = SqliteMigrator.layer({
     }),
 
     // Whether a thread is still in the INBOX. Without this the list showed
-    // every thread ever synced: archiving in Gmail removes the INBOX label,
-    // which reaches us as a change on the thread, so the row was updated and
-    // happily kept — the local inbox only ever grew.
-    //
+    // every thread ever synced: archiving removes the INBOX label, which
+    // reaches us as a change on the thread, so the row was updated and kept.
     // Defaults to 1 so nothing disappears on upgrade; existing rows are
     // corrected as applyHistory touches them.
-    //
-    // Numbered 0004, skipping 0003: the vector-search branch owns
+    // NOTE: Numbered 0004, skipping 0003. The vector-search branch owns
     // 0003_thread_vectors, and the migrator skips any id <= the highest
-    // already applied — so reusing 0003 would silently no-op on a database
-    // that had run that branch.
+    // already applied, so reusing 0003 would silently no-op on a database that
+    // had run that branch.
     "0004_thread_inbox_membership": Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`ALTER TABLE threads ADD COLUMN in_inbox INTEGER NOT NULL DEFAULT 1`;
       yield* sql`CREATE INDEX threads_inbox ON threads (in_inbox, latest_date DESC)`;
     }),
 
-    // Bodies become gzip bytes: they are ~91% of the store and compress
-    // ~6.5x, which is what makes keeping every body — and so reading the
-    // whole mailbox offline — affordable. See docs/caching.md.
-    //
-    // SQLite can't retype a column, hence the rebuild. Existing rows are
-    // carried over as codec 'none': CAST(body AS BLOB) yields the text's
-    // UTF-8 bytes, so they decode through exactly the same path as new rows
-    // and no legacy branch is needed anywhere in the read path. They turn
-    // into gzip naturally as threads re-sync.
+    // Bodies become gzip bytes: they are ~91% of the store and compress ~6.5x,
+    // which is what makes keeping every body affordable. See docs/caching.md.
+    // NOTE: SQLite can't retype a column, hence the rebuild. Existing rows
+    // carry over as codec 'none' because CAST(body AS BLOB) yields the text's
+    // UTF-8 bytes, so they decode through the same path as new rows and no
+    // legacy branch is needed. They turn into gzip as threads re-sync.
     "0005_compress_message_bodies": Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`
@@ -194,18 +188,15 @@ export const SqlLive = SqliteMigrator.layer({
       yield* sql`ALTER TABLE message_bodies_v2 RENAME TO message_bodies`;
     }),
 
-    // Remote images, cached so mail renders instantly and offline — and so
+    // Remote images, cached so mail renders instantly and offline, and so
     // opening a mail stops firing its tracking pixels. Distinct from
-    // message_attachments: those are inline MIME parts that arrive with the
+    // message_attachments: those are inline MIME parts arriving with the
     // message, these are urls fetched from the sender's CDN through the API
     // worker's proxy. See images.ts and docs/caching.md.
-    //
-    // Unlike bodies, these are tiered: hydrating every image in the mailbox
-    // is ~280,000 fetches and several gigabytes, so only the newest
-    // HOT_THREAD_COUNT threads are prefetched and opened threads are kept
-    // under an LRU. The two thread columns are what make that decidable
-    // without a second table — images_cached_at is the work queue
-    // (0 = pending) and images_used_at is the LRU stamp (0 = never opened).
+    // NOTE: Unlike bodies these are tiered, because hydrating every image is
+    // ~280,000 fetches and several gigabytes. The two thread columns are what
+    // make the tier decidable without a second table: images_cached_at is the
+    // work queue (0 = pending), images_used_at the LRU stamp (0 = never).
     "0006_remote_images": Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`
@@ -227,5 +218,6 @@ export const SqlLive = SqliteMigrator.layer({
         ON threads (images_cached_at, latest_date DESC)
       `;
     }),
-  } satisfies Record<`${number}_${string}`, any>),
+    // `satisfies` only pins the key format; the migrator infers the values.
+  } satisfies Record<`${number}_${string}`, unknown>),
 }).pipe(Layer.provideMerge(ClientLive));

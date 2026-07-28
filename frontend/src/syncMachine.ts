@@ -118,13 +118,11 @@ export const AppliedHistory = m("AppliedHistory", {
   changedCount: S.Number,
   syncedAt: S.Number,
 });
-/** A history pass that ran *during* the backfill. Deliberately a separate
- *  fact from AppliedHistory, with no failure variant: an interleaved refresh
- *  is an optimization on top of a walk that is already correct, so every way
- *  it can go wrong — a failed request, an expired cursor, more changes than
- *  HISTORY_RESYNC_CAP — collapses to `maybeHistoryId: None` and the backfill
- *  carries on undisturbed. Routing it through FailedSync instead would let a
- *  transient network blip knock a 25-minute backfill into Backoff. */
+/** A history pass that ran *during* the backfill. A separate fact from
+ *  AppliedHistory with no failure variant: every way it can go wrong
+ *  collapses to `maybeHistoryId: None` and the backfill carries on. */
+// NOTE: Routing this through FailedSync instead would let a transient network
+// blip knock a 25-minute backfill into Backoff.
 export const RefreshedDuringBackfill = m("RefreshedDuringBackfill", {
   maybeHistoryId: S.Option(HistoryId),
   changedCount: S.Number,
@@ -208,7 +206,9 @@ export const ReadSyncCheckpoint = Command.define(
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
     return yield* engine.readCheckpoint(accountEmail).pipe(
-      Effect.map((maybeCheckpoint) => SucceededReadSyncCheckpoint({ maybeCheckpoint })),
+      Effect.map((maybeCheckpoint) =>
+        SucceededReadSyncCheckpoint({ maybeCheckpoint }),
+      ),
       Effect.catch((error) => {
         const failure = toFailedSync(error);
         return Effect.succeed(
@@ -281,15 +281,13 @@ export const ApplyHistory = Command.define(
   }),
 );
 
-// The interleaved refresh. Same engine pass as ApplyHistory, but every
-// outcome — including failure — becomes one infallible fact, because the
-// backfill must not be interrupted by it.
-//
-// An expired cursor reports None and so keeps the old one, which means the
-// remaining interleaved passes during this backfill are wasted requests and
-// the full resync happens once at CatchingUp. That is the right trade: an
-// expired cursor is rare, and handling it here would mean tearing down a
-// backfill that is already most of the way through the same work.
+/** The interleaved refresh: the same engine pass as ApplyHistory, but every
+ *  outcome including failure becomes one infallible fact, because the backfill
+ *  must not be interrupted by it. */
+// NOTE: An expired cursor reports None and keeps the old one, so the remaining
+// interleaved passes this backfill are wasted requests and the full resync
+// happens once at CatchingUp. Handling it here would mean tearing down a
+// backfill already most of the way through the same work.
 export const RefreshDuringBackfill = Command.define(
   "RefreshDuringBackfill",
   { historyId: HistoryId },
@@ -358,13 +356,27 @@ const backoffDelayMs = (
     BACKOFF_BASE_MS * 2 ** (attempt - 1),
     BACKOFF_MAX_MS,
   );
-  return Math.max(exponential, Option.getOrElse(maybeRetryAfterMs, () => 0));
+  return Math.max(
+    exponential,
+    Option.getOrElse(maybeRetryAfterMs, () => 0),
+  );
 };
 
-const isAuthFailure = (
-  _state: State,
-  message: { readonly isAuthError: boolean },
-): boolean => message.isAuthError;
+// Every failing pass reports the same two facts, whatever it was doing.
+type FailureMessage = Readonly<{
+  isAuthError: boolean;
+  maybeRetryAfterMs: Option.Option<number>;
+}>;
+
+const isAuthFailure = (_state: State, message: FailureMessage): boolean =>
+  message.isAuthError;
+
+// The delay the next attempt waits out. Both the Backoff state and its
+// WaitRetry command need it, and they must agree.
+const retryDelay = (
+  state: Readonly<{ attempt: number }>,
+  message: FailureMessage,
+): number => backoffDelayMs(state.attempt + 1, message.maybeRetryAfterMs);
 
 // The boot fork, off the persisted checkpoint: a finished backfill goes
 // straight to the history diff; an unfinished one resumes with honest
@@ -406,11 +418,49 @@ const resumePageToken = (
     ? Option.none()
     : backfilling.maybePageToken;
 
-const backfillResume = (
-  _backoff: typeof Backoff.Type,
-  resume: Resume,
-): Option.Option<typeof ResumeBackfill.Type> =>
-  resume._tag === "ResumeBackfill" ? Option.some(resume) : Option.none();
+// Narrows the parked resume to one variant. The Backoff exits are a chain of
+// these, each re-entering the pass that stored it.
+const resumeAs =
+  <Tag extends Resume["_tag"]>(tag: Tag) =>
+  (
+    backoff: typeof Backoff.Type,
+  ): Option.Option<Extract<Resume, { readonly _tag: Tag }>> =>
+    Option.liftPredicate(
+      backoff.resume,
+      (resume): resume is Extract<Resume, { readonly _tag: Tag }> =>
+        resume._tag === tag,
+    );
+
+// Every network pass fails the same way: auth-shaped errors park the machine
+// in NeedsAuth, anything else escalates the delay and re-enters the pass it
+// came from. Only the resume payload differs, so only that is a parameter.
+const failsIntoBackoff = <
+  SourceState extends State & Readonly<{ attempt: number }>,
+  TriggerMessage extends Message & FailureMessage,
+>(
+  toResume: (state: SourceState, message: TriggerMessage) => Resume,
+) =>
+  [
+    when<State, Message, SourceState, TriggerMessage, boolean, "NeedsAuth">(
+      isAuthFailure,
+      "NeedsAuth",
+      () => NeedsAuth(),
+    ),
+    otherwise(
+      to<State, Message, SourceState, TriggerMessage, "Backoff", SyncEngine>(
+        "Backoff",
+        ({ state, message }) =>
+          Backoff({
+            attempt: state.attempt + 1,
+            delayMs: retryDelay(state, message),
+            resume: toResume(state, message),
+          }),
+        ({ state, message }) => [
+          WaitRetry({ delayMs: retryDelay(state, message) }),
+        ],
+      ),
+    ),
+  ] as const;
 
 export const syncMachine = Machine.define({
   state: State,
@@ -452,36 +502,12 @@ export const syncMachine = Machine.define({
             ),
           ),
         ],
-        // Without this the checkpoint read's own failure message had nowhere
-        // to go: the machine sat in Cold forever, rendering no pill, with
-        // nothing scheduled to try again.
-        FailedReadSyncCheckpoint: [
-          when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
-          otherwise(
-            to(
-              "Backoff",
-              ({ state, message }) =>
-                Backoff({
-                  attempt: state.attempt + 1,
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                  resume: ResumeCheckpoint({
-                    accountEmail: message.accountEmail,
-                  }),
-                }),
-              ({ state, message }) => [
-                WaitRetry({
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                }),
-              ],
-            ),
-          ),
-        ],
+        // NOTE: Without this the checkpoint read's own failure had nowhere to
+        // go: the machine sat in Cold forever, rendering no pill, with nothing
+        // scheduled to try again.
+        FailedReadSyncCheckpoint: failsIntoBackoff((_state, message) =>
+          ResumeCheckpoint({ accountEmail: message.accountEmail }),
+        ),
       },
     },
 
@@ -504,31 +530,7 @@ export const syncMachine = Machine.define({
             }),
           ],
         ),
-        FailedSync: [
-          when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
-          otherwise(
-            to(
-              "Backoff",
-              ({ state, message }) =>
-                Backoff({
-                  attempt: state.attempt + 1,
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                  resume: ResumePrime(),
-                }),
-              ({ state, message }) => [
-                WaitRetry({
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                }),
-              ],
-            ),
-          ),
-        ],
+        FailedSync: failsIntoBackoff(() => ResumePrime()),
       },
     },
 
@@ -544,15 +546,13 @@ export const syncMachine = Machine.define({
                 syncedCount: () => message.syncedCount,
                 attempt: () => 0,
               }),
-            // Two commands, running concurrently: the next page of the walk,
-            // and a history pass so mail arriving mid-backfill shows up
-            // within a page rather than at the end of a ~25 minute sync.
-            //
-            // Every page, with no stride: one history.list is 2 quota units
+            // Two concurrent commands: the next page of the walk, and a
+            // history pass so mail arriving mid-backfill shows up within a
+            // page rather than at the end of a ~25 minute sync.
+            // NOTE: Every page, no stride. One history.list is 2 quota units
             // against a 250/sec budget and a page takes ~5s, so this is under
-            // 0.2% of the backfill's own quota spend. A counter to fire it
-            // every Nth page would be more machine state to carry and resume
-            // than the requests it saves are worth.
+            // 0.2% of the backfill's spend, and a counter to fire it every Nth
+            // page would be more state to carry and resume than it saves.
             ({ state, message, guardValue }) => [
               SyncBatch({
                 maybePageToken: Option.some(guardValue),
@@ -571,10 +571,9 @@ export const syncMachine = Machine.define({
           ),
         ],
         // Stays in Backfilling and issues nothing: the walk already has its
-        // next page in flight, and this pass exists only to fold newly
-        // arrived mail into the store. Advancing the cursor when the pass
-        // succeeded is what stops the next refresh re-reporting the same
-        // changes; a None leaves the cursor exactly where it was.
+        // next page in flight. Advancing the cursor on success is what stops
+        // the next refresh re-reporting the same changes; a None leaves it
+        // exactly where it was.
         RefreshedDuringBackfill: to(
           "Backfilling",
           ({ state, message }) =>
@@ -584,36 +583,14 @@ export const syncMachine = Machine.define({
             }),
           () => [],
         ),
-        FailedSync: [
-          when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
-          otherwise(
-            to(
-              "Backoff",
-              ({ state, message }) =>
-                Backoff({
-                  attempt: state.attempt + 1,
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                  resume: ResumeBackfill({
-                    historyId: state.historyId,
-                    maybePageToken: resumePageToken(state),
-                    syncedCount: state.syncedCount,
-                    totalEstimate: state.totalEstimate,
-                  }),
-                }),
-              ({ state, message }) => [
-                WaitRetry({
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                }),
-              ],
-            ),
-          ),
-        ],
+        FailedSync: failsIntoBackoff((state) =>
+          ResumeBackfill({
+            historyId: state.historyId,
+            maybePageToken: resumePageToken(state),
+            syncedCount: state.syncedCount,
+            totalEstimate: state.totalEstimate,
+          }),
+        ),
       },
     },
 
@@ -638,31 +615,9 @@ export const syncMachine = Machine.define({
           () => Priming({ attempt: 0 }),
           () => [PrimeInbox()],
         ),
-        FailedSync: [
-          when(isAuthFailure, "NeedsAuth", () => NeedsAuth()),
-          otherwise(
-            to(
-              "Backoff",
-              ({ state, message }) =>
-                Backoff({
-                  attempt: state.attempt + 1,
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                  resume: ResumeHistory({ historyId: state.historyId }),
-                }),
-              ({ state, message }) => [
-                WaitRetry({
-                  delayMs: backoffDelayMs(
-                    state.attempt + 1,
-                    message.maybeRetryAfterMs,
-                  ),
-                }),
-              ],
-            ),
-          ),
-        ],
+        FailedSync: failsIntoBackoff((state) =>
+          ResumeHistory({ historyId: state.historyId }),
+        ),
       },
     },
 
@@ -682,18 +637,15 @@ export const syncMachine = Machine.define({
       on: {
         CompletedWaitRetry: [
           when(
-            (state) =>
-              state.resume._tag === "ResumeCheckpoint"
-                ? Option.some(state.resume.accountEmail)
-                : Option.none<string>(),
+            resumeAs("ResumeCheckpoint"),
             "Cold",
             ({ state }) => Cold({ attempt: state.attempt }),
             ({ guardValue }) => [
-              ReadSyncCheckpoint({ accountEmail: guardValue }),
+              ReadSyncCheckpoint({ accountEmail: guardValue.accountEmail }),
             ],
           ),
           when(
-            (state) => backfillResume(state, state.resume),
+            resumeAs("ResumeBackfill"),
             "Backfilling",
             ({ state, guardValue }) =>
               Backfilling({
@@ -711,14 +663,16 @@ export const syncMachine = Machine.define({
             ],
           ),
           when(
-            (state) =>
-              state.resume._tag === "ResumeHistory"
-                ? Option.some(state.resume.historyId)
-                : Option.none<HistoryId>(),
+            resumeAs("ResumeHistory"),
             "CatchingUp",
             ({ state, guardValue }) =>
-              CatchingUp({ historyId: guardValue, attempt: state.attempt }),
-            ({ guardValue }) => [ApplyHistory({ historyId: guardValue })],
+              CatchingUp({
+                historyId: guardValue.historyId,
+                attempt: state.attempt,
+              }),
+            ({ guardValue }) => [
+              ApplyHistory({ historyId: guardValue.historyId }),
+            ],
           ),
           otherwise(
             to(

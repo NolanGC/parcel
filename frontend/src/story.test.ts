@@ -9,6 +9,8 @@
 //   ?error= callback param surfaces on the login page.
 // - Session transitions: cookie confirms → LoggedIn; cookie gone →
 //   LoggedOut; a failed check leaves the signed-in user alone.
+// - The login page's own three statuses, including the double-click and
+//   click-while-checking guards.
 // - The inbox load, the thread open, and the palette search, each resolved
 //   to success and to failure.
 // - Sign-out lands back on the marketing page.
@@ -24,12 +26,13 @@ import { describe, expect, test } from "vitest";
 
 import {
   CompletedSignOut,
+  FailedAuth,
   FailedCheckSession,
   SucceededCheckSession,
 } from "./auth";
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
 import { GotInboxMessage, init, update, type Model } from "./main";
-import { Inbox } from "./page";
+import { Inbox, Login } from "./page";
 import * as SyncMachine from "./syncMachine";
 import * as Ui from "./ui";
 
@@ -63,7 +66,7 @@ const threadRow = {
   sender: "Ada",
   snippet: "hello",
   date: 1,
-  unread: false,
+  isUnread: false,
   category: "none" as const,
 };
 
@@ -154,7 +157,7 @@ describe("init", () => {
   test("a declined OAuth round-trip surfaces on the login page", () => {
     const [model] = init(loggedOutFlags, url("/login", "?error=access_denied"));
 
-    expect(asLoggedOut(model).loginPage.error).toEqual(
+    expect(asLoggedOut(model).loginPage.maybeError).toEqual(
       Option.some("Google sign-in was cancelled."),
     );
   });
@@ -214,6 +217,69 @@ describe("session", () => {
     );
 
     expect(commands.map((command) => command.name)).toContain("SignOut");
+  });
+});
+
+// The login page's own update. Its three statuses are what the button reads
+// from, so each transition is asserted directly rather than through the shell.
+describe("the login page", () => {
+  test("clicking sign-in moves Ready to Redirecting and starts the flow", () => {
+    const [next, commands] = Login.update(
+      Login.init(Login.Ready()),
+      Login.ClickedGoogleSignIn(),
+    );
+
+    expect(next.status._tag).toBe("Redirecting");
+    expect(commands.map((command) => command.name)).toEqual([
+      "SignInWithGoogle",
+    ]);
+  });
+
+  // Double-clicking the button, or clicking it while the boot session check
+  // is still running, must not fire a second redirect.
+  test("clicking again while redirecting does not start a second flow", () => {
+    const [next, commands] = Login.update(
+      Login.init(Login.Redirecting()),
+      Login.ClickedGoogleSignIn(),
+    );
+
+    expect(next.status._tag).toBe("Redirecting");
+    expect(commands).toEqual([]);
+  });
+
+  test("clicking while the session check is in flight is ignored", () => {
+    const [, commands] = Login.update(
+      Login.init(Login.CheckingSession()),
+      Login.ClickedGoogleSignIn(),
+    );
+
+    expect(commands).toEqual([]);
+  });
+
+  test("a failure to start the flow returns the button to Ready with the error", () => {
+    const [next] = Login.update(
+      Login.init(Login.Redirecting()),
+      FailedAuth({ error: "popup blocked" }),
+    );
+
+    expect(next.status._tag).toBe("Ready");
+    expect(next.maybeError).toEqual(Option.some("popup blocked"));
+  });
+
+  // The parent owns the session check, so it is the parent that tells the page
+  // the check came back empty.
+  test("a settled session check releases the button", () => {
+    const settled = Login.settledSessionCheck(
+      Login.init(Login.CheckingSession()),
+    );
+
+    expect(settled.status._tag).toBe("Ready");
+  });
+
+  test("a settled session check leaves an in-flight redirect alone", () => {
+    const settled = Login.settledSessionCheck(Login.init(Login.Redirecting()));
+
+    expect(settled.status._tag).toBe("Redirecting");
   });
 });
 
@@ -280,7 +346,7 @@ describe("opening a thread", () => {
         if (screen._tag !== "ShowingList") {
           throw new Error(`Expected ShowingList, got ${screen._tag}`);
         }
-        expect(screen.error).toEqual(Option.some("thread is gone"));
+        expect(screen.maybeError).toEqual(Option.some("thread is gone"));
       }),
       Story.Command.resolveAll(),
     );
@@ -325,7 +391,7 @@ describe("list keyboard navigation", () => {
       Story.with(loadedInbox()),
       Story.message(inboxMessage(Inbox.PressedListKey({ key: "j" }))),
       Story.model((next) => {
-        expect(next.inboxPage.selected).toEqual(Option.some(0));
+        expect(next.inboxPage.maybeSelected).toEqual(Option.some(0));
       }),
       Story.Command.resolve(
         Inbox.ScrollListToRow,
@@ -348,7 +414,7 @@ describe("list keyboard navigation", () => {
       Story.with(loadedInbox()),
       Story.message(inboxMessage(Inbox.HoveredRow({ index: 0 }))),
       Story.model((next) => {
-        expect(next.inboxPage.selected).toEqual(Option.some(0));
+        expect(next.inboxPage.maybeSelected).toEqual(Option.some(0));
       }),
       Story.Command.resolveAll(),
     );
@@ -364,7 +430,7 @@ describe("list keyboard navigation", () => {
     const model = loadedInbox();
     const [next] = update(model, inboxMessage(Inbox.HoveredRow({ index: 0 })));
 
-    expect(next.inboxPage.selected).toEqual(Option.some(0));
+    expect(next.inboxPage.maybeSelected).toEqual(Option.some(0));
     expect(next.inboxPage.list).toBe(model.inboxPage.list);
     expect(next.inboxPage.threads).toBe(model.inboxPage.threads);
   });
@@ -420,7 +486,7 @@ describe("palette search", () => {
       ),
       Story.model((next) => {
         expect(next.inboxPage.searchResults).toEqual([threadRow]);
-        expect(next.inboxPage.searchError).toEqual(Option.none());
+        expect(next.inboxPage.maybeSearchError).toEqual(Option.none());
       }),
       Story.Command.resolveAll(),
     );
@@ -438,7 +504,7 @@ describe("palette search", () => {
       ),
       Story.model((next) => {
         expect(next.inboxPage.searchResults).toEqual([]);
-        expect(next.inboxPage.searchError).toEqual(
+        expect(next.inboxPage.maybeSearchError).toEqual(
           Option.some("index missing"),
         );
       }),

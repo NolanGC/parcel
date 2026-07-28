@@ -95,13 +95,16 @@ describe("Inbox list hover session", () => {
     sender: "Ada",
     snippet: "hello",
     date: n,
-    unread: false,
+    isUnread: false,
     category: "none" as const,
   }));
 
   // A list with real rows, pointer inside, cursor mouse-held at `index`.
   const hoveredAt = (index: number): Inbox.Model => {
-    const [loaded] = Inbox.update(Inbox.init(), Inbox.SucceededLoadInbox({ rows }));
+    const [loaded] = Inbox.update(
+      Inbox.init(),
+      Inbox.SucceededLoadInbox({ rows }),
+    );
     const [entered] = Inbox.update(loaded, Inbox.EnteredList());
     const [next] = Inbox.update(entered, Inbox.HoveredRow({ index }));
     return next;
@@ -112,13 +115,13 @@ describe("Inbox list hover session", () => {
     const [next] = Inbox.update(left, Inbox.EnteredList());
     // Remounts the overlay (snap + fade-in) instead of sliding from row 1.
     expect(next.hoverSession).toBe(left.hoverSession + 1);
-    expect(Option.isNone(next.selected)).toBe(true);
+    expect(Option.isNone(next.maybeSelected)).toBe(true);
     expect(next.isPointerInside).toBe(true);
   });
 
   test("leaving keeps the cursor so the overlay fades out in place", () => {
     const [next] = Inbox.update(hoveredAt(1), Inbox.ExitedList());
-    expect(next.selected).toEqual(Option.some(1));
+    expect(next.maybeSelected).toEqual(Option.some(1));
     expect(next.isPointerInside).toBe(false);
   });
 
@@ -127,9 +130,9 @@ describe("Inbox list hover session", () => {
       hoveredAt(1),
       Inbox.PressedListKey({ key: "j" }),
     );
-    expect(claimed.keyboardControlled).toBe(true);
+    expect(claimed.isKeyboardControlled).toBe(true);
     const [next] = Inbox.update(claimed, Inbox.EnteredList());
-    expect(next.selected).toEqual(claimed.selected);
+    expect(next.maybeSelected).toEqual(claimed.maybeSelected);
   });
 
   test("real mouse motion over a row reclaims the overlay", () => {
@@ -138,7 +141,7 @@ describe("Inbox list hover session", () => {
       Inbox.PressedListKey({ key: "j" }),
     );
     const [next] = Inbox.update(claimed, Inbox.HoveredRow({ index: 1 }));
-    expect(next.keyboardControlled).toBe(false);
-    expect(next.selected).toEqual(Option.some(1));
+    expect(next.isKeyboardControlled).toBe(false);
+    expect(next.maybeSelected).toEqual(Option.some(1));
   });
 });
