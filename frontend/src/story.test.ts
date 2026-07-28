@@ -31,6 +31,11 @@ import {
   SucceededCheckSession,
 } from "./auth";
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
+import {
+  CompletedSnapshotPersistence,
+  SaveSnapshot,
+  type InboxSnapshot,
+} from "./inboxSnapshot";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox, Login } from "./page";
 import * as SyncMachine from "./syncMachine";
@@ -41,8 +46,14 @@ const session = {
   email: "ada@example.com",
   name: "Ada",
 };
-const loggedInFlags = { maybeSession: Option.some(session) };
-const loggedOutFlags = { maybeSession: Option.none<typeof session>() };
+const loggedInFlags = {
+  maybeSession: Option.some(session),
+  maybeSnapshot: Option.none<InboxSnapshot>(),
+};
+const loggedOutFlags = {
+  maybeSession: Option.none<typeof session>(),
+  maybeSnapshot: Option.none<InboxSnapshot>(),
+};
 
 const url = (pathname: string, search?: string): Url => ({
   protocol: "http:",
@@ -110,14 +121,12 @@ describe("init", () => {
 
     expect(model._tag).toBe("LoggedIn");
     expect(model.route._tag).toBe("Inbox");
-    // The boot-time CheckSession revalidation + the inbox boot (local
-    // read, the store's size for the sync pill, and the sync machine's
-    // checkpoint read).
+    // The boot-time CheckSession revalidation + the inbox boot (the LIMITed
+    // first local read and the sync machine's checkpoint read; the full
+    // read, size read, and image loop chain off the top read's result).
     expect(commands.map((command) => command.name)).toEqual([
       "CheckSession",
-      "LoadInbox",
-      "ReadLocalSize",
-      "CacheImageBatch",
+      "LoadInboxTop",
       "ReadSyncCheckpoint",
     ]);
   });
@@ -131,9 +140,7 @@ describe("init", () => {
     expect(commands.map((command) => command.name)).toEqual([
       "RedirectToInbox",
       "CheckSession",
-      "LoadInbox",
-      "ReadLocalSize",
-      "CacheImageBatch",
+      "LoadInboxTop",
       "ReadSyncCheckpoint",
     ]);
   });
@@ -306,6 +313,113 @@ describe("loading the inbox", () => {
 
     expect(next.inboxPage.threads._tag).toBe("Failure");
   });
+
+  test("the top read paints Refreshing and chains the full boot reads", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next, commands] = update(
+      model,
+      inboxMessage(Inbox.SucceededLoadInboxTop({ rows: [threadRow] })),
+    );
+
+    expect(next.inboxPage.threads._tag).toBe("Refreshing");
+    expect(commands.map((command) => command.name)).toEqual([
+      "LoadInbox",
+      "ReadLocalSize",
+      "CacheImageBatch",
+    ]);
+  });
+
+  test("a failed top read stays silent but still chains the full read", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next, commands] = update(
+      model,
+      inboxMessage(Inbox.FailedLoadInboxTop({ error: "sqlite is unhappy" })),
+    );
+
+    expect(next.inboxPage.threads._tag).toBe("Loading");
+    expect(commands.map((command) => command.name)).toEqual([
+      "LoadInbox",
+      "ReadLocalSize",
+      "CacheImageBatch",
+    ]);
+  });
+});
+
+describe("inbox snapshot seed", () => {
+  test("a matching snapshot paints rows at init instead of the placeholder", () => {
+    const [model] = init(
+      {
+        ...loggedInFlags,
+        maybeSnapshot: Option.some({ email: session.email, rows: [threadRow] }),
+      },
+      url("/inbox"),
+    );
+
+    expect(model.inboxPage.threads._tag).toBe("Refreshing");
+  });
+
+  test("another account's snapshot is no seed", () => {
+    const [model] = init(
+      {
+        ...loggedInFlags,
+        maybeSnapshot: Option.some({
+          email: "grace@example.com",
+          rows: [threadRow],
+        }),
+      },
+      url("/inbox"),
+    );
+
+    expect(model.inboxPage.threads._tag).toBe("Loading");
+  });
+
+  // The regression this guards: the snapshot write used to be skipped when
+  // the top slice looked unchanged, comparing against the rows already in the
+  // model. On a first visit the LIMITed boot read has already put those rows
+  // there and reconcileRows preserves their identity, so the comparison said
+  // "unchanged", no snapshot was ever written, and every visit to a fresh
+  // origin paid the full placeholder — until unrelated new mail happened to
+  // change the top of the list.
+  test("a first visit with no stored snapshot still writes one", () => {
+    const [model] = init(loggedOutFlags, url("/inbox"));
+    const [signedIn] = update(
+      model,
+      SucceededCheckSession({ maybeSession: Option.some(session) }),
+    );
+    // The boot sequence in order: the LIMITed read lands first, then the full
+    // read settles the list.
+    const [afterTop] = update(
+      signedIn,
+      inboxMessage(Inbox.SucceededLoadInboxTop({ rows: [threadRow] })),
+    );
+    const [, commands] = update(
+      afterTop,
+      inboxMessage(Inbox.SucceededLoadInbox({ rows: [threadRow] })),
+    );
+
+    expect(commands.map((command) => command.name)).toContain("SaveSnapshot");
+  });
+
+  test("an empty inbox writes no snapshot", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.SucceededLoadInbox({ rows: [] })),
+    );
+
+    expect(commands.map((command) => command.name)).not.toContain(
+      "SaveSnapshot",
+    );
+  });
+
+  test("sign-out clears the snapshot alongside the session", () => {
+    const [, commands] = update(loadedInbox(), CompletedSignOut());
+
+    expect(commands.map((command) => command.name)).toEqual([
+      "ClearSession",
+      "ClearSnapshot",
+      "RedirectToHome",
+    ]);
+  });
 });
 
 describe("opening a thread", () => {
@@ -360,10 +474,12 @@ describe("opening a thread", () => {
     Story.story(
       update,
       Story.with(loadedInbox()),
-      // New mail arrives and takes over index 0.
+      // New mail arrives and takes over index 0. The changed top slice also
+      // triggers the localStorage snapshot write.
       Story.message(
         inboxMessage(Inbox.SucceededLoadInbox({ rows: [otherRow, threadRow] })),
       ),
+      Story.Command.resolve(SaveSnapshot, CompletedSnapshotPersistence()),
       // The click the user began before that refresh landed.
       Story.message(
         inboxMessage(Inbox.ClickedRow({ id: threadRow.id, index: 0 })),

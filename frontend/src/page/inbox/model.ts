@@ -304,7 +304,12 @@ export const Model = S.Struct({
 });
 export type Model = typeof Model.Type;
 
-export const init = (): Model => ({
+/** `maybeSeedRows` is the localStorage snapshot of the top of the list
+ *  (inboxSnapshot.ts): seeded boots paint rows immediately as `Refreshing`,
+ *  and the boot LoadInbox settles over them. */
+export const init = (
+  maybeSeedRows: Option.Option<ReadonlyArray<ThreadRow>> = Option.none(),
+): Model => ({
   appearance: "System",
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
   tabs: Ui.Tabs.init({
@@ -314,7 +319,10 @@ export const init = (): Model => ({
   list: Ui.VirtualList.init({ id: LIST_ID, rowHeightPx: ROW_HEIGHT }),
   palette: Ui.Palette.init({ id: "inbox-palette" }),
   accountPopover: Ui.Popover.init({ id: "inbox-account", isAnimated: true }),
-  threads: AsyncData.Loading(),
+  threads: Option.match(maybeSeedRows, {
+    onNone: (): typeof ThreadsData.schema.Type => AsyncData.Loading(),
+    onSome: (rows) => AsyncData.Refreshing({ data: rows }),
+  }),
   sync: SyncMachine.init(),
   screen: ShowingList({ maybeError: Option.none() }),
   maybeSelected: Option.none(),
@@ -376,6 +384,16 @@ export const FailedSearch = m("FailedSearch", {
 export const SucceededLoadInbox = m("SucceededLoadInbox", {
   rows: S.Array(ThreadRow),
 });
+/** The boot-only LIMITed first read: enough rows to paint the viewport,
+ *  decoded in O(limit) instead of O(mailbox). The full read follows. */
+export const SucceededLoadInboxTop = m("SucceededLoadInboxTop", {
+  rows: S.Array(ThreadRow),
+});
+/** A failed top read stays silent: the full read that follows either
+ *  succeeds or owns the error report. */
+export const FailedLoadInboxTop = m("FailedLoadInboxTop", {
+  error: S.String,
+});
 /** A sync-machine fact (checkpoint read, batch landed, failure, …). */
 export const GotSyncMessage = m("GotSyncMessage", {
   message: SyncMachine.Message,
@@ -426,6 +444,8 @@ export const Message = S.Union([
   SucceededSearch,
   FailedSearch,
   SucceededLoadInbox,
+  SucceededLoadInboxTop,
+  FailedLoadInboxTop,
   GotSyncMessage,
   FailedLoadInbox,
   SucceededReadLocalSize,

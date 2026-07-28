@@ -36,6 +36,14 @@ import {
   remoteImageUrls,
   rewriteImageUrls,
 } from "./images";
+import {
+  BOOT_ENGINE_READY,
+  BOOT_ENGINE_START,
+  BOOT_QUERY_END,
+  BOOT_QUERY_START,
+  logBootReport,
+  mark,
+} from "./bootMarks";
 import { cleanSnippet } from "./snippet";
 import { SqlLive } from "./sql";
 import { HOT_THREAD_COUNT, OPENED_LRU_COUNT } from "./tiers";
@@ -457,10 +465,12 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
   "parcel/SyncEngine",
   {
     make: Effect.gen(function* () {
+      yield* mark(BOOT_ENGINE_START);
       const gmail = yield* Gmail;
       const sql = yield* SqlClient.SqlClient;
       const compression = yield* Compression;
       const imageFetcher = yield* ImageFetcher;
+      yield* mark(BOOT_ENGINE_READY);
 
       // The list columns all come off the newest message in the thread, so
       // they are resolved together rather than each re-deriving it.
@@ -1152,6 +1162,26 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         return yield* decodeThreadRows(raw);
       });
 
+      // The boot-only first read: the viewport's worth of rows in O(limit),
+      // served by the (in_inbox, latest_date DESC) index. The full loadInbox
+      // follows it and settles the list. Runs once per boot, which is what
+      // makes it the right home for the boot-query bracket.
+      const loadInboxTop = (limit: number) =>
+        Effect.gen(function* () {
+          yield* mark(BOOT_QUERY_START);
+          const raw = yield* sql`
+            SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
+            FROM threads
+            WHERE in_inbox = 1
+            ORDER BY latest_date DESC
+            LIMIT ${limit}
+          `;
+          const rows = yield* decodeThreadRows(raw);
+          yield* mark(BOOT_QUERY_END);
+          yield* logBootReport(rows.length);
+          return rows;
+        });
+
       // Image bytes reach the html as blob: urls rather than data: URIs, since
       // inlining megabytes of base64 into the body string is slow and can OOM
       // the tab.
@@ -1292,6 +1322,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       return {
         cacheImageBatch,
         loadInbox,
+        loadInboxTop,
         loadThread,
         localSizeBytes,
         readCheckpoint,

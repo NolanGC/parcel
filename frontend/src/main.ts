@@ -8,7 +8,7 @@ import {
   pipe,
 } from "effect";
 import { KeyValueStore } from "effect/unstable/persistence";
-import { Command, Runtime, Subscription } from "foldkit";
+import { AsyncData, Command, Runtime, Subscription } from "foldkit";
 import { html, type Document, type Html } from "foldkit/html";
 import { m } from "foldkit/message";
 import { UrlRequest, load, pushUrl, replaceUrl } from "foldkit/navigation";
@@ -30,6 +30,13 @@ import {
   readStoredSession,
 } from "./auth";
 import { APP_NAME } from "./config";
+import {
+  ClearSnapshot,
+  CompletedSnapshotPersistence,
+  InboxSnapshot,
+  SaveSnapshot,
+  readStoredSnapshot,
+} from "./inboxSnapshot";
 import { Inbox, Login } from "./page";
 import { landingView, notFoundView } from "./page/landing";
 import {
@@ -43,7 +50,7 @@ import {
   urlToAppRoute,
 } from "./route";
 import { Search } from "./search";
-import { SyncEngine } from "./sync";
+import { SyncEngine, type ThreadRow } from "./sync";
 import * as Ui from "./ui";
 
 // MODEL
@@ -95,6 +102,7 @@ export const Message = S.Union([
   FailedCheckSession,
   CompletedSignOut,
   CompletedSessionPersistence,
+  CompletedSnapshotPersistence,
 ]);
 export type Message = typeof Message.Type;
 
@@ -102,14 +110,20 @@ export type Message = typeof Message.Type;
 
 export const Flags = S.Struct({
   maybeSession: S.Option(Session),
+  maybeSnapshot: S.Option(InboxSnapshot),
 });
 export type Flags = typeof Flags.Type;
 
-// NOTE: The localStorage copy of the session only buys an instant logged-in
-// first paint. `CheckSession` confirms against the cookie, which is the
-// authority, and every init branch issues it.
-export const flags: Effect.Effect<Flags> = readStoredSession.pipe(
-  Effect.map((maybeSession) => Flags.make({ maybeSession })),
+// NOTE: The localStorage copies only buy an instant first paint: the session
+// a logged-in shell, the snapshot real list rows. `CheckSession` confirms the
+// session against the cookie and the boot LoadInbox settles over the seeded
+// rows; both localStorage reads are advisory, never authoritative.
+export const flags: Effect.Effect<Flags> = Effect.map(
+  Effect.all({
+    maybeSession: readStoredSession,
+    maybeSnapshot: readStoredSnapshot,
+  }),
+  Flags.make,
 );
 
 // INIT
@@ -139,8 +153,12 @@ const initLoggedOut = (
     inboxPage: Inbox.init(),
   });
 
-const initLoggedIn = (route: AppRoute, session: Session): LoggedIn =>
-  LoggedIn({ route, session, inboxPage: Inbox.init() });
+const initLoggedIn = (
+  route: AppRoute,
+  session: Session,
+  maybeSeedRows: Option.Option<ReadonlyArray<ThreadRow>> = Option.none(),
+): LoggedIn =>
+  LoggedIn({ route, session, inboxPage: Inbox.init(maybeSeedRows) });
 
 const ACCESS_DENIED = "access_denied";
 
@@ -163,6 +181,9 @@ const oauthErrorFromUrl = (url: Url): Option.Option<string> =>
 // The inbox page owns its boot (the first local read plus the sync machine's
 // checkpoint read); wrapping its messages here keeps the parent/child message
 // boundary intact.
+const inboxRows = (inboxPage: Inbox.Model): ReadonlyArray<ThreadRow> =>
+  Option.getOrElse(AsyncData.getData(inboxPage.threads), () => []);
+
 const loadInboxCommands = (
   accountEmail: string,
 ): ReadonlyArray<Command.Command<Message, never, AppResources>> =>
@@ -211,8 +232,14 @@ export const init: Runtime.RoutingApplicationInit<
     // for CheckSession, so a stale cookie surfaces as the pull's own auth
     // error instead of a blank list.
     onSome: (session) => {
+      // The seed is only a seed for the mailbox it came from.
+      const maybeSeedRows = flags.maybeSnapshot.pipe(
+        Option.filter((snapshot) => snapshot.email === session.email),
+        Option.map((snapshot) => snapshot.rows),
+      );
+
       const optimistic = (route: AppRoute): UpdateReturn => [
-        initLoggedIn(route, session),
+        initLoggedIn(route, session, maybeSeedRows),
         [CheckSession(), ...loadInboxCommands(session.email)],
       ];
 
@@ -220,7 +247,7 @@ export const init: Runtime.RoutingApplicationInit<
         withUpdateReturn,
         M.tagsExhaustive({
           Login: () => [
-            initLoggedIn(InboxRoute(), session),
+            initLoggedIn(InboxRoute(), session, maybeSeedRows),
             [
               RedirectToInbox(),
               CheckSession(),
@@ -278,7 +305,7 @@ const enterLoggedIn = (session: Session): UpdateReturn => [
 
 const leaveLoggedIn = (): UpdateReturn => [
   initLoggedOut(HomeRoute(), Login.Ready()),
-  [ClearSession(), RedirectToHome()],
+  [ClearSession(), ClearSnapshot(), RedirectToHome()],
 ];
 
 const settleLoginSessionCheck = (loggedOut: LoggedOut): UpdateReturn => [
@@ -293,6 +320,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       CompletedNavigateInternal: () => [model, []],
       CompletedLoadExternal: () => [model, []],
       CompletedSessionPersistence: () => [model, []],
+      CompletedSnapshotPersistence: () => [model, []],
 
       ClickedLink: ({ request }) =>
         M.value(request).pipe(
@@ -411,11 +439,35 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           SignOut(),
           () => message._tag === "ClickedAccountSignOut",
         );
+        // The snapshot write lives here rather than in the page because the
+        // account email is this model's fact.
+        //
+        // NOTE: Every settled read writes, with no "did the top change?"
+        // guard. Such a guard has to compare against what is *persisted*, and
+        // the obvious proxy — the rows already in the model — is wrong: the
+        // LIMITed boot read has put those rows there first, and reconcileRows
+        // preserves their identity, so an unwritten snapshot looks unchanged
+        // and a first visit never persists one. The write is a ~10KB
+        // localStorage set on boot and once per backfill stride; that is
+        // cheaper than the class of bug the guard invites.
+        const maybeSaveSnapshot = Option.liftPredicate(
+          model,
+          (model): model is LoggedIn =>
+            model._tag === "LoggedIn" && message._tag === "SucceededLoadInbox",
+        ).pipe(
+          Option.filter(() => Arr.isReadonlyArrayNonEmpty(inboxRows(inboxPage))),
+          Option.map(({ session }) =>
+            SaveSnapshot({
+              snapshot: { email: session.email, rows: inboxRows(inboxPage) },
+            }),
+          ),
+        );
         const mapped = [
           ...Command.mapMessages(commands, (message) =>
             GotInboxMessage({ message }),
           ),
           ...Arr.fromOption(maybeSignOut),
+          ...Arr.fromOption(maybeSaveSnapshot),
         ];
 
         // NOTE: The arms are identical because `evo` needs the union narrowed
