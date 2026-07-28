@@ -3,21 +3,68 @@ import * as SqliteMigrator from "@effect/sql-sqlite-wasm/SqliteMigrator";
 import { Effect, Layer } from "effect";
 import { Migrator, SqlClient } from "effect/unstable/sql";
 
+import { BOOT_WORKER_SPAWN, markNow } from "./bootMarks";
+
 // NOTE: The standards-based worker form, not a `?worker` import. Vite detects
 // this exact `new Worker(new URL(...), import.meta.url)` pattern and bundles
 // the worker, while bun (which imports this module tree for the landing-page
 // prerender) parses it as plain code rather than choking on a `?worker`
-// specifier. The worker is only constructed when the layer builds, which the
-// prerender never does.
+// specifier.
+//
+// The worker runs its whole boot (wasm fetch + compile, OPFS handle pool,
+// open) the moment it starts, so it is spawned at module eval rather than at
+// layer build: that work overlaps bundle eval and the first paint instead of
+// following them.
+//
+// The globalThis slot (rather than module state) is what survives HMR: a
+// re-eval of this module while the previous runtime still owns a worker must
+// not spawn a second one — OPFS access handles are exclusive, and a second
+// pool would fail to acquire them. On that path no eager spawn happens, and
+// the layer build spawns fresh after the old runtime's release has terminated
+// its worker and cleared the slot.
+type WorkerSlot = Readonly<{ worker: Worker; isOwned: boolean }>;
+const workerGlobal = globalThis as { __parcelDbWorker?: WorkerSlot };
+
+const spawnWorker = (): Worker => {
+  const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+    type: "module",
+  });
+  workerGlobal.__parcelDbWorker = { worker, isOwned: false };
+  markNow(BOOT_WORKER_SPAWN);
+  return worker;
+};
+
+// NOTE: OPFS, not `typeof Worker`, is the guard. bun defines a Worker global
+// (with or without happy-dom registered), so a Worker check does not keep the
+// landing-page prerender from eagerly spawning a database worker that has no
+// OPFS to open — it would fail asynchronously inside the worker and survive
+// only because prerender's process.exit wins the race. `getDirectory` is the
+// exact capability AccessHandlePoolVFS needs, so testing for it is the honest
+// question: can a database worker actually boot here?
+const canOpenOpfs =
+  typeof navigator !== "undefined" &&
+  typeof navigator.storage?.getDirectory === "function";
+
+if (canOpenOpfs && workerGlobal.__parcelDbWorker === undefined) {
+  spawnWorker();
+}
+
 const ClientLive = SqliteClient.layer({
   worker: Effect.acquireRelease(
-    Effect.sync(
-      () =>
-        new Worker(new URL("./worker.ts", import.meta.url), {
-          type: "module",
-        }),
-    ),
-    (worker) => Effect.sync(() => worker.terminate()),
+    Effect.sync(() => {
+      const slot = workerGlobal.__parcelDbWorker;
+      const worker =
+        slot !== undefined && !slot.isOwned ? slot.worker : spawnWorker();
+      workerGlobal.__parcelDbWorker = { worker, isOwned: true };
+      return worker;
+    }),
+    (worker) =>
+      Effect.sync(() => {
+        worker.terminate();
+        if (workerGlobal.__parcelDbWorker?.worker === worker) {
+          delete workerGlobal.__parcelDbWorker;
+        }
+      }),
   ),
 });
 

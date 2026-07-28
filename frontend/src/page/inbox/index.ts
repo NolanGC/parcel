@@ -14,6 +14,7 @@ import {
 import { AsyncData, Command } from "foldkit";
 import { evo } from "foldkit/struct";
 
+import { mark } from "../../bootMarks";
 import { ThreadId } from "../../Gmail";
 import { Search } from "../../search";
 import { SyncEngine, ThreadRow } from "../../sync";
@@ -49,6 +50,8 @@ import {
   ShowingList,
   ShowingThread,
   SucceededLoadInbox,
+  SucceededLoadInboxTop,
+  FailedLoadInboxTop,
   SucceededLoadThread,
   SucceededReadLocalSize,
   SucceededSearch,
@@ -104,15 +107,38 @@ export const LoadInbox = Command.define(
   }),
 );
 
-/** Everything main.ts issues on entering the inbox: the first local read
- *  plus the sync machine's checkpoint-derived boot. `accountEmail` scopes
- *  the local store — a different mailbox wipes it rather than blending. */
+/** How many rows the boot-only first read selects: comfortably past the
+ *  viewport, still O(1) against mailbox size. */
+export const TOP_READ_LIMIT = 200;
+
+/** The boot-only LIMITed first read; the full LoadInbox is issued from its
+ *  result, and so are ReadLocalSize and the image loop — everything shares
+ *  one serialized DB worker, so nothing may queue ahead of the paint. */
+const LoadInboxTop = Command.define(
+  "LoadInboxTop",
+  SucceededLoadInboxTop,
+  FailedLoadInboxTop,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.loadInboxTop(TOP_READ_LIMIT).pipe(
+      Effect.map((rows) => SucceededLoadInboxTop({ rows })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedLoadInboxTop({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+/** Everything main.ts issues on entering the inbox: the LIMITed first local
+ *  read plus the sync machine's checkpoint-derived boot. The full read, the
+ *  size read, and the image loop chain off the top read's result rather than
+ *  queueing here in front of the first paint. `accountEmail` scopes the
+ *  local store — a different mailbox wipes it rather than blending. */
 export const bootCommands = (
   accountEmail: string,
 ): ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>> => [
-  LoadInbox(),
-  ReadLocalSize(),
-  CacheImageBatch(),
+  LoadInboxTop(),
   ...Command.mapMessages(SyncMachine.bootCommands(accountEmail), (message) =>
     GotSyncMessage({ message }),
   ),
@@ -199,11 +225,14 @@ export const LoadThread = Command.define(
 )(({ id }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
+    // parcel:data:* is the perf bench's data-phase bracket (perf/src/bench.ts).
+    yield* mark("parcel:data:start");
     return yield* engine.loadThread(id).pipe(
       Effect.map((detail) => SucceededLoadThread({ detail })),
       Effect.catchCause((cause) =>
         Effect.succeed(FailedLoadThread({ error: Cause.pretty(cause) })),
       ),
+      Effect.tap(mark("parcel:data:end")),
     );
   }),
 );
@@ -238,6 +267,13 @@ type UpdateReturn = readonly [
   Model,
   ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>>,
 ];
+
+/** Issued exactly once, from the top read's settle (either branch): the full
+ *  read that settles the list, then the size read and the image loop queued
+ *  behind it on the shared worker. */
+const afterTopReadCommands = (): ReadonlyArray<
+  Command.Command<Message, never, SyncEngine | Search>
+> => [LoadInbox(), ReadLocalSize(), CacheImageBatch()];
 
 // Every palette query goes through here, so the seq can never be bumped
 // without a search in flight to match it.
@@ -531,6 +567,27 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
         ];
       },
+
+      // The boot top read: paints as `Refreshing` (the full read is still in
+      // flight) unless a sync-triggered full read already settled the list,
+      // in which case the newer, complete rows win and the top slice is
+      // dropped. Either way the follow-up commands fire, exactly once.
+      SucceededLoadInboxTop: ({ rows }) => [
+        model.threads._tag === "Success"
+          ? model
+          : evo(model, {
+              threads: () =>
+                AsyncData.Refreshing({
+                  data: reconcileRows(listedRows(model), rows),
+                }),
+            }),
+        afterTopReadCommands(),
+      ],
+
+      // The full read that follows either succeeds or owns the error report;
+      // a failed top read stays silent so the user never sees an error for a
+      // query whose only job was an early paint.
+      FailedLoadInboxTop: () => [model, afterTopReadCommands()],
 
       // Reconciled against the rows already on screen so unchanged threads
       // keep their object identity and the view can memoize past them.
