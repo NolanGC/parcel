@@ -16,20 +16,23 @@ import { BOOT_WORKER_SPAWN, markNow } from "./bootMarks";
 // layer build: that work overlaps bundle eval and the first paint instead of
 // following them.
 //
-// The globalThis slot (rather than module state) is what survives HMR: a
-// re-eval of this module while the previous runtime still owns a worker must
-// not spawn a second one — OPFS access handles are exclusive, and a second
-// pool would fail to acquire them. On that path no eager spawn happens, and
-// the layer build spawns fresh after the old runtime's release has terminated
-// its worker and cleared the slot.
-type WorkerSlot = Readonly<{ worker: Worker; isOwned: boolean }>;
-const workerGlobal = globalThis as { __parcelDbWorker?: WorkerSlot };
+// The globalThis slot (rather than module state) is what survives HMR, and
+// what makes "at most one database worker per tab" enforceable. That bound is
+// not a tidiness preference: the OPFS access handles a worker opens are
+// EXCLUSIVE, so a second live worker cannot open the database at all, and each
+// leaked one holds a wa-sqlite instance until the tab runs out of memory.
+//
+// NOTE: Hence `replaceWorker` rather than a bare spawn. A runtime rebuild that
+// never released its worker (every HMR cycle in dev) would otherwise leave the
+// old one running while the new one fails to acquire the pool.
+const workerGlobal = globalThis as { __parcelDbWorker?: Worker };
 
-const spawnWorker = (): Worker => {
+const replaceWorker = (): Worker => {
+  workerGlobal.__parcelDbWorker?.terminate();
   const worker = new Worker(new URL("./worker.ts", import.meta.url), {
     type: "module",
   });
-  workerGlobal.__parcelDbWorker = { worker, isOwned: false };
+  workerGlobal.__parcelDbWorker = worker;
   markNow(BOOT_WORKER_SPAWN);
   return worker;
 };
@@ -45,23 +48,26 @@ const canOpenOpfs =
   typeof navigator !== "undefined" &&
   typeof navigator.storage?.getDirectory === "function";
 
-if (canOpenOpfs && workerGlobal.__parcelDbWorker === undefined) {
-  spawnWorker();
-}
+// The eager spawn: the head start that lets the worker's wasm compile and OPFS
+// open overlap bundle eval and the first paint. The first layer build claims
+// it; any later build replaces it rather than racing it for the handles.
+const maybeEagerWorker =
+  canOpenOpfs && workerGlobal.__parcelDbWorker === undefined
+    ? replaceWorker()
+    : undefined;
 
 const ClientLive = SqliteClient.layer({
   worker: Effect.acquireRelease(
-    Effect.sync(() => {
-      const slot = workerGlobal.__parcelDbWorker;
-      const worker =
-        slot !== undefined && !slot.isOwned ? slot.worker : spawnWorker();
-      workerGlobal.__parcelDbWorker = { worker, isOwned: true };
-      return worker;
-    }),
+    Effect.sync(() =>
+      maybeEagerWorker !== undefined &&
+      workerGlobal.__parcelDbWorker === maybeEagerWorker
+        ? maybeEagerWorker
+        : replaceWorker(),
+    ),
     (worker) =>
       Effect.sync(() => {
         worker.terminate();
-        if (workerGlobal.__parcelDbWorker?.worker === worker) {
+        if (workerGlobal.__parcelDbWorker === worker) {
           delete workerGlobal.__parcelDbWorker;
         }
       }),
