@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>zen hillclimb</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <aside id="rail">
+      <header>
+        <input
+          id="search"
+          type="search"
+          placeholder="search subject or sender"
+        />
+        <span id="build" title="zen version and rule hash"></span>
+      </header>
+      <ol id="list"></ol>
+    </aside>
+
+    <main>
+      <section class="pane">
+        <h2>Before <small id="before-meta"></small></h2>
+        <iframe
+          id="before"
+          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+        ></iframe>
+      </section>
+
+      <section class="pane">
+        <h2>
+          After <small id="after-meta"></small>
+          <button id="toggle-source" type="button">source</button>
+        </h2>
+        <iframe
+          id="after"
+          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+        ></iframe>
+        <pre id="source" hidden></pre>
+      </section>
+    </main>
+
+    <footer>
+      <div id="verdicts">
+        <button type="button" data-verdict="good">good</button>
+        <button type="button" data-verdict="meh">meh</button>
+        <button type="button" data-verdict="bad">bad</button>
+      </div>
+      <textarea
+        id="note"
+        placeholder="what did the conversion lose? (⌘⏎ to save)"
+      ></textarea>
+      <button id="save" type="button">save</button>
+      <ol id="history"></ol>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

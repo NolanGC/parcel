@@ -7,6 +7,8 @@
     "backend",
     "frontend",
     "packages/desktop",
+    "packages/zen",
+    "packages/zen-hillclimb",
     "perf"
   ],
   "scripts": {
@@ -29,7 +31,9 @@
     "lint:fix": "oxlint --disable-nested-config --fix .",
     "test": "bun run --cwd frontend test",
     "test:integ": "INTEG=1 bun test test/integ.test.ts",
-    "sql": "bun perf/src/sql.ts"
+    "sql": "bun perf/src/sql.ts",
+    "zen:dash": "bun run --cwd packages/zen-hillclimb dash",
+    "zen:test": "bun run --cwd packages/zen test"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^4.20250805.0",

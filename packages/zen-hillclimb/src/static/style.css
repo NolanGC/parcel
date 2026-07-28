@@ -1,0 +1,246 @@
+/* Deliberately plain. The two panes are the instrument; anything decorative
+   here competes with the thing being judged. */
+
+:root {
+  color-scheme: light;
+  --line: #e2e5ea;
+  --muted: #6b7280;
+  --good: #10b981;
+  --meh: #f59e0b;
+  --bad: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  grid-template-rows: 1fr auto;
+  grid-template-areas: "rail main" "rail footer";
+  font:
+    13px/1.5 -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: #111827;
+  background: #fff;
+}
+
+#rail {
+  grid-area: rail;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#rail header {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#search {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+}
+
+#build {
+  color: var(--muted);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+#list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+#list li {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 8px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+
+#list li[aria-selected="true"] {
+  background: #eff6ff;
+}
+
+#list .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: transparent;
+}
+
+#list .dot.good {
+  background: var(--good);
+}
+#list .dot.meh {
+  background: var(--meh);
+}
+#list .dot.bad {
+  background: var(--bad);
+}
+/* A verdict left against rules that have since changed is history, not a
+   current judgement — hollow it out rather than hide it. */
+#list .dot.stale {
+  opacity: 0.35;
+}
+
+#list .subject {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#list .from {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+main {
+  grid-area: main;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 0;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--line);
+}
+
+.pane h2 {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.pane h2 small {
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.pane h2 button {
+  margin-left: auto;
+}
+
+iframe {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+#source {
+  flex: 1;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font:
+    12px/1.6 ui-monospace,
+    SFMono-Regular,
+    monospace;
+  background: #f9fafb;
+}
+
+footer {
+  grid-area: footer;
+  border-top: 1px solid var(--line);
+  padding: 8px 10px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto auto;
+  gap: 8px;
+  align-items: start;
+}
+
+#verdicts {
+  display: flex;
+  gap: 4px;
+}
+
+button {
+  font: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+#verdicts button[aria-pressed="true"] {
+  border-color: #111827;
+  background: #111827;
+  color: #fff;
+}
+
+#note {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  resize: vertical;
+  min-height: 34px;
+}
+
+#history {
+  grid-column: 1 / -1;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 84px;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+#history li {
+  padding: 2px 0;
+  border-top: 1px solid var(--line);
+}
+
+#history code {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+/* A fold that hides legal text should look different from one that hides a
+   reply: the reply is someone talking, the footer is nobody talking. */
+details.quote.footer summary::before,
+details.quote.placeholder summary::before {
+  content: "§";
+  letter-spacing: 0;
+}

@@ -6,6 +6,9 @@
     "frontend/scripts/**/*.ts",
     "frontend/vite.config.ts",
     "frontend/vitest.config.ts",
+    "packages/zen/src/**/*.ts",
+    "packages/zen/test/**/*.ts",
+    "packages/zen-hillclimb/src/**/*.ts",
     "perf/src/**/*.ts",
     "test/**/*.ts"
   ],

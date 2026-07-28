@@ -74,6 +74,25 @@
         "@tauri-apps/cli": "^2",
       },
     },
+    "packages/zen": {
+      "name": "@foldkit/zen",
+      "version": "0.1.0",
+      "dependencies": {
+        "effect": "4.0.0-beta.97",
+      },
+      "devDependencies": {
+        "happy-dom": "^20.10.6",
+      },
+    },
+    "packages/zen-hillclimb": {
+      "name": "@foldkit/zen-hillclimb",
+      "version": "0.0.0",
+      "dependencies": {
+        "@foldkit/zen": "workspace:*",
+        "effect": "4.0.0-beta.97",
+        "happy-dom": "^20.10.6",
+      },
+    },
     "perf": {
       "name": "@foldkit/perf",
       "version": "0.0.0",
@@ -288,6 +307,10 @@
     "@foldkit/ui": ["@foldkit/ui@0.131.0", "", { "dependencies": { "@floating-ui/dom": "^1.7.6" }, "peerDependencies": { "effect": "4.0.0-beta.97", "foldkit": "^0" } }, "sha512-zm09ywdY66AF8RFvXv6ovXN+9Vls3sA48YyNXxlOWRoPoTaaxBgBy8CFIv0PWAP3Zzc9fYq+UN4fa92U6qhx1w=="],
 
     "@foldkit/vite-plugin": ["@foldkit/vite-plugin@0.11.1", "", { "dependencies": { "magic-string": "^0.30.21", "ws": "^8.21.0" }, "peerDependencies": { "effect": "4.0.0-beta.101", "foldkit": "^0", "vite": "^7.0.0 || ^8.0.0" } }, "sha512-f1yrSgkYWFpotVmajkvEY+rlXIj7RGIUgD7Cw7+/6sIYIj964aVbh0Lxk7t3ybkuZbEyWeoF12B91nW7pmJNSQ=="],
+
+    "@foldkit/zen": ["@foldkit/zen@workspace:packages/zen"],
+
+    "@foldkit/zen-hillclimb": ["@foldkit/zen-hillclimb@workspace:packages/zen-hillclimb"],
 
     "@happy-dom/global-registrator": ["@happy-dom/global-registrator@20.10.6", "", { "dependencies": { "@types/node": ">=20.0.0", "happy-dom": "^20.10.6" } }, "sha512-Nu/IjRkkNxmeG2ywWsyJSO4d1BrWTqVzxCPL+gXj0b97klhmjd6wLzt6Bx/laNpkZ3WLW7zNCqmtMIbIlahqug=="],
 
