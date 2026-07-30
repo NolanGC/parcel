@@ -18,9 +18,12 @@ import { ts } from "foldkit/schema";
 import {
   Gmail,
   HistoryId,
+  INBOX_LABEL,
   LabelId,
   MessageId,
+  STARRED_LABEL,
   ThreadId,
+  UNREAD_LABEL,
   type GmailError,
   type History as GmailHistory,
   type ListHistoryResponse,
@@ -44,6 +47,8 @@ import {
   logBootReport,
   mark,
 } from "./bootMarks";
+import { base64UrlToBytes } from "./mime";
+import { OutboxEngine } from "./outboxEngine";
 import { cleanSnippet } from "./snippet";
 import { SqlLive } from "./sql";
 import { HOT_THREAD_COUNT, OPENED_LRU_COUNT } from "./tiers";
@@ -67,6 +72,7 @@ export const ThreadRow = S.Struct({
   snippet: S.String,
   date: S.Number,
   isUnread: S.Boolean,
+  isStarred: S.Boolean,
   category: ThreadCategory,
 });
 export type ThreadRow = typeof ThreadRow.Type;
@@ -81,6 +87,11 @@ export const MessageDetail = S.Struct({
   date: S.Number,
   bodyKind: BodyKind,
   body: S.String,
+  /** This message's own Message-ID header, and the chain it belongs to —
+   *  what a reply threads against in the recipient's client (mime.ts).
+   *  Empty for messages synced before the headers were extracted. */
+  rfc822MessageId: S.String,
+  references: S.String,
 });
 export type MessageDetail = typeof MessageDetail.Type;
 
@@ -95,7 +106,7 @@ export type ThreadDetail = typeof ThreadDetail.Type;
 // hence orDie at the call sites. Exported because search.ts selects the same
 // shape and must not drift from it.
 export const THREAD_ROW_COLUMNS =
-  "id, subject, snippet, participants, latest_date, is_unread, category";
+  "id, subject, snippet, participants, latest_date, is_unread, is_starred, category";
 
 const DbThreadRow = S.Struct({
   id: ThreadId,
@@ -104,6 +115,7 @@ const DbThreadRow = S.Struct({
   participants: S.String,
   latest_date: S.Number,
   is_unread: S.Number,
+  is_starred: S.Number,
   category: ThreadCategory,
 });
 const decodeDbRows = S.decodeUnknownEffect(S.Array(DbThreadRow));
@@ -130,6 +142,7 @@ export const decodeThreadRows = (
           snippet: cleanSnippet(row.snippet),
           date: row.latest_date,
           isUnread: row.is_unread !== 0,
+          isStarred: row.is_starred !== 0,
           category: row.category,
         }),
       ),
@@ -149,6 +162,8 @@ const DbMessageRow = S.Struct({
   internal_date: S.Number,
   from_name: S.String,
   from_email: S.String,
+  rfc822_message_id: S.String,
+  references_header: S.String,
 });
 const decodeDbMessages = S.decodeUnknownEffect(S.Array(DbMessageRow));
 
@@ -272,12 +287,6 @@ export const Overflowed = ts("Overflowed");
 export const HistoryResult = S.Union([Applied, Expired, Overflowed]);
 export type HistoryResult = typeof HistoryResult.Type;
 
-// NOTE: Gmail body payloads are BASE64URL (-/_ alphabet), not btoa's +/.
-const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> =>
-  Uint8Array.from(atob(data.replace(/-/g, "+").replace(/_/g, "/")), (char) =>
-    char.charCodeAt(0),
-  );
-
 const utf8 = new TextDecoder();
 
 // MIME TREE WALKING
@@ -348,8 +357,15 @@ const parseFrom = (from: string): Readonly<{ name: string; email: string }> => {
   return { name: name === "" ? email : name, email };
 };
 
-const UNREAD_LABEL = "UNREAD";
 const CATEGORY_PREFIX = "CATEGORY_";
+
+// A thread carries a flag if any of its messages does — which is how Gmail
+// itself presents an unread or starred conversation in a list.
+const hasLabel = (
+  messages: ReadonlyArray<GmailMessage>,
+  label: LabelId,
+): boolean =>
+  messages.some((message) => message.labelIds?.some((id) => id === label));
 
 const decodeThreadCategory = S.decodeUnknownOption(ThreadCategory);
 
@@ -430,7 +446,6 @@ const foldHistoryPage = (
 
 // SERVICE
 
-const INBOX = LabelId.make("INBOX");
 // The prime page: enough to fill the first screen.
 const PULL_LIMIT = 15;
 // NOTE: threads.list costs 10 quota units whatever the page size, so small
@@ -470,6 +485,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       const sql = yield* SqlClient.SqlClient;
       const compression = yield* Compression;
       const imageFetcher = yield* ImageFetcher;
+      const outbox = yield* OutboxEngine;
       yield* mark(BOOT_ENGINE_READY);
 
       // The list columns all come off the newest message in the thread, so
@@ -497,18 +513,11 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             participants: JSON.stringify(latest.participants),
             latest_date: latestDate(messages),
             message_count: messages.length,
-            is_unread: messages.some((message) =>
-              message.labelIds?.some((id) => id === UNREAD_LABEL),
-            )
-              ? 1
-              : 0,
+            is_unread: hasLabel(messages, UNREAD_LABEL) ? 1 : 0,
+            is_starred: hasLabel(messages, STARRED_LABEL) ? 1 : 0,
             // Archiving is just the removal of this label, so re-reading it
             // on every sync is what lets a thread leave the local inbox.
-            in_inbox: messages.some((message) =>
-              message.labelIds?.some((id) => id === INBOX),
-            )
-              ? 1
-              : 0,
+            in_inbox: hasLabel(messages, INBOX_LABEL) ? 1 : 0,
             category: threadCategory(messages),
           },
         ])}`;
@@ -526,6 +535,10 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             to_json: JSON.stringify(headerValue(message, "to") ?? ""),
             subject: headerValue(message, "subject") ?? "",
             snippet: message.snippet ?? "",
+            // Kept verbatim, angle brackets included: a reply puts these
+            // straight back on the wire.
+            rfc822_message_id: headerValue(message, "message-id") ?? "",
+            references_header: headerValue(message, "references") ?? "",
             has_attachments: (message.payload?.parts ?? []).some(
               (part) => (part.filename ?? "") !== "",
             )
@@ -653,15 +666,24 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             ).pipe(
               Effect.flatMap((fetched) =>
                 sql.withTransaction(
-                  Effect.forEach(
-                    fetched,
-                    ({ id, maybeFetched }) =>
-                      Option.match(maybeFetched, {
-                        onNone: () => deleteThreadLocal(id),
-                        onSome: persistThread,
-                      }),
-                    { discard: true },
-                  ),
+                  Effect.gen(function* () {
+                    yield* Effect.forEach(
+                      fetched,
+                      ({ id, maybeFetched }) =>
+                        Option.match(maybeFetched, {
+                          onNone: () => deleteThreadLocal(id),
+                          onSome: persistThread,
+                        }),
+                      { discard: true },
+                    );
+                    // NOTE: What was just written is the mailbox as Gmail
+                    // currently sees it — a mailbox where the queued ops have
+                    // not happened. Without re-applying them in the same
+                    // transaction, archiving a thread and then catching up
+                    // puts it back in the list until the op drains, and the
+                    // optimistic update reads as a bug.
+                    yield* outbox.reapplyPendingLabelOps;
+                  }),
                 ),
               ),
             ),
@@ -774,7 +796,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           // and a mailbox resuming mid-backfill never re-primes, so it would
           // keep whatever number the last prime wrote. Refreshed once per boot,
           // best-effort: a progress denominator is not worth failing a boot over.
-          const totalEstimate = yield* gmail.getLabel(INBOX).pipe(
+          const totalEstimate = yield* gmail.getLabel(INBOX_LABEL).pipe(
             Effect.map((label) => label.threadsTotal ?? row.total_estimate),
             Effect.catchCause(() => Effect.succeed(row.total_estimate)),
           );
@@ -803,10 +825,10 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           // to be the INBOX label's own count. profile.threadsTotal counts the
           // entire mailbox, which reads as a bar that stalls at a few percent
           // and then declares itself done.
-          const inboxLabel = yield* gmail.getLabel(INBOX);
+          const inboxLabel = yield* gmail.getLabel(INBOX_LABEL);
           const totalEstimate = inboxLabel.threadsTotal ?? profile.threadsTotal;
           const page = yield* gmail.listThreads({
-            labelIds: [INBOX],
+            labelIds: [INBOX_LABEL],
             maxResults: PULL_LIMIT,
           });
           yield* syncThreads(yield* unseenThreadIds(page.threads ?? []));
@@ -846,7 +868,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       ): Effect.Effect<BatchResult, GmailError | SqlError> =>
         Effect.gen(function* () {
           const page = yield* gmail.listThreads({
-            labelIds: [INBOX],
+            labelIds: [INBOX_LABEL],
             maxResults: LIST_PAGE_SIZE,
             ...Option.match(maybePageToken, {
               onNone: () => ({}),
@@ -1225,7 +1247,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const subject = firstRowOr(subjects, (row) => row.subject, "");
 
           const rowsRaw = yield* sql`
-            SELECT id, internal_date, from_name, from_email
+            SELECT id, internal_date, from_name, from_email,
+                   rfc822_message_id, references_header
             FROM messages
             WHERE thread_id = ${id}
             ORDER BY internal_date ASC
@@ -1303,6 +1326,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                     mime_type === "text/html" ? "html" : "plain",
                 }),
                 body: rewriteImageUrls(inlined, new Map(remoteBlobs)),
+                rfc822MessageId: row.rfc822_message_id,
+                references: row.references_header,
               } satisfies MessageDetail;
             }),
           );
@@ -1340,6 +1365,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         SqlLive,
         Compression.layer,
         ImageFetcher.layer,
+        OutboxEngine.layer,
       ),
     ),
   );

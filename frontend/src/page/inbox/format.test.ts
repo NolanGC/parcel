@@ -155,6 +155,7 @@ describe("reconcileRows", () => {
     snippet: `Snippet ${id}`,
     date: 1_700_000_000_000,
     isUnread: false,
+    isStarred: false,
     category: "personal",
     ...fields,
   });

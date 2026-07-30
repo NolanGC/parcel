@@ -99,11 +99,20 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
           // the chooser on shared machines. Tokens land on the `account` row.
           accessType: "offline" as const,
           prompt: "select_account consent" as const,
-          // Sign-in doubles as the Gmail grant. Read-only for now; wider
-          // scopes (send, modify) can be requested later per user via
-          // `linkSocial({ provider: "google", scopes: [...] })` without
-          // re-onboarding everyone.
-          scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+          // Sign-in doubles as the Gmail grant, reads and writes both. The
+          // outbox (frontend/src/outboxEngine.ts) needs `modify` for label
+          // edits (archive, read, star) and `send` for compose and replies.
+          // NOTE: Granted at sign-in rather than incrementally via
+          // `linkSocial`, so there is one consent screen rather than a second
+          // one the first time you archive something. Sessions predating this
+          // still hold a read-only token: their writes fail with
+          // GmailScopeError, which parks the outbox machine in NeedsAuth and
+          // renders the reconnect pill — signing in again re-consents.
+          scope: [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
+          ],
         },
       }),
     }),

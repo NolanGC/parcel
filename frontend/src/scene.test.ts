@@ -192,6 +192,7 @@ describe("the inbox", () => {
     snippet: "hello",
     date: 1,
     isUnread: false,
+    isStarred: false,
     category: "none" as const,
   };
 
@@ -206,6 +207,8 @@ describe("the inbox", () => {
         date: 1,
         bodyKind: "plain" as const,
         body: "hello there",
+        rfc822MessageId: "",
+        references: "",
       },
     ],
   };

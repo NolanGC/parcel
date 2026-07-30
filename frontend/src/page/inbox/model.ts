@@ -5,10 +5,13 @@ import { Array as Arr, Option, Schema as S } from "effect";
 import { AsyncData } from "foldkit";
 import { m } from "foldkit/message";
 import { ts } from "foldkit/schema";
+import { evo } from "foldkit/struct";
 
 import * as Icon from "../../icons";
 import { HOT_THREAD_COUNT } from "../../tiers";
 import { THREADS_PER_SECOND, ThreadId } from "../../Gmail";
+import * as OutboxMachine from "../../outboxMachine";
+import { ThreadPatch } from "../../outboxOps";
 import { ThreadDetail, ThreadRow, type ThreadCategory } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
@@ -61,6 +64,7 @@ const isSameRow = (left: ThreadRow, right: ThreadRow): boolean =>
   left.snippet === right.snippet &&
   left.date === right.date &&
   left.isUnread === right.isUnread &&
+  left.isStarred === right.isStarred &&
   left.category === right.category;
 
 // NOTE: The common case by a wide margin is that a refresh changed nothing,
@@ -78,6 +82,39 @@ const isAlignedWith = (
     const incoming = next[index];
     return incoming !== undefined && isSameRow(row, incoming);
   });
+};
+
+/**
+ * One thread's row, changed in place.
+ *
+ * The optimistic path for a flag action: the local write has already
+ * happened (outboxEngine.enqueue), and this is the list catching up to it.
+ * Re-reading the store instead would re-decode every row to change one of
+ * them, and hand every memoized row subtree a new object on the way past.
+ *
+ * NOTE: A thread the list doesn't hold returns the same array — patching a
+ * row that isn't on screen must not cost the list its identity.
+ */
+export const patchRow = (
+  rows: ReadonlyArray<ThreadRow>,
+  patch: ThreadPatch,
+): ReadonlyArray<ThreadRow> => {
+  const isPatched = (row: ThreadRow): boolean => row.id === patch.threadId;
+  if (!rows.some(isPatched)) {
+    return rows;
+  }
+  if (patch.isRemoved) {
+    return rows.filter((row) => !isPatched(row));
+  }
+  // Every other row keeps its object, so every other memo slot keeps its hit.
+  return rows.map((row) =>
+    isPatched(row)
+      ? evo(row, {
+          isUnread: (was) => Option.getOrElse(patch.maybeIsUnread, () => was),
+          isStarred: (was) => Option.getOrElse(patch.maybeIsStarred, () => was),
+        })
+      : row,
+  );
 };
 
 export const reconcileRows = (
@@ -265,6 +302,53 @@ export const InboxPalette = Ui.Palette.create<ThreadId>();
 
 export const ThreadsData = AsyncData.Schema(S.Array(ThreadRow), S.String);
 
+// COMPOSE
+
+/** What makes a compose a reply rather than a new message: the thread it
+ *  joins in our mailbox, and the headers that join it in the recipient's. */
+export const ReplyContext = S.Struct({
+  threadId: ThreadId,
+  inReplyTo: S.String,
+  references: S.String,
+});
+export type ReplyContext = typeof ReplyContext.Type;
+
+export const ComposeField = S.Literals(["to", "subject", "body"]);
+export type ComposeField = typeof ComposeField.Type;
+
+export const composeFieldId = (field: ComposeField): string =>
+  `inbox-compose-${field}`;
+
+/** Where focus goes when the panel opens. */
+export const COMPOSE_FIRST_FIELD_ID = composeFieldId("to");
+
+export const ComposeClosed = ts("ComposeClosed");
+/** NOTE: The body is markdown, and `isPreviewing` swaps the textarea for the
+ *  rendered result — the same render that is sent (markdown.ts), so the
+ *  preview cannot drift from the message. */
+export const ComposeEditing = ts("ComposeEditing", {
+  to: S.String,
+  subject: S.String,
+  body: S.String,
+  isPreviewing: S.Boolean,
+  maybeReply: S.Option(ReplyContext),
+});
+export const Compose = S.Union([ComposeClosed, ComposeEditing]);
+export type Compose = typeof Compose.Type;
+
+/** Addresses as typed, one per comma. Empty entries are dropped rather than
+ *  sent as blanks, so a trailing comma is not an error. */
+export const parseRecipients = (text: string): ReadonlyArray<string> =>
+  text
+    .split(",")
+    .map((address) => address.trim())
+    .filter((address) => address !== "");
+
+/** A compose worth sending: somewhere to send it, and something to say. */
+export const isSendable = (compose: typeof ComposeEditing.Type): boolean =>
+  Arr.isReadonlyArrayNonEmpty(parseRecipients(compose.to)) &&
+  compose.body.trim() !== "";
+
 export const ShowingList = ts("ShowingList", {
   maybeError: S.Option(S.String),
 });
@@ -282,6 +366,16 @@ export const Model = S.Struct({
   accountPopover: Ui.Popover.Model,
   threads: ThreadsData.schema,
   sync: SyncMachine.State,
+  /** The drain's state, which is also the queue badge: every state carries
+   *  the pending and failed counts. */
+  outbox: OutboxMachine.State,
+  compose: Compose,
+  /** Threads with a reply still in the queue, for the "Sending…" chip. The
+   *  sent copy itself arrives through the sync like any other message. */
+  sendingThreads: S.Array(ThreadId),
+  /** The last permanent outbox failure, shown once rather than latched into
+   *  the row it concerned. */
+  maybeOutboxError: S.Option(S.String),
   screen: Screen,
   /** The single list cursor: mouse hover and j/k both move it. */
   maybeSelected: S.Option(S.Number),
@@ -324,6 +418,10 @@ export const init = (
     onSome: (rows) => AsyncData.Refreshing({ data: rows }),
   }),
   sync: SyncMachine.init(),
+  outbox: OutboxMachine.init(),
+  compose: ComposeClosed(),
+  sendingThreads: [],
+  maybeOutboxError: Option.none(),
   screen: ShowingList({ maybeError: Option.none() }),
   maybeSelected: Option.none(),
   hoverSession: 0,
@@ -427,6 +525,43 @@ export const FailedLoadThread = m("FailedLoadThread", { error: S.String });
 export const ClickedBack = m("ClickedBack");
 export const CompletedScrollListToRow = m("CompletedScrollListToRow");
 
+// OUTGOING
+//
+// The three flag actions name the thread by id, never by position, for the
+// same reason ClickedRow does: a refresh between paint and click shifts
+// every index, and starring the wrong thread is worse than doing nothing.
+
+export const ClickedStarRow = m("ClickedStarRow", { id: ThreadId });
+export const ClickedArchiveRow = m("ClickedArchiveRow", { id: ThreadId });
+export const ClickedToggleReadRow = m("ClickedToggleReadRow", {
+  id: ThreadId,
+});
+export const ClickedCompose = m("ClickedCompose");
+/** Reply to the open thread, prefilled from its newest message. */
+export const ClickedReply = m("ClickedReply");
+export const EditedCompose = m("EditedCompose", {
+  field: ComposeField,
+  value: S.String,
+});
+export const ToggledComposePreview = m("ToggledComposePreview");
+export const CompletedFocusComposeField = m("CompletedFocusComposeField");
+export const ClickedSend = m("ClickedSend");
+export const ClosedCompose = m("ClosedCompose");
+/** The op is durably queued and the local store already reflects it.
+ *  `maybePatch` is the one row the list has to catch up on. */
+export const SucceededEnqueueOp = m("SucceededEnqueueOp", {
+  maybePatch: S.Option(ThreadPatch),
+  maybeSendingThreadId: S.Option(ThreadId),
+});
+/** The queue write itself failed, so *nothing* happened — no local change to
+ *  roll back, and the action can simply be repeated. */
+export const FailedEnqueueOp = m("FailedEnqueueOp", { error: S.String });
+export const GotOutboxMessage = m("GotOutboxMessage", {
+  message: OutboxMachine.Message,
+});
+/** Dismisses the outbox error line. */
+export const ClosedOutboxError = m("ClosedOutboxError");
+
 export const Message = S.Union([
   GotFolderMenuMessage,
   CompletedApplyAppearance,
@@ -457,5 +592,19 @@ export const Message = S.Union([
   FailedLoadThread,
   ClickedBack,
   CompletedScrollListToRow,
+  ClickedStarRow,
+  ClickedArchiveRow,
+  ClickedToggleReadRow,
+  ClickedCompose,
+  ClickedReply,
+  EditedCompose,
+  ToggledComposePreview,
+  CompletedFocusComposeField,
+  ClickedSend,
+  ClosedCompose,
+  SucceededEnqueueOp,
+  FailedEnqueueOp,
+  GotOutboxMessage,
+  ClosedOutboxError,
 ]);
 export type Message = typeof Message.Type;

@@ -271,6 +271,31 @@ export const SqlLive = SqliteMigrator.layer({
         ON threads (images_cached_at, latest_date DESC)
       `;
     }),
+
+    // Outgoing actions. Three separate needs, one migration because they
+    // arrive with the same feature (see outboxEngine.ts):
+    //
+    //  - is_starred: the one flag the list can show that wasn't extracted
+    //    yet. Defaults to 0 and is recomputed from the STARRED label as
+    //    threads re-sync, exactly like is_unread.
+    //  - The reply headers: RFC 2822 threading is In-Reply-To/References,
+    //    which have to come from the message being replied to. Rows written
+    //    before this migration carry '', and a reply to one threads on
+    //    Gmail's threadId alone until that thread next re-syncs.
+    //  - outbox status/last_error: a permanently failed send is kept rather
+    //    than dropped, so the composed body survives for a retry. Label ops
+    //    never reach 'failed' — they roll back and delete themselves.
+    "0007_outgoing_actions": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE threads ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE messages ADD COLUMN rfc822_message_id TEXT NOT NULL DEFAULT ''`;
+      yield* sql`ALTER TABLE messages ADD COLUMN references_header TEXT NOT NULL DEFAULT ''`;
+      yield* sql`ALTER TABLE outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`;
+      yield* sql`ALTER TABLE outbox ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`;
+      // The drain's queue query — oldest pending op first — and the anti-clobber
+      // read in syncThreads, which scans every pending op on each chunk commit.
+      yield* sql`CREATE INDEX outbox_pending ON outbox (status, id)`;
+    }),
     // `satisfies` only pins the key format; the migrator infers the values.
   } satisfies Record<`${number}_${string}`, unknown>),
 }).pipe(Layer.provideMerge(ClientLive));

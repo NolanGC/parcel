@@ -6,6 +6,8 @@ import { createKeyedLazy, createLazy, html, type Html } from "foldkit/html";
 
 import * as Icon from "../../icons";
 import { ThreadId } from "../../Gmail";
+import { renderMarkdownToEmailHtml } from "../../markdown";
+import * as OutboxMachine from "../../outboxMachine";
 import { ThreadDetail, ThreadRow, type MessageDetail } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
@@ -19,9 +21,21 @@ import {
   CATEGORY_FROM_THREAD,
   type Category,
   ClickedAppearance,
+  ClickedArchiveRow,
   ClickedBack,
+  ClickedCompose,
+  ClickedReply,
   ClickedRow,
+  ClickedSend,
+  ClickedStarRow,
+  ClickedToggleReadRow,
   ClickedAccountSignOut,
+  ClosedCompose,
+  ClosedOutboxError,
+  ComposeEditing,
+  type ComposeField,
+  composeFieldId,
+  EditedCompose,
   EnteredList,
   ExitedList,
   FOLDERS,
@@ -30,11 +44,13 @@ import {
   GotAccountPopoverMessage,
   GotFolderMenuMessage,
   GotListMessage,
+  GotOutboxMessage,
   GotPaletteMessage,
   GotSyncMessage,
   GotTabsMessage,
   HoveredRow,
   InboxPalette,
+  isSendable,
   LIST_ID,
   LIST_OVERSCAN,
   DETAIL_PANE_ID,
@@ -43,6 +59,7 @@ import {
   PAGE_SURFACE,
   ROW_HEIGHT,
   TAB_LABELS,
+  ToggledComposePreview,
   ToggledPalette,
   formatBytes,
   formatProgress,
@@ -407,11 +424,55 @@ const syncPillView = (
   );
 };
 
-// NOTE: Split into three memoized pieces along the lines its inputs change
-// on. The pill ticks several times a second during a backfill; as one subtree
+// The outbound counterpart of the sync pill: what is still waiting to go out.
+// Absent entirely when the queue is empty, which is almost always — a badge
+// that reads "0 queued" is noise on every screen to spare one on a few.
+//
+// A failed send is the one state that is a control: its body was kept
+// precisely so the click has something to retry.
+const outboxPillView = (outbox: OutboxMachine.State): Html => {
+  const h = html<Message>();
+  const { pendingCount, failedCount } = outbox.summary;
+
+  if (failedCount > 0) {
+    const label =
+      failedCount === 1
+        ? "1 message failed to send"
+        : `${failedCount} messages failed to send`;
+    return h.button(
+      [
+        h.Type("button"),
+        h.OnClick(
+          GotOutboxMessage({ message: OutboxMachine.ClickedRetryFailed() }),
+        ),
+        h.AriaLabel(`${label}. Retry.`),
+        h.Class(
+          `${PILL_CLASS} cursor-pointer outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+        ),
+      ],
+      [Ui.badgeDot({ color: "red" }), h.span([], [`${label} · Retry`])],
+    );
+  }
+
+  if (pendingCount === 0) {
+    return h.empty;
+  }
+
+  return h.div(
+    [h.Class(PILL_CLASS), h.Role("status"), h.AriaLive("polite")],
+    [
+      Icon.send("h-3.5 w-3.5"),
+      h.span([], [pendingCount === 1 ? "1 queued" : `${pendingCount} queued`]),
+    ],
+  );
+};
+
+// NOTE: Split into memoized pieces along the lines its inputs change on. The
+// sync pill ticks several times a second during a backfill; as one subtree
 // every tick rebuilt four submodels to change two digits.
 const lazyFolderCluster = createLazy();
 const lazySyncPill = createLazy();
+const lazyOutboxPill = createLazy();
 const lazyAccountCluster = createLazy();
 
 const folderClusterView = (
@@ -508,9 +569,15 @@ const accountClusterView = (
         { variant: "ghost", size: "icon-sm", ariaLabel: "Notifications" },
         [Icon.bell("h-[18px] w-[18px]")],
       ),
-      Ui.button({ variant: "tertiary", size: "icon", ariaLabel: "Compose" }, [
-        Icon.squarePen("h-[18px] w-[18px]"),
-      ]),
+      Ui.button(
+        {
+          variant: "tertiary",
+          size: "icon",
+          ariaLabel: "Compose",
+          onClick: ClickedCompose(),
+        },
+        [Icon.squarePen("h-[18px] w-[18px]")],
+      ),
     ],
   );
 };
@@ -524,6 +591,7 @@ const toolbarView = (model: Model, profile: Profile): Html => {
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
+          lazyOutboxPill(outboxPillView, [model.outbox]),
           lazySyncPill(syncPillView, [
             model.sync,
             model.maybeLocalBytes,
@@ -578,49 +646,63 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
 
   return h.div(
     [
-      h.OnClick(ClickedRow({ id: row.id, index })),
       h.OnMouseEnter(HoveredRow({ index })),
       h.Class(
         // overflow-hidden so a row can never widen the list: the sender and
         // meta clusters are shrink-0, so without it their combined
         // min-content width becomes the row's, and the container scrolls
         // sideways instead of the snippet truncating.
-        "flex h-full cursor-pointer items-center gap-4 overflow-hidden border-b border-border px-4",
+        //
+        // `group` is what lets the actions in the meta cluster reveal on
+        // hover without any of it reaching the Model.
+        "group flex h-full items-center gap-4 overflow-hidden border-b border-border px-4",
       ),
     ],
     [
-      // Sender
+      // The opening region. NOTE: The click handler is here rather than on
+      // the row, so that the action buttons in the meta cluster are not also
+      // "open this thread" — foldkit's OnClick has no stopPropagation, so a
+      // button nested under a clickable row would do both.
       h.div(
-        [h.Class("flex w-56 shrink-0 items-center gap-3 md:w-64")],
         [
-          senderTile((row.sender.slice(0, 1) || "?").toUpperCase()),
-          // min-w-0: a flex item defaults to min-width:auto, which refuses to
-          // shrink below its text, so `truncate` alone never fires and a long
-          // sender pushes past the fixed w-56.
-          h.span(
-            [h.Class(`min-w-0 truncate font-semibold ${tone}`)],
-            [row.sender],
-          ),
+          h.OnClick(ClickedRow({ id: row.id, index })),
+          h.Class("flex min-w-0 flex-1 cursor-pointer items-center gap-4"),
         ],
-      ),
-
-      // Subject + preview
-      h.div(
-        [h.Class("flex min-w-0 flex-1 items-center gap-2")],
         [
-          // The dot's slot is always reserved so the subject column lines up
-          // across read and unread rows; only the dot itself hides.
-          row.isUnread
-            ? Ui.badgeDot({ color: "indigo", ariaLabel: "Unread" })
-            : h.span([h.Class("invisible h-[7px] w-[7px] shrink-0")], []),
-          // The truncation ellipsis draws in the truncating element's color;
-          // muted here matches the preview text it's eliding.
-          h.span(
-            [h.Class("min-w-0 truncate text-muted-foreground")],
+          // Sender
+          h.div(
+            [h.Class("flex w-56 shrink-0 items-center gap-3 md:w-64")],
             [
-              h.span([h.Class(`font-semibold ${tone}`)], [row.subject]),
-              h.span([h.Class("mx-2 text-muted-foreground/50")], ["—"]),
-              h.span([], [row.snippet]),
+              senderTile((row.sender.slice(0, 1) || "?").toUpperCase()),
+              // min-w-0: a flex item defaults to min-width:auto, which refuses
+              // to shrink below its text, so `truncate` alone never fires and
+              // a long sender pushes past the fixed w-56.
+              h.span(
+                [h.Class(`min-w-0 truncate font-semibold ${tone}`)],
+                [row.sender],
+              ),
+            ],
+          ),
+
+          // Subject + preview
+          h.div(
+            [h.Class("flex min-w-0 flex-1 items-center gap-2")],
+            [
+              // The dot's slot is always reserved so the subject column lines
+              // up across read and unread rows; only the dot itself hides.
+              row.isUnread
+                ? Ui.badgeDot({ color: "indigo", ariaLabel: "Unread" })
+                : h.span([h.Class("invisible h-[7px] w-[7px] shrink-0")], []),
+              // The truncation ellipsis draws in the truncating element's
+              // color; muted here matches the preview text it's eliding.
+              h.span(
+                [h.Class("min-w-0 truncate text-muted-foreground")],
+                [
+                  h.span([h.Class(`font-semibold ${tone}`)], [row.subject]),
+                  h.span([h.Class("mx-2 text-muted-foreground/50")], ["—"]),
+                  h.span([], [row.snippet]),
+                ],
+              ),
             ],
           ),
         ],
@@ -631,6 +713,11 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
         [h.Class("flex shrink-0 items-center gap-3")],
         [
           categoryTagView(CATEGORY_FROM_THREAD[row.category]),
+          // The star reads at a glance without hovering, which is the whole
+          // point of a star; the button that sets it is in the actions.
+          ...(row.isStarred
+            ? [Icon.star("h-4 w-4 shrink-0 fill-amber-400 text-amber-400", "2")]
+            : []),
           h.span(
             [
               h.Class(
@@ -639,6 +726,7 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
             ],
             [formatTime(row.date)],
           ),
+          rowActionsView(row),
         ],
       ),
     ],
@@ -684,6 +772,67 @@ const statusRowView = (text: string): Html => {
 // @starting-style fade-in) instead of sliding from a stale row; leaving keeps
 // it mounted and fades it out in place (data-hidden), unless the keyboard
 // holds it.
+// One icon action. Shared by the list rows and the open thread's header, so
+// starring from either place looks and reads the same.
+const rowActionView = (
+  label: string,
+  icon: Ui.IconView,
+  iconClass: string,
+  message: Message,
+): Html => {
+  const h = html<Message>();
+  return h.button(
+    [
+      h.Type("button"),
+      h.AriaLabel(label),
+      h.Title(label),
+      h.OnClick(message),
+      h.Class(
+        `flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+      ),
+    ],
+    [icon(`h-4 w-4 ${iconClass}`)],
+  );
+};
+
+// The row's own actions, revealed by hover or by focus.
+//
+// NOTE: In the row rather than in the traveling overlay, because the overlay
+// reaches the VirtualList through `viewInputs` and foldkit rejects interactive
+// Html there (it walks viewInputs and throws on nested functions). The cost is
+// bounded anyway: the list only ever mounts its visible window, so this is
+// three buttons per visible row, not per thread.
+const rowActionsView = (row: ThreadRow): Html => {
+  const h = html<Message>();
+  return h.div(
+    [
+      h.Class(
+        `flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 ${Ui.hoverTransition}`,
+      ),
+    ],
+    [
+      rowActionView(
+        row.isStarred ? "Unstar" : "Star",
+        Icon.star,
+        row.isStarred ? "fill-amber-400 text-amber-400" : "",
+        ClickedStarRow({ id: row.id }),
+      ),
+      rowActionView(
+        row.isUnread ? "Mark as read" : "Mark as unread",
+        row.isUnread ? Icon.mailOpen : Icon.mail,
+        "",
+        ClickedToggleReadRow({ id: row.id }),
+      ),
+      rowActionView(
+        "Archive",
+        Icon.archive,
+        "",
+        ClickedArchiveRow({ id: row.id }),
+      ),
+    ],
+  );
+};
+
 const listOverlayView = (
   maybeSelected: Option.Option<number>,
   hoverSession: number,
@@ -932,7 +1081,14 @@ const messageCardView = (message: MessageDetail): Html => {
 // the whole body string every time it runs.
 const lazyThreadDetail = createKeyedLazy();
 
-const threadDetailView = (detail: ThreadDetail): Html => {
+const SENDING_CHIP_CLASS =
+  "flex shrink-0 items-center gap-1.5 rounded-lg bg-hover px-2 py-1 text-[12px] text-muted-foreground";
+
+const threadDetailView = (
+  detail: ThreadDetail,
+  isStarred: boolean,
+  isSending: boolean,
+): Html => {
   const h = html<Message>();
   return h.div(
     [h.Class("flex min-h-0 flex-1 flex-col")],
@@ -959,6 +1115,38 @@ const threadDetailView = (detail: ThreadDetail): Html => {
             ],
             [detail.subject === "" ? "(no subject)" : detail.subject],
           ),
+          // A reply is queued, not in flight — it will go out whether or not
+          // this thread stays open, so the chip says "queued to send" rather
+          // than pretending to be a progress indicator.
+          ...(isSending
+            ? [
+                h.span(
+                  [h.Class(SENDING_CHIP_CLASS), h.Role("status")],
+                  [Icon.send("h-3.5 w-3.5"), "Sending…"],
+                ),
+              ]
+            : []),
+          h.div(
+            [h.Class("flex shrink-0 items-center gap-1")],
+            [
+              rowActionView(
+                isStarred ? "Unstar" : "Star",
+                Icon.star,
+                isStarred ? "fill-amber-400 text-amber-400" : "",
+                ClickedStarRow({ id: detail.id }),
+              ),
+              rowActionView(
+                "Archive",
+                Icon.archive,
+                "",
+                ClickedArchiveRow({ id: detail.id }),
+              ),
+              Ui.button(
+                { variant: "tertiary", size: "sm", onClick: ClickedReply() },
+                [Icon.reply("h-4 w-4"), "Reply"],
+              ),
+            ],
+          ),
         ],
       ),
       h.div(
@@ -969,6 +1157,159 @@ const threadDetailView = (detail: ThreadDetail): Html => {
   );
 };
 
+// COMPOSE
+//
+// Bodies are markdown. The Write/Preview toggle renders through the exact
+// function that produces the sent HTML (markdown.ts), so the preview cannot
+// promise something the message does not deliver.
+
+// NOTE: outline-none is replaced by an explicit focus ring rather than left
+// bare. The palette's input can drop the outline because its dialog traps
+// focus and it is the only focusable thing on screen; this panel has five
+// focusable controls and no trap, so without this a keyboard user tabbing
+// through it sees only the caret move.
+const FIELD_CLASS =
+  "w-full rounded-md bg-transparent px-1 py-0.5 text-[14px] text-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-1 focus-visible:ring-focus-ring";
+
+const composeFieldView = (
+  label: string,
+  field: ComposeField,
+  value: string,
+  placeholder: string,
+): Html => {
+  const h = html<Message>();
+  return h.div(
+    [h.Class("flex items-center gap-3 border-b border-border px-4 py-2.5")],
+    [
+      h.label(
+        [
+          h.For(composeFieldId(field)),
+          h.Class("w-16 shrink-0 text-[12px] text-muted-foreground"),
+        ],
+        [label],
+      ),
+      // NOTE: A raw input rather than a Ui component: this app's local
+      // FoldkitUI port (ui/index.ts) has no Input yet. The a11y surface an
+      // Input would provide is written out here instead — a real label bound
+      // by For/Id, and a focus ring in FIELD_CLASS.
+      h.input([
+        h.Id(composeFieldId(field)),
+        h.Type("text"),
+        h.Value(value),
+        h.Placeholder(placeholder),
+        h.Autocomplete("off"),
+        h.Class(FIELD_CLASS),
+        h.OnInput((value) => EditedCompose({ field, value })),
+      ]),
+    ],
+  );
+};
+
+const composeBodyView = (compose: typeof ComposeEditing.Type): Html => {
+  const h = html<Message>();
+
+  if (compose.isPreviewing) {
+    // The same sandbox the thread view uses: this is email HTML, and it is
+    // rendered under the same rules whether we wrote it or received it.
+    return h.iframe(
+      [
+        h.Sandbox("allow-same-origin"),
+        h.Srcdoc(srcdocFor(renderMarkdownToEmailHtml(compose.body))),
+        h.Class("min-h-0 w-full flex-1 rounded-lg bg-white"),
+        h.Style({ border: "0" }),
+      ],
+      [],
+    );
+  }
+
+  return h.textarea(
+    [
+      h.Id(composeFieldId("body")),
+      h.Value(compose.body),
+      h.Placeholder("Write your message… **markdown** works."),
+      h.AriaLabel("Message body"),
+      h.Class(`min-h-0 flex-1 resize-none leading-relaxed ${FIELD_CLASS}`),
+      h.OnInput((value) => EditedCompose({ field: "body", value })),
+    ],
+    [],
+  );
+};
+
+const composePanelView = (compose: typeof ComposeEditing.Type): Html => {
+  const h = html<Message>();
+  const isReply = Option.isSome(compose.maybeReply);
+
+  return h.div(
+    [
+      h.Class(
+        `absolute inset-0 z-20 flex min-h-0 flex-col rounded-xl border border-border ${Ui.surface(
+          Ui.elevate(PAGE_SURFACE, 2),
+          2,
+        )}`,
+      ),
+      h.Role("dialog"),
+      h.AriaModal(true),
+      h.AriaLabel(isReply ? "Reply" : "New message"),
+    ],
+    [
+      h.div(
+        [
+          h.Class(
+            "flex items-center justify-between gap-3 border-b border-border px-4 py-2.5",
+          ),
+        ],
+        [
+          h.span(
+            [h.Class("text-[13px] font-semibold text-foreground")],
+            [isReply ? "Reply" : "New message"],
+          ),
+          h.div(
+            [h.Class("flex items-center gap-1")],
+            [
+              rowActionView(
+                compose.isPreviewing ? "Write" : "Preview",
+                compose.isPreviewing ? Icon.squarePen : Icon.eye,
+                "",
+                ToggledComposePreview(),
+              ),
+              rowActionView("Discard", Icon.x, "", ClosedCompose()),
+            ],
+          ),
+        ],
+      ),
+      composeFieldView("To", "to", compose.to, "name@example.com"),
+      composeFieldView("Subject", "subject", compose.subject, "Subject"),
+      h.div(
+        [h.Class("flex min-h-0 flex-1 flex-col px-4 py-3")],
+        [composeBodyView(compose)],
+      ),
+      h.div(
+        [
+          h.Class(
+            "flex items-center justify-between gap-3 border-t border-border px-4 py-2.5",
+          ),
+        ],
+        [
+          h.span(
+            [h.Class("text-[12px] text-muted-foreground")],
+            ["Queued locally, sent when Gmail is reachable."],
+          ),
+          Ui.button(
+            {
+              variant: "primary",
+              size: "md",
+              onClick: ClickedSend(),
+              isDisabled: !isSendable(compose),
+            },
+            [Icon.send("h-4 w-4"), "Send"],
+          ),
+        ],
+      ),
+    ],
+  );
+};
+
+const lazyCompose = createLazy();
 const lazyPalette = createLazy();
 
 const paletteView = (
@@ -1000,6 +1341,57 @@ const paletteView = (
     },
     toParentMessage: (message) => GotPaletteMessage({ message }),
   });
+};
+
+// Whether something is painted over the list: an open thread, or a compose
+// panel. Either way the list is decorative until it comes back.
+const isListCovered = (model: Model): boolean =>
+  model.screen._tag === "ShowingThread" ||
+  model.compose._tag === "ComposeEditing";
+
+// The star lives on the list row, which is where it is stored; the open
+// thread reads it from there rather than keeping a second copy that could
+// disagree with the list behind it.
+const isThreadStarred = (model: Model, id: ThreadId): boolean =>
+  Option.match(
+    Option.flatMap(AsyncData.getData(model.threads), (rows) =>
+      Arr.findFirst(rows, (row) => row.id === id),
+    ),
+    { onNone: () => false, onSome: (row) => row.isStarred },
+  );
+
+// A permanently failed action, said once and dismissible. Not attached to the
+// row it concerned: by the time this shows, that row has already been rolled
+// back to the truth, and pinning an error to a row that now looks correct
+// reads as a bug in the row rather than an explanation of it.
+const outboxErrorView = (error: string): Html => {
+  const h = html<Message>();
+  return h.div(
+    [
+      h.Class(
+        `pointer-events-auto absolute bottom-4 left-1/2 z-30 flex max-w-md -translate-x-1/2 items-start gap-3 rounded-xl border border-border px-4 py-3 text-[13px] ${Ui.surface(
+          Ui.elevate(PAGE_SURFACE, 3),
+          3,
+        )}`,
+      ),
+      h.Role("alert"),
+    ],
+    [
+      Ui.badgeDot({ color: "red" }),
+      h.span([h.Class("min-w-0 flex-1 text-foreground")], [error]),
+      h.button(
+        [
+          h.Type("button"),
+          h.OnClick(ClosedOutboxError()),
+          h.AriaLabel("Dismiss"),
+          h.Class(
+            `shrink-0 cursor-pointer text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+          ),
+        ],
+        [Icon.x("h-4 w-4")],
+      ),
+    ],
+  );
 };
 
 export const view = Submodel.defineView<Model, Message, ViewInputs>(
@@ -1035,7 +1427,13 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                 // Still mounted under the open thread, so it has to be
                 // hidden from screen readers or the list is announced
                 // through the thread covering it.
-                h.AriaHidden(model.screen._tag === "ShowingThread"),
+                //
+                // NOTE: `inert` alongside, not aria-hidden alone. The rows
+                // now contain real buttons (the star/read/archive actions),
+                // and aria-hidden over focusable content is a spec violation
+                // that leaves those buttons tabbable but unannounced.
+                h.AriaHidden(isListCovered(model)),
+                ...(isListCovered(model) ? [h.Inert(true)] : []),
               ],
               [listSectionView(model)],
             ),
@@ -1054,13 +1452,34 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                       // on screen". It has no styling or behaviour attached.
                       h.Id(DETAIL_PANE_ID),
                     ],
-                    [lazyThreadDetail(detail.id, threadDetailView, [detail])],
+                    [
+                      lazyThreadDetail(detail.id, threadDetailView, [
+                        detail,
+                        // The star lives on the list row, which is the one
+                        // place it is stored; the open thread reads it from
+                        // there rather than keeping a second copy.
+                        isThreadStarred(model, detail.id),
+                        model.sendingThreads.includes(detail.id),
+                      ]),
+                    ],
                   ),
+                ],
+              }),
+            ),
+            // Above the open thread: replying to one and then discarding
+            // should leave the thread exactly as it was.
+            ...M.value(model.compose).pipe(
+              M.withReturnType<ReadonlyArray<Html>>(),
+              M.tagsExhaustive({
+                ComposeClosed: () => [],
+                ComposeEditing: (compose) => [
+                  lazyCompose(composePanelView, [compose]),
                 ],
               }),
             ),
           ],
         ),
+        ...Arr.fromOption(Option.map(model.maybeOutboxError, outboxErrorView)),
         lazyPalette(paletteView, [
           model.palette,
           model.searchResults,

@@ -22,6 +22,7 @@ import { m } from "foldkit/message";
 import { ts } from "foldkit/schema";
 import { evo } from "foldkit/struct";
 
+import { backoffDelayMs } from "./backoff";
 import { HistoryId, PageToken, type GmailError } from "./Gmail";
 import { SyncEngine } from "./sync";
 
@@ -167,8 +168,6 @@ export type Message = typeof Message.Type;
 // COMMAND
 
 const POLL_INTERVAL_MS = 60_000;
-const BACKOFF_BASE_MS = 2_000;
-const BACKOFF_MAX_MS = 60_000;
 // After this many consecutive failures a stored page token is presumed
 // stale and dropped — the resumed walk skip-scans from the top instead of
 // retrying a token Gmail may no longer honor.
@@ -347,20 +346,6 @@ export const bootCommands = (
 ];
 
 // MACHINE
-
-const backoffDelayMs = (
-  attempt: number,
-  maybeRetryAfterMs: Option.Option<number>,
-): number => {
-  const exponential = Math.min(
-    BACKOFF_BASE_MS * 2 ** (attempt - 1),
-    BACKOFF_MAX_MS,
-  );
-  return Math.max(
-    exponential,
-    Option.getOrElse(maybeRetryAfterMs, () => 0),
-  );
-};
 
 // Every failing pass reports the same two facts, whatever it was doing.
 type FailureMessage = Readonly<{

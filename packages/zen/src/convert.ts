@@ -196,7 +196,9 @@ const loneImage = (
  *  might be the hero photo the heading is about, and stacking that above the
  *  heading is correct. Merging is refused across a quote boundary so a signature
  *  icon can't reach backwards into a person's authored line. */
-const mergeLeadingIcons = (blocks: ReadonlyArray<Block>): ReadonlyArray<Block> => {
+const mergeLeadingIcons = (
+  blocks: ReadonlyArray<Block>,
+): ReadonlyArray<Block> => {
   const out: Array<Block> = [];
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
@@ -213,7 +215,10 @@ const mergeLeadingIcons = (blocks: ReadonlyArray<Block>): ReadonlyArray<Block> =
       (next._tag === "paragraph" || next._tag === "heading") &&
       next.quote === block.quote
     ) {
-      out.push({ ...next, inlines: [image, { _tag: "text", text: " " }, ...next.inlines] });
+      out.push({
+        ...next,
+        inlines: [image, { _tag: "text", text: " " }, ...next.inlines],
+      });
       index += 1;
       continue;
     }

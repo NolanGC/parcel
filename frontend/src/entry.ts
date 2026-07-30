@@ -4,6 +4,7 @@ import { Runtime } from "foldkit";
 import { overlay } from "@foldkit/devtools";
 
 import { AuthClient, sessionStorageLayer } from "./auth";
+import { OutboxEngine } from "./outboxEngine";
 import { Search } from "./search";
 import { SyncEngine } from "./sync";
 import {
@@ -34,14 +35,17 @@ const application = Runtime.makeApplication({
   // build runs the local database migrations — if those fail the app has
   // no working store, so dying (crash screen) is the honest outcome.
   //
-  // Search and SyncEngine each provide SqlLive, and Layer memoizes by
-  // reference within one build — so they share a single worker, a single
-  // OPFS handle, and one migration run.
+  // Search, SyncEngine and OutboxEngine each provide SqlLive, and Layer
+  // memoizes by reference within one build — so they share a single worker, a
+  // single OPFS handle, and one migration run. The same memoization is what
+  // makes the OutboxEngine the sync holds (for the pending-op re-apply) and
+  // the one the page enqueues through the same instance.
   resources: Layer.mergeAll(
     AuthClient.layer,
     sessionStorageLayer,
     Layer.orDie(SyncEngine.layer),
     Layer.orDie(Search.layer),
+    Layer.orDie(OutboxEngine.layer),
   ),
   container: document.getElementById("root"),
   routing: {

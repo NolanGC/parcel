@@ -96,6 +96,7 @@ describe("Inbox list hover session", () => {
     snippet: "hello",
     date: n,
     isUnread: false,
+    isStarred: false,
     category: "none" as const,
   }));
 

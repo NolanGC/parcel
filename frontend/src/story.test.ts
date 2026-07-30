@@ -31,6 +31,7 @@ import {
   SucceededCheckSession,
 } from "./auth";
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
+import { type ThreadRow } from "./sync";
 import {
   CompletedSnapshotPersistence,
   SaveSnapshot,
@@ -38,6 +39,8 @@ import {
 } from "./inboxSnapshot";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox, Login } from "./page";
+import * as OutboxEngine from "./outboxEngine";
+import * as OutboxMachine from "./outboxMachine";
 import * as SyncMachine from "./syncMachine";
 import * as Ui from "./ui";
 
@@ -78,6 +81,7 @@ const threadRow = {
   snippet: "hello",
   date: 1,
   isUnread: false,
+  isStarred: false,
   category: "none" as const,
 };
 
@@ -98,6 +102,8 @@ const threadDetail = {
       date: 1,
       bodyKind: "plain" as const,
       body: "hello",
+      rfc822MessageId: "",
+      references: "",
     },
   ],
 };
@@ -122,12 +128,14 @@ describe("init", () => {
     expect(model._tag).toBe("LoggedIn");
     expect(model.route._tag).toBe("Inbox");
     // The boot-time CheckSession revalidation + the inbox boot (the LIMITed
-    // first local read and the sync machine's checkpoint read; the full
-    // read, size read, and image loop chain off the top read's result).
+    // first local read, the sync machine's checkpoint read, and the outbox
+    // drain that picks up anything the last session queued; the full read,
+    // size read, and image loop chain off the top read's result).
     expect(commands.map((command) => command.name)).toEqual([
       "CheckSession",
       "LoadInboxTop",
       "ReadSyncCheckpoint",
+      "DrainOutbox",
     ]);
   });
 
@@ -142,6 +150,7 @@ describe("init", () => {
       "CheckSession",
       "LoadInboxTop",
       "ReadSyncCheckpoint",
+      "DrainOutbox",
     ]);
   });
 
@@ -698,5 +707,263 @@ describe("backfill list refresh", () => {
     expect(refreshesAfter(600, 700)).toBe(false);
     // 700 → 800 does.
     expect(refreshesAfter(700, 800)).toBe(true);
+  });
+});
+
+// OUTGOING
+//
+// The optimistic contract, from the page's side: the local write and the
+// queue row are one transaction inside the engine, so by the time
+// SucceededEnqueueOp arrives the action has *happened* — the list is only
+// catching up to it, and it must do that without re-reading the store.
+describe("optimistic flag actions", () => {
+  const rowsOf = (model: Model): ReadonlyArray<ThreadRow> =>
+    model.inboxPage.threads._tag === "Success"
+      ? model.inboxPage.threads.data
+      : [];
+
+  const starPatch = (isStarred: boolean) =>
+    inboxMessage(
+      Inbox.SucceededEnqueueOp({
+        maybePatch: Option.some({
+          threadId: threadRow.id,
+          maybeIsUnread: Option.none(),
+          maybeIsStarred: Option.some(isStarred),
+          isRemoved: false,
+        }),
+        maybeSendingThreadId: Option.none(),
+      }),
+    );
+
+  test("clicking the star queues the op the row's state calls for", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.ClickedStarRow({ id: threadRow.id })),
+    );
+
+    expect(commands.map((command) => command.name)).toEqual(["EnqueueOp"]);
+  });
+
+  // The row on screen is unstarred, so the op has to be the one that stars
+  // it — the direction comes from the row, never from a guess.
+  test("the op's direction comes from the row it was clicked on", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.ClickedStarRow({ id: threadRow.id })),
+    );
+
+    expect(commands[0]?.args).toMatchObject({
+      op: { _tag: "ModifyThreadLabels", addLabelIds: ["STARRED"] },
+    });
+  });
+
+  // Re-reading the store would re-decode every row in the mailbox to change
+  // one of them. The patch is the whole point.
+  test("the row updates without a LoadInbox", () => {
+    const [model, commands] = update(loadedInbox(), starPatch(true));
+
+    expect(rowsOf(model)[0]?.isStarred).toBe(true);
+    expect(commands.map((command) => command.name)).not.toContain("LoadInbox");
+  });
+
+  test("archiving takes the row out of the list", () => {
+    const [model] = update(
+      loadedInbox(),
+      inboxMessage(
+        Inbox.SucceededEnqueueOp({
+          maybePatch: Option.some({
+            threadId: threadRow.id,
+            maybeIsUnread: Option.none(),
+            maybeIsStarred: Option.none(),
+            isRemoved: true,
+          }),
+          maybeSendingThreadId: Option.none(),
+        }),
+      ),
+    );
+
+    expect(rowsOf(model)).toEqual([]);
+  });
+
+  // A permanent rejection has already been undone in the store; this is the
+  // list being told to match.
+  test("a rejected op rolls the row back and says why", () => {
+    const [starred] = update(loadedInbox(), starPatch(true));
+    const [rolledBack] = update(
+      starred,
+      inboxMessage(
+        Inbox.GotOutboxMessage({
+          message: OutboxMachine.SteppedDrain({
+            result: OutboxEngine.Rejected({
+              maybeRollback: Option.some({
+                threadId: threadRow.id,
+                maybeIsUnread: Option.none(),
+                maybeIsStarred: Option.some(false),
+                isRemoved: false,
+              }),
+              maybeSentThreadId: Option.none(),
+              message: "Gmail said no.",
+              summary: OutboxEngine.emptySummary,
+            }),
+          }),
+        }),
+      ),
+    );
+
+    expect(rowsOf(rolledBack)[0]?.isStarred).toBe(false);
+    expect(rolledBack.inboxPage.maybeOutboxError).toEqual(
+      Option.some("Gmail said no."),
+    );
+  });
+
+  // The enqueue is one transaction, so a failed one changed nothing locally
+  // either — there is no rollback to do, only an action to repeat.
+  test("a failed enqueue leaves the rows untouched", () => {
+    const before = loadedInbox();
+    const [after] = update(
+      before,
+      inboxMessage(Inbox.FailedEnqueueOp({ error: "disk full" })),
+    );
+
+    expect(rowsOf(after)).toBe(rowsOf(before));
+  });
+
+  // Nudging the drain is what turns a queued op into a sent one.
+  test("a queued op starts the drain", () => {
+    const [, commands] = update(loadedInbox(), starPatch(true));
+
+    expect(commands.map((command) => command.name)).toEqual(["DrainOutbox"]);
+  });
+});
+
+describe("compose", () => {
+  const composing = (): Model => {
+    const [model] = update(loadedInbox(), inboxMessage(Inbox.ClickedCompose()));
+    return model;
+  };
+
+  const typed = (model: Model, field: Inbox.ComposeField, value: string) =>
+    update(model, inboxMessage(Inbox.EditedCompose({ field, value })))[0];
+
+  test("the compose button opens an empty draft", () => {
+    expect(composing().inboxPage.compose._tag).toBe("ComposeEditing");
+  });
+
+  test("an empty draft cannot be sent", () => {
+    const [, commands] = update(composing(), inboxMessage(Inbox.ClickedSend()));
+
+    expect(commands).toEqual([]);
+  });
+
+  test("a filled draft queues a send and closes the panel", () => {
+    const filled = typed(
+      typed(composing(), "to", "grace@example.com"),
+      "body",
+      "**hi**",
+    );
+    const [sent, commands] = update(filled, inboxMessage(Inbox.ClickedSend()));
+
+    expect(sent.inboxPage.compose._tag).toBe("ComposeClosed");
+    expect(commands.map((command) => command.name)).toEqual(["EnqueueOp"]);
+  });
+
+  // The body is markdown and goes out as both alternatives, rendered once
+  // here rather than again at send time.
+  test("the queued op carries the markdown and its rendering", () => {
+    const filled = typed(
+      typed(composing(), "to", "grace@example.com"),
+      "body",
+      "**hi**",
+    );
+    const [, commands] = update(filled, inboxMessage(Inbox.ClickedSend()));
+
+    expect(commands[0]?.args).toMatchObject({
+      op: {
+        _tag: "SendMessage",
+        to: ["grace@example.com"],
+        bodyMarkdown: "**hi**",
+      },
+    });
+    expect(commands[0]?.args).toMatchObject({
+      op: { bodyHtml: expect.stringContaining("<strong>hi</strong>") },
+    });
+  });
+
+  test("recipients are split on commas, and blanks dropped", () => {
+    const filled = typed(
+      typed(composing(), "to", "a@x.com, b@x.com, "),
+      "body",
+      "hi",
+    );
+    const [, commands] = update(filled, inboxMessage(Inbox.ClickedSend()));
+
+    expect(commands[0]?.args).toMatchObject({
+      op: { to: ["a@x.com", "b@x.com"] },
+    });
+  });
+
+  test("discarding throws the draft away", () => {
+    const [model] = update(
+      typed(composing(), "body", "half a thought"),
+      inboxMessage(Inbox.ClosedCompose()),
+    );
+
+    expect(model.inboxPage.compose._tag).toBe("ComposeClosed");
+  });
+});
+
+// The compose panel sits on top of whatever it was opened from, so it has to
+// claim Escape before the thread underneath does.
+describe("dismissing the compose panel", () => {
+  const escape = inboxMessage(Inbox.PressedListKey({ key: "Escape" }));
+
+  const replyingToThread = (): Model => {
+    const [opened] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.ClickedRow({ id: threadRow.id, index: 0 })),
+    );
+    const [shown] = update(
+      opened,
+      inboxMessage(Inbox.SucceededLoadThread({ detail: threadDetail })),
+    );
+    return update(shown, inboxMessage(Inbox.ClickedReply()))[0];
+  };
+
+  test("Escape closes the panel", () => {
+    const [model] = update(replyingToThread(), escape);
+
+    expect(model.inboxPage.compose._tag).toBe("ComposeClosed");
+  });
+
+  // The bug this guards: falling through to the thread branch closed the
+  // thread *underneath* the reply and left the panel floating over the list,
+  // with the half-written reply the only thing still on screen.
+  test("Escape leaves the thread it was opened from alone", () => {
+    const [model] = update(replyingToThread(), escape);
+
+    expect(model.inboxPage.screen._tag).toBe("ShowingThread");
+  });
+
+  test("list navigation does not leak past an open panel", () => {
+    const before = replyingToThread();
+    const [after] = update(
+      before,
+      inboxMessage(Inbox.PressedListKey({ key: "j" })),
+    );
+
+    expect(after.inboxPage.maybeSelected).toEqual(
+      before.inboxPage.maybeSelected,
+    );
+  });
+
+  test("opening a compose puts the keyboard in it", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.ClickedCompose()),
+    );
+
+    expect(commands.map((command) => command.name)).toEqual([
+      "FocusComposeField",
+    ]);
   });
 });

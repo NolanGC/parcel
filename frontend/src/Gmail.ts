@@ -36,6 +36,14 @@ export type ThreadId = typeof ThreadId.Type;
 export const LabelId = S.NonEmptyString.pipe(S.brand("GmailLabelId"));
 export type LabelId = typeof LabelId.Type;
 
+// The system labels the app reads and writes. Every mailbox state the UI
+// exposes is one of these: in the inbox, unread, starred. Named once here
+// because both the sync's extraction and the outbox's label edits key off
+// them, and a typo in either place is a silent no-op rather than an error.
+export const INBOX_LABEL = LabelId.make("INBOX");
+export const UNREAD_LABEL = LabelId.make("UNREAD");
+export const STARRED_LABEL = LabelId.make("STARRED");
+
 export const AttachmentId = S.NonEmptyString.pipe(S.brand("GmailAttachmentId"));
 export type AttachmentId = typeof AttachmentId.Type;
 
@@ -238,9 +246,9 @@ export class GmailAuthError extends S.TaggedErrorClass<GmailAuthError>()(
 ) {}
 
 /** 403 without a rate-limit reason: the granted scopes don't cover this
- * call — expected for every write while sign-in only grants
- * gmail.readonly. Recovery is a scope upgrade via
- * linkSocial({ provider: "google", scopes: [...] }), not a retry. */
+ * call. Sign-in grants modify and send alongside readonly, so this now means
+ * a session older than that change. Recovery is signing in again (which
+ * re-consents), not a retry. */
 export class GmailScopeError extends S.TaggedErrorClass<GmailScopeError>()(
   "GmailScopeError",
   { message: S.String, reason: S.optionalKey(S.String) },
@@ -418,6 +426,9 @@ export const THREADS_PER_SECOND = QUOTA_UNITS_PER_WINDOW / THREAD_GET_UNITS;
 // NOTE: Order matters. An attachment URL also contains /messages/, so the
 // first match wins and the narrower fragments come first.
 const QUOTA_UNITS_BY_PATH: ReadonlyArray<readonly [string, number]> = [
+  // Sending is by far the most expensive call in the table, and its URL also
+  // contains /messages, so it has to be matched before that entry.
+  ["/send", 100],
   ["/attachments/", 5],
   ["/history", 2],
   ["/profile", 1],
@@ -629,8 +640,8 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
       listHistory: (options: ListHistoryOptions) =>
         request(ListHistoryResponse, "GET", "/history", { ...options }),
 
-      // WRITES (fail with GmailScopeError until scopes beyond
-      // gmail.readonly are granted via linkSocial)
+      // WRITES (covered by gmail.modify and gmail.send; a session predating
+      // those scopes fails with GmailScopeError until it signs in again)
 
       /**
        * Add/remove labels on one message. Archiving, marking read, and

@@ -47,3 +47,7 @@ export const hand = from(Hugeicons.HandPointingRight01Icon);
 export const circleUser = from(Hugeicons.UserCircleIcon);
 export const logOut = from(Hugeicons.Logout01Icon);
 export const palmtree = from(Hugeicons.TreeIcon);
+export const star = from(Hugeicons.StarIcon);
+export const reply = from(Hugeicons.ArrowTurnBackwardIcon);
+export const x = from(Hugeicons.Cancel01Icon);
+export const eye = from(Hugeicons.ViewIcon);

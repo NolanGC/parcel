@@ -16,6 +16,19 @@ import { evo } from "foldkit/struct";
 
 import { mark } from "../../bootMarks";
 import { ThreadId } from "../../Gmail";
+import { renderMarkdownToEmailHtml } from "../../markdown";
+import { replyReferences, replySubject } from "../../mime";
+import { OutboxEngine } from "../../outboxEngine";
+import * as OutboxMachine from "../../outboxMachine";
+import {
+  OutboxOp,
+  SEND_MESSAGE,
+  SendMessage,
+  archiveOp,
+  readOp,
+  starOp,
+  type ThreadPatch,
+} from "../../outboxOps";
 import { Search } from "../../search";
 import { SyncEngine, ThreadRow } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
@@ -23,8 +36,14 @@ import * as Ui from "../../ui";
 
 import {
   Appearance,
+  ComposeClosed,
+  ComposeEditing,
+  ComposeField,
+  CompletedFocusComposeField,
+  composeFieldId,
   CompletedApplyAppearance,
   CompletedScrollListToRow,
+  FailedEnqueueOp,
   FailedLoadInbox,
   FailedLoadThread,
   CompletedCacheImageBatch,
@@ -35,6 +54,7 @@ import {
   GotAccountPopoverMessage,
   GotFolderMenuMessage,
   GotListMessage,
+  GotOutboxMessage,
   GotPaletteMessage,
   GotSyncMessage,
   GotTabsMessage,
@@ -46,9 +66,13 @@ import {
   OpeningThread,
   PALETTE_RESULT_LIMIT,
   ROW_HEIGHT,
+  isSendable,
+  parseRecipients,
+  patchRow,
   reconcileRows,
   ShowingList,
   ShowingThread,
+  SucceededEnqueueOp,
   SucceededLoadInbox,
   SucceededLoadInboxTop,
   FailedLoadInboxTop,
@@ -59,6 +83,10 @@ import {
 
 export * from "./model";
 export { view } from "./view";
+
+/** Everything this page's Commands can require. main.ts folds it into the
+ *  application's own resource union, and entry.ts provides the layers. */
+export type InboxResources = SyncEngine | Search | OutboxEngine;
 
 // COMMAND
 
@@ -137,10 +165,15 @@ const LoadInboxTop = Command.define(
  *  local store — a different mailbox wipes it rather than blending. */
 export const bootCommands = (
   accountEmail: string,
-): ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>> => [
+): ReadonlyArray<Command.Command<Message, never, InboxResources>> => [
   LoadInboxTop(),
   ...Command.mapMessages(SyncMachine.bootCommands(accountEmail), (message) =>
     GotSyncMessage({ message }),
+  ),
+  // Whatever the last session queued and never got out. Costs one local
+  // SELECT when the queue is empty, which is the usual case.
+  ...Command.mapMessages(OutboxMachine.bootCommands(), (message) =>
+    GotOutboxMessage({ message }),
   ),
 ];
 
@@ -237,6 +270,49 @@ export const LoadThread = Command.define(
   }),
 );
 
+/** Queues one outgoing action and applies it to the local store, in one
+ *  transaction. The action is done from here on; getting it to Gmail is the
+ *  outbox machine's problem. */
+export const EnqueueOp = Command.define(
+  "EnqueueOp",
+  { op: OutboxOp },
+  SucceededEnqueueOp,
+  FailedEnqueueOp,
+)(({ op }) =>
+  Effect.gen(function* () {
+    const engine = yield* OutboxEngine;
+    return yield* engine.enqueue(op).pipe(
+      Effect.map((maybePatch) =>
+        SucceededEnqueueOp({
+          maybePatch,
+          maybeSendingThreadId:
+            op._tag === SEND_MESSAGE ? op.maybeThreadId : Option.none(),
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedEnqueueOp({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+/** Moves focus into the compose panel when it opens, so the panel is where
+ *  the keyboard already is rather than somewhere to be found. */
+// NOTE: A Command, not a Mount: the cause is the message that opened the
+// panel, not the input existing. Missing the element is not a failure worth
+// reporting — the panel closing before the focus lands is the only way it
+// happens, and the user has already moved on.
+export const FocusComposeField = Command.define(
+  "FocusComposeField",
+  { field: ComposeField },
+  CompletedFocusComposeField,
+)(({ field }) =>
+  Effect.sync(() => {
+    document.getElementById(composeFieldId(field))?.focus();
+    return CompletedFocusComposeField();
+  }),
+);
+
 /** Keeps the keyboard cursor on screen. */
 // NOTE: Scrolls the container directly rather than using scrollIntoView: the
 // target row usually isn't mounted, and the fixed row height makes its
@@ -265,14 +341,14 @@ export const ScrollListToRow = Command.define(
 
 type UpdateReturn = readonly [
   Model,
-  ReadonlyArray<Command.Command<Message, never, SyncEngine | Search>>,
+  ReadonlyArray<Command.Command<Message, never, InboxResources>>,
 ];
 
 /** Issued exactly once, from the top read's settle (either branch): the full
  *  read that settles the list, then the size read and the image loop queued
  *  behind it on the shared worker. */
 const afterTopReadCommands = (): ReadonlyArray<
-  Command.Command<Message, never, SyncEngine | Search>
+  Command.Command<Message, never, InboxResources>
 > => [LoadInbox(), ReadLocalSize(), CacheImageBatch()];
 
 // Every palette query goes through here, so the seq can never be bumped
@@ -373,6 +449,232 @@ const closeThread = (model: Model): UpdateReturn => [
 const isStaleSearch = (model: Model, seq: number): boolean =>
   seq !== model.searchSeq;
 
+// OUTGOING
+
+// The list catching up to a local write that has already happened. Only the
+// one row changes, and the cursor is clamped because an archive shortens the
+// list under it.
+const applyPatch = (model: Model, patch: ThreadPatch): Model => {
+  const rows = listedRows(model);
+  const next = patchRow(rows, patch);
+  if (next === rows) {
+    return model;
+  }
+  const lastIndex = next.length - 1;
+  return evo(model, {
+    threads: (threads) => AsyncData.map(threads, () => next),
+    maybeSelected: (maybeSelected) =>
+      Option.filter(
+        Option.map(maybeSelected, (index) => Math.min(index, lastIndex)),
+        (index) => index >= 0,
+      ),
+  });
+};
+
+// Every flag action is the same two steps: name the op from the row's current
+// state, and queue it. The row is found by id because an index captured at
+// paint time may address a different thread by the time the click lands.
+const enqueueForRow = (
+  model: Model,
+  id: ThreadId,
+  toOp: (row: ThreadRow) => OutboxOp,
+): UpdateReturn =>
+  Option.match(
+    Arr.findFirst(listedRows(model), (row) => row.id === id),
+    {
+      onNone: (): UpdateReturn => [model, []],
+      onSome: (row) => [model, [EnqueueOp({ op: toOp(row) })]],
+    },
+  );
+
+const editingCompose = (
+  model: Model,
+): Option.Option<typeof ComposeEditing.Type> =>
+  Option.liftPredicate(
+    model.compose,
+    (compose): compose is typeof ComposeEditing.Type =>
+      compose._tag === "ComposeEditing",
+  );
+
+// Every compose edit is the same shape: if a draft is open, replace it with an
+// edited one; if not, the message was for a panel that has since closed.
+const withEditingCompose = (
+  model: Model,
+  edit: (compose: typeof ComposeEditing.Type) => typeof ComposeEditing.Type,
+): Model =>
+  Option.match(editingCompose(model), {
+    onNone: () => model,
+    onSome: (compose) => evo(model, { compose: () => edit(compose) }),
+  });
+
+// NOTE: Matched rather than written as `evo(compose, { [field]: … })`. `evo`
+// takes literal keys only — a computed one widens to an index signature and is
+// rejected — and reaching for a spread instead would step outside the one
+// update path every Model change goes through.
+const editComposeField = (
+  compose: typeof ComposeEditing.Type,
+  field: ComposeField,
+  value: string,
+): typeof ComposeEditing.Type =>
+  M.value(field).pipe(
+    M.withReturnType<typeof ComposeEditing.Type>(),
+    M.when("to", () => evo(compose, { to: () => value })),
+    M.when("subject", () => evo(compose, { subject: () => value })),
+    M.when("body", () => evo(compose, { body: () => value })),
+    M.exhaustive,
+  );
+
+// A reply is prefilled from the newest message in the open thread: its sender
+// is the recipient, and its Message-ID is what threads the reply in that
+// person's client.
+const openReply = (model: Model): UpdateReturn => {
+  if (model.screen._tag !== "ShowingThread") {
+    return [model, []];
+  }
+  const { detail } = model.screen;
+  return Option.match(Arr.last(detail.messages), {
+    onNone: (): UpdateReturn => [model, []],
+    onSome: (latest) => [
+      evo(model, {
+        compose: () =>
+          ComposeEditing({
+            to: latest.fromEmail,
+            subject: replySubject(detail.subject),
+            body: "",
+            isPreviewing: false,
+            maybeReply: Option.some({
+              threadId: detail.id,
+              inReplyTo: latest.rfc822MessageId,
+              references: replyReferences(
+                latest.references,
+                latest.rfc822MessageId,
+              ),
+            }),
+          }),
+      }),
+      // The recipient and subject are already filled in, so the body is where
+      // there is actually something to type.
+      [FocusComposeField({ field: "body" })],
+    ],
+  });
+};
+
+const sendCompose = (model: Model): UpdateReturn =>
+  Option.match(Option.filter(editingCompose(model), isSendable), {
+    // The Send button is disabled in this case; reaching it anyway (a stray
+    // Enter, say) should do nothing rather than queue an empty message.
+    onNone: (): UpdateReturn => [model, []],
+    onSome: (compose) => {
+      const op = SendMessage({
+        to: parseRecipients(compose.to),
+        subject: compose.subject,
+        bodyMarkdown: compose.body,
+        // Rendered here, once, so the queued op carries exactly what the
+        // preview showed rather than re-rendering at send time.
+        bodyHtml: renderMarkdownToEmailHtml(compose.body),
+        maybeThreadId: Option.map(
+          compose.maybeReply,
+          (reply) => reply.threadId,
+        ),
+        maybeInReplyTo: Option.flatMap(compose.maybeReply, (reply) =>
+          Option.liftPredicate(reply.inReplyTo, (id) => id !== ""),
+        ),
+        references: Option.match(compose.maybeReply, {
+          onNone: () => "",
+          onSome: (reply) => reply.references,
+        }),
+      });
+      // The panel closes immediately: the message is the outbox's from the
+      // moment it is queued, and holding a spinner over a durable queue would
+      // be pretending otherwise.
+      return [
+        evo(model, { compose: () => ComposeClosed() }),
+        [EnqueueOp({ op })],
+      ];
+    },
+  });
+
+// A settled send, however it settled, is no longer sending.
+const settleSending = (
+  model: Model,
+  maybeThreadId: Option.Option<ThreadId>,
+): Model =>
+  Option.match(maybeThreadId, {
+    onNone: () => model,
+    onSome: (threadId) =>
+      evo(model, {
+        sendingThreads: (threads) =>
+          threads.filter((sending) => sending !== threadId),
+      }),
+  });
+
+// What one drain outcome means to the page, on top of what it means to the
+// machine: a rolled-back label edit has to reach the row, and a settled send
+// has to clear its chip.
+const applyDrainOutcome = (
+  model: Model,
+  message: OutboxMachine.Message,
+): Model => {
+  if (message._tag !== "SteppedDrain") {
+    return model;
+  }
+  return M.value(message.result).pipe(
+    M.withReturnType<Model>(),
+    M.tagsExhaustive({
+      Applied: ({ maybeSentThreadId }) =>
+        settleSending(model, maybeSentThreadId),
+      Rejected: ({ maybeRollback, maybeSentThreadId, message: error }) =>
+        evo(
+          Option.match(maybeRollback, {
+            onNone: () => settleSending(model, maybeSentThreadId),
+            onSome: (rollback) =>
+              applyPatch(settleSending(model, maybeSentThreadId), rollback),
+          }),
+          { maybeOutboxError: () => Option.some(error) },
+        ),
+      Drained: () => model,
+      Deferred: () => model,
+    }),
+  );
+};
+
+// One step of the outbox machine, plus the page-level consequences of what
+// the step just learned. Every path into the machine goes through here.
+const stepOutbox = (
+  model: Model,
+  message: OutboxMachine.Message,
+): UpdateReturn => {
+  const [nextOutbox, commands] = OutboxMachine.step(model.outbox, message);
+  return [
+    applyDrainOutcome(evo(model, { outbox: () => nextOutbox }), message),
+    Command.mapMessages(commands, (message) => GotOutboxMessage({ message })),
+  ];
+};
+
+// The same for the sync machine, plus the row refresh its progress earns and
+// the one message both machines answer to.
+const stepSync = (model: Model, message: SyncMachine.Message): UpdateReturn => {
+  const [nextSync, commands] = SyncMachine.step(model.sync, message);
+  const syncCommands = [
+    ...Command.mapMessages(commands, (message) => GotSyncMessage({ message })),
+    ...(shouldRefreshRows(model.sync, message)
+      ? [LoadInbox(), ReadLocalSize()]
+      : []),
+  ];
+  const stepped = evo(model, { sync: () => nextSync });
+  // One pill, two machines. Both park on the same lost grant, so the click
+  // that revives the sync has to revive the drain as well — otherwise
+  // reconnecting brings mail in and still will not send any.
+  if (message._tag !== "ClickedReconnect") {
+    return [stepped, syncCommands];
+  }
+  const [revived, outboxCommands] = stepOutbox(
+    stepped,
+    OutboxMachine.ClickedReconnect(),
+  );
+  return [revived, [...syncCommands, ...outboxCommands]];
+};
+
 // NOTE: With no cursor yet, either direction lands on the first row, stated
 // outright rather than falling out of arithmetic on a sentinel.
 const moveCursor = (model: Model, step: number): UpdateReturn => {
@@ -401,6 +703,16 @@ const handlePressedListKey =
   (key: ListKey): UpdateReturn => {
     if (model.palette.dialog.isOpen) {
       return [model, []];
+    }
+    // NOTE: Before the thread branch, not after. An open compose panel is on
+    // top of whatever it was opened from, so Escape has to dismiss the panel;
+    // falling through would close the *thread underneath* a reply and leave
+    // the panel floating over the list, with the half-written reply the only
+    // thing still on screen.
+    if (model.compose._tag === "ComposeEditing") {
+      return key === "Escape"
+        ? [evo(model, { compose: () => ComposeClosed() }), []]
+        : [model, []];
     }
     if (model.screen._tag === "ShowingThread") {
       return key === "Escape" ? closeThread(model) : [model, []];
@@ -600,20 +912,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [],
       ],
 
-      GotSyncMessage: ({ message }) => {
-        const [nextSync, commands] = SyncMachine.step(model.sync, message);
-        return [
-          evo(model, { sync: () => nextSync }),
-          [
-            ...Command.mapMessages(commands, (message) =>
-              GotSyncMessage({ message }),
-            ),
-            ...(shouldRefreshRows(model.sync, message)
-              ? [LoadInbox(), ReadLocalSize()]
-              : []),
-          ],
-        ];
-      },
+      GotSyncMessage: ({ message }) => stepSync(model, message),
 
       // NOTE: Re-wrapping an unchanged number in a fresh Option would hand the
       // pill a new argument and cost it its memoization slot for nothing.
@@ -686,6 +985,92 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           ),
         ];
       },
+
+      // The three flag actions. Each reads the row's current state so the
+      // toggle direction is never guessed, and each is done locally the
+      // moment the enqueue lands.
+      ClickedStarRow: ({ id }) =>
+        enqueueForRow(model, id, (row) => starOp(row.id, row.isStarred)),
+
+      ClickedArchiveRow: ({ id }) =>
+        enqueueForRow(model, id, (row) => archiveOp(row.id)),
+
+      ClickedToggleReadRow: ({ id }) =>
+        enqueueForRow(model, id, (row) => readOp(row.id, row.isUnread)),
+
+      ClickedCompose: () => [
+        evo(model, {
+          compose: () =>
+            ComposeEditing({
+              to: "",
+              subject: "",
+              body: "",
+              isPreviewing: false,
+              maybeReply: Option.none(),
+            }),
+        }),
+        [FocusComposeField({ field: "to" })],
+      ],
+
+      ClickedReply: () => openReply(model),
+
+      CompletedFocusComposeField: () => [model, []],
+
+      EditedCompose: ({ field, value }) => [
+        withEditingCompose(model, (compose) =>
+          editComposeField(compose, field, value),
+        ),
+        [],
+      ],
+
+      ToggledComposePreview: () => [
+        withEditingCompose(model, (compose) =>
+          evo(compose, { isPreviewing: (was) => !was }),
+        ),
+        [],
+      ],
+
+      ClickedSend: () => sendCompose(model),
+
+      ClosedCompose: () => [evo(model, { compose: () => ComposeClosed() }), []],
+
+      // The store already reflects this; the list is only catching up. The
+      // drain is nudged rather than started — the machine ignores the nudge
+      // if one is already in flight.
+      SucceededEnqueueOp: ({ maybePatch, maybeSendingThreadId }) => {
+        const patched = Option.match(maybePatch, {
+          onNone: () => model,
+          onSome: (patch) => applyPatch(model, patch),
+        });
+        // NOTE: Deduped. `settleSending` clears every entry for a thread, so
+        // a second queued reply to the same thread would otherwise have its
+        // chip cleared by the first one landing, while it is still in flight.
+        const sending = Option.match(maybeSendingThreadId, {
+          onNone: () => patched,
+          onSome: (threadId) =>
+            evo(patched, {
+              sendingThreads: (threads) =>
+                threads.includes(threadId)
+                  ? threads
+                  : Arr.append(threads, threadId),
+            }),
+        });
+        return stepOutbox(sending, OutboxMachine.QueuedOp());
+      },
+
+      // Nothing happened — not locally either, since the local write and the
+      // queue row share a transaction. The action can just be repeated.
+      FailedEnqueueOp: ({ error }) => [
+        evo(model, { maybeOutboxError: () => Option.some(error) }),
+        [],
+      ],
+
+      GotOutboxMessage: ({ message }) => stepOutbox(model, message),
+
+      ClosedOutboxError: () => [
+        evo(model, { maybeOutboxError: () => Option.none() }),
+        [],
+      ],
 
       // The popover stays open so the switch reads as a live preview.
       ClickedAppearance: () => {

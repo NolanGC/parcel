@@ -49,8 +49,7 @@ import {
   loginRouter,
   urlToAppRoute,
 } from "./route";
-import { Search } from "./search";
-import { SyncEngine, type ThreadRow } from "./sync";
+import { type ThreadRow } from "./sync";
 import * as Ui from "./ui";
 
 // MODEL
@@ -133,8 +132,7 @@ export const flags: Effect.Effect<Flags> = Effect.map(
 export type AppResources =
   | AuthClient
   | KeyValueStore.KeyValueStore
-  | SyncEngine
-  | Search;
+  | Inbox.InboxResources;
 
 type UpdateReturn = readonly [
   Model,
@@ -455,7 +453,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           (model): model is LoggedIn =>
             model._tag === "LoggedIn" && message._tag === "SucceededLoadInbox",
         ).pipe(
-          Option.filter(() => Arr.isReadonlyArrayNonEmpty(inboxRows(inboxPage))),
+          Option.filter(() =>
+            Arr.isReadonlyArrayNonEmpty(inboxRows(inboxPage)),
+          ),
           Option.map(({ session }) =>
             SaveSnapshot({
               snapshot: { email: session.email, rows: inboxRows(inboxPage) },
@@ -516,12 +516,17 @@ const toPaletteShortcutMessage = (
 
 // j/k/Enter/Escape drive the inbox list. Bare keys only, and never while
 // typing: the palette's input (or any editable target) keeps its keystrokes.
+//
+// NOTE: Escape is the exception, because it is the one key whose meaning does
+// not change when you are typing — it dismisses what you are typing INTO.
+// Swallowing it left an open compose panel with no keyboard way out.
 const toListKeyMessage = (event: KeyboardEvent): Option.Option<Message> => {
+  const isDismissal = event.key === "Escape";
   if (
     event.metaKey ||
     event.ctrlKey ||
     event.altKey ||
-    isTypingTarget(event.target)
+    (!isDismissal && isTypingTarget(event.target))
   ) {
     return Option.none();
   }
