@@ -448,10 +448,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         // and a first visit never persists one. The write is a ~10KB
         // localStorage set on boot and once per backfill stride; that is
         // cheaper than the class of bug the guard invites.
+        // Only an inbox read: the snapshot seeds the boot view, and the boot
+        // view is always the inbox.
         const maybeSaveSnapshot = Option.liftPredicate(
           model,
           (model): model is LoggedIn =>
-            model._tag === "LoggedIn" && message._tag === "SucceededLoadInbox",
+            model._tag === "LoggedIn" &&
+            message._tag === "SucceededLoadFolder" &&
+            message.folder === "inbox",
         ).pipe(
           Option.filter(() =>
             Arr.isReadonlyArrayNonEmpty(inboxRows(inboxPage)),

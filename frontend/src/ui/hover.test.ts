@@ -104,7 +104,7 @@ describe("Inbox list hover session", () => {
   const hoveredAt = (index: number): Inbox.Model => {
     const [loaded] = Inbox.update(
       Inbox.init(),
-      Inbox.SucceededLoadInbox({ rows }),
+      Inbox.SucceededLoadFolder({ folder: "inbox", rows }),
     );
     const [entered] = Inbox.update(loaded, Inbox.EnteredList());
     const [next] = Inbox.update(entered, Inbox.HoveredRow({ index }));

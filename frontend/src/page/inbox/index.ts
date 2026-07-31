@@ -30,7 +30,7 @@ import {
   type ThreadPatch,
 } from "../../outboxOps";
 import { Search } from "../../search";
-import { SyncEngine, ThreadRow } from "../../sync";
+import { Folder, SyncEngine, ThreadRow } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
 
@@ -44,7 +44,7 @@ import {
   CompletedApplyAppearance,
   CompletedScrollListToRow,
   FailedEnqueueOp,
-  FailedLoadInbox,
+  FailedLoadFolder,
   FailedLoadThread,
   CompletedCacheImageBatch,
   FailedCacheImageBatch,
@@ -73,12 +73,13 @@ import {
   ShowingList,
   ShowingThread,
   SucceededEnqueueOp,
-  SucceededLoadInbox,
+  SucceededLoadFolder,
   SucceededLoadInboxTop,
   FailedLoadInboxTop,
   SucceededLoadThread,
   SucceededReadLocalSize,
   SucceededSearch,
+  visibleRows,
 } from "./model";
 
 export * from "./model";
@@ -117,19 +118,22 @@ const ApplyAppearance = Command.define(
   }),
 );
 
-/** Selects the whole local store, newest first. No network: filling the store
- *  is the sync machine's job. */
-export const LoadInbox = Command.define(
-  "LoadInbox",
-  SucceededLoadInbox,
-  FailedLoadInbox,
-)(
+/** Selects one folder from the local store, newest first. No network: filling
+ *  the store is the sync machine's job. */
+export const LoadFolder = Command.define(
+  "LoadFolder",
+  { folder: Folder },
+  SucceededLoadFolder,
+  FailedLoadFolder,
+)(({ folder }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    return yield* engine.loadInbox.pipe(
-      Effect.map((rows) => SucceededLoadInbox({ rows })),
+    return yield* engine.loadFolder(folder).pipe(
+      Effect.map((rows) => SucceededLoadFolder({ folder, rows })),
       Effect.catchCause((cause) =>
-        Effect.succeed(FailedLoadInbox({ error: Cause.pretty(cause) })),
+        Effect.succeed(
+          FailedLoadFolder({ folder, error: Cause.pretty(cause) }),
+        ),
       ),
     );
   }),
@@ -347,9 +351,13 @@ type UpdateReturn = readonly [
 /** Issued exactly once, from the top read's settle (either branch): the full
  *  read that settles the list, then the size read and the image loop queued
  *  behind it on the shared worker. */
-const afterTopReadCommands = (): ReadonlyArray<
-  Command.Command<Message, never, InboxResources>
-> => [LoadInbox(), ReadLocalSize(), CacheImageBatch()];
+const afterTopReadCommands = (
+  folder: Folder,
+): ReadonlyArray<Command.Command<Message, never, InboxResources>> => [
+  LoadFolder({ folder }),
+  ReadLocalSize(),
+  CacheImageBatch(),
+];
 
 // Every palette query goes through here, so the seq can never be bumped
 // without a search in flight to match it.
@@ -358,8 +366,15 @@ const runSearch = (model: Model, text: string): UpdateReturn => {
   return [evo(model, { searchSeq: () => seq }), [RunSearch({ seq, text })]];
 };
 
-const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
+/** The current folder's rows as loaded, before any tab narrowing. What the
+ *  reconcilers and by-id lookups run against. */
+const storedRows = (model: Model): ReadonlyArray<ThreadRow> =>
   Option.getOrElse(AsyncData.getData(model.threads), () => []);
+
+/** The rows actually on screen (see visibleRows). Everything positional —
+ *  the cursor, j/k, Enter — indexes into this. */
+const listedRows = (model: Model): ReadonlyArray<ThreadRow> =>
+  visibleRows(model, storedRows(model));
 
 // NOTE: Re-selecting and decoding the whole store costs tens of ms at 10k
 // rows, so backfill progress refreshes the list on a stride, not per batch.
@@ -415,9 +430,19 @@ const openThread = (
   if (base.screen._tag === "ShowingThread" && base.screen.detail.id === id) {
     return [base, []];
   }
+  // Opening is reading. The mark-read rides the same outbox op as the
+  // explicit toggle, so the dot clears optimistically and Gmail hears about
+  // it when the queue drains — an already-read thread enqueues nothing.
+  const markRead = Option.map(
+    Option.filter(
+      Arr.findFirst(listedRows(base), (row) => row.id === id),
+      (row) => row.isUnread,
+    ),
+    (row) => EnqueueOp({ op: readOp(row.id, true) }),
+  );
   return [
     evo(base, { screen: () => OpeningThread({ id }) }),
-    [LoadThread({ id })],
+    [...Arr.fromOption(markRead), LoadThread({ id })],
   ];
 };
 
@@ -446,6 +471,24 @@ const closeThread = (model: Model): UpdateReturn => [
   [],
 ];
 
+// Switching mailboxes. The old folder's rows never paint under the new
+// folder's name: the list drops to Loading, and the read that comes back is
+// checked against the folder it was issued for.
+const switchFolder = (model: Model, folder: Folder): UpdateReturn => {
+  if (folder === model.folder) {
+    return [model, []];
+  }
+  return [
+    evo(model, {
+      folder: () => folder,
+      threads: (): Model["threads"] => AsyncData.Loading(),
+      screen: () => ShowingList({ maybeError: Option.none() }),
+      maybeSelected: () => Option.none(),
+    }),
+    [LoadFolder({ folder }), ScrollListToRow({ index: 0 })],
+  ];
+};
+
 const isStaleSearch = (model: Model, seq: number): boolean =>
   seq !== model.searchSeq;
 
@@ -455,14 +498,25 @@ const isStaleSearch = (model: Model, seq: number): boolean =>
 // one row changes, and the cursor is clamped because an archive shortens the
 // list under it.
 const applyPatch = (model: Model, patch: ThreadPatch): Model => {
-  const rows = listedRows(model);
-  const next = patchRow(rows, patch);
+  const rows = storedRows(model);
+  // Leaving the inbox is only a removal in the inbox. An archived thread is
+  // still a member of All Mail, Starred, Sent — every other folder keeps the
+  // row and takes just the flag changes.
+  const effective =
+    patch.isRemoved && model.folder !== "inbox"
+      ? evo(patch, { isRemoved: () => false })
+      : patch;
+  const next = patchRow(rows, effective);
   if (next === rows) {
     return model;
   }
-  const lastIndex = next.length - 1;
-  return evo(model, {
+  const patched = evo(model, {
     threads: (threads) => AsyncData.map(threads, () => next),
+  });
+  // Clamped against what is on screen: the tab filter can shorten the list
+  // well past where the stored rows end.
+  const lastIndex = listedRows(patched).length - 1;
+  return evo(patched, {
     maybeSelected: (maybeSelected) =>
       Option.filter(
         Option.map(maybeSelected, (index) => Math.min(index, lastIndex)),
@@ -480,7 +534,7 @@ const enqueueForRow = (
   toOp: (row: ThreadRow) => OutboxOp,
 ): UpdateReturn =>
   Option.match(
-    Arr.findFirst(listedRows(model), (row) => row.id === id),
+    Arr.findFirst(storedRows(model), (row) => row.id === id),
     {
       onNone: (): UpdateReturn => [model, []],
       onSome: (row) => [model, [EnqueueOp({ op: toOp(row) })]],
@@ -658,7 +712,7 @@ const stepSync = (model: Model, message: SyncMachine.Message): UpdateReturn => {
   const syncCommands = [
     ...Command.mapMessages(commands, (message) => GotSyncMessage({ message })),
     ...(shouldRefreshRows(model.sync, message)
-      ? [LoadInbox(), ReadLocalSize()]
+      ? [LoadFolder({ folder: model.folder }), ReadLocalSize()]
       : []),
   ];
   const stepped = evo(model, { sync: () => nextSync });
@@ -737,27 +791,45 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     M.withReturnType<UpdateReturn>(),
     M.tagsExhaustive({
       GotFolderMenuMessage: ({ message }) => {
-        const [nextFolderMenu, commands] = FolderMenu.update(
+        const [nextFolderMenu, commands, maybeSelected] = FolderMenu.update(
           model.folderMenu,
           message,
         );
-        return [
-          evo(model, { folderMenu: () => nextFolderMenu }),
-          Command.mapMessages(commands, (message) =>
-            GotFolderMenuMessage({ message }),
-          ),
-        ];
+        const stepped = evo(model, { folderMenu: () => nextFolderMenu });
+        const mapped = Command.mapMessages(commands, (message) =>
+          GotFolderMenuMessage({ message }),
+        );
+        // Picking an item is picking a mailbox.
+        return Option.match(maybeSelected, {
+          onNone: (): UpdateReturn => [stepped, mapped],
+          onSome: ({ value }) => {
+            const [next, switchCommands] = switchFolder(stepped, value);
+            return [next, [...mapped, ...switchCommands]];
+          },
+        });
       },
 
       CompletedApplyAppearance: () => [model, []],
 
       GotTabsMessage: ({ message }) => {
         const [nextTabs, commands] = Ui.Tabs.update(model.tabs, message);
+        // A tab commit re-slices the already-loaded rows (visibleRows); the
+        // cursor and scroll reset because their positions belonged to the
+        // previous slice.
+        const isTabChanged =
+          nextTabs.selectedValue !== model.tabs.selectedValue;
         return [
-          evo(model, { tabs: () => nextTabs }),
-          Command.mapMessages(commands, (message) =>
-            GotTabsMessage({ message }),
-          ),
+          evo(model, {
+            tabs: () => nextTabs,
+            maybeSelected: (maybeSelected) =>
+              isTabChanged ? Option.none() : maybeSelected,
+          }),
+          [
+            ...Command.mapMessages(commands, (message) =>
+              GotTabsMessage({ message }),
+            ),
+            ...(isTabChanged ? [ScrollListToRow({ index: 0 })] : []),
+          ],
         ];
       },
 
@@ -801,19 +873,23 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
       ClickedRow: ({ id, index }) => openThread(model, id, index),
 
-      // Opening runs the empty search, so the palette paints its "recent"
-      // list in the same frame the dialog appears rather than a beat later.
+      // The palette opens blank: results follow typing, never precede it.
+      // The seq bump orphans any search still in flight from the previous
+      // session, so a late reply can't repopulate an empty palette.
       ToggledPalette: () => {
         const [nextPalette, commands] = InboxPalette.toggle(model.palette);
-        const opened = evo(model, { palette: () => nextPalette });
-        const paletteCommands = Command.mapMessages(commands, (message) =>
-          GotPaletteMessage({ message }),
-        );
-        if (!nextPalette.dialog.isOpen) {
-          return [opened, paletteCommands];
-        }
-        const [next, searchCommands] = runSearch(opened, "");
-        return [next, [...paletteCommands, ...searchCommands]];
+        const opened = evo(model, {
+          palette: () => nextPalette,
+          searchResults: (): ReadonlyArray<ThreadRow> => [],
+          searchSeq: Number.increment,
+          maybeSearchError: () => Option.none(),
+        });
+        return [
+          opened,
+          Command.mapMessages(commands, (message) =>
+            GotPaletteMessage({ message }),
+          ),
+        ];
       },
 
       GotPaletteMessage: ({ message }) => {
@@ -836,6 +912,19 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           onNone: (): UpdateReturn => {
             if (message._tag !== "ChangedQuery") {
               return [stepped, paletteCommands];
+            }
+            // Deleting back to nothing returns to the blank palette rather
+            // than to "every thread matches the empty string". The seq bump
+            // orphans the in-flight search for the last real keystroke.
+            if (message.query.trim() === "") {
+              return [
+                evo(stepped, {
+                  searchResults: (): ReadonlyArray<ThreadRow> => [],
+                  searchSeq: Number.increment,
+                  maybeSearchError: () => Option.none(),
+                }),
+                paletteCommands,
+              ];
             }
             const [next, searchCommands] = runSearch(stepped, message.query);
             return [next, [...paletteCommands, ...searchCommands]];
@@ -883,34 +972,40 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // The boot top read: paints as `Refreshing` (the full read is still in
       // flight) unless a sync-triggered full read already settled the list,
       // in which case the newer, complete rows win and the top slice is
-      // dropped. Either way the follow-up commands fire, exactly once.
+      // dropped. The rows are inbox rows, so a folder switched away from
+      // before they landed also drops them. Either way the follow-up
+      // commands fire, exactly once, for whatever folder is current.
       SucceededLoadInboxTop: ({ rows }) => [
-        model.threads._tag === "Success"
+        model.threads._tag === "Success" || model.folder !== "inbox"
           ? model
           : evo(model, {
               threads: () =>
                 AsyncData.Refreshing({
-                  data: reconcileRows(listedRows(model), rows),
+                  data: reconcileRows(storedRows(model), rows),
                 }),
             }),
-        afterTopReadCommands(),
+        afterTopReadCommands(model.folder),
       ],
 
       // The full read that follows either succeeds or owns the error report;
       // a failed top read stays silent so the user never sees an error for a
       // query whose only job was an early paint.
-      FailedLoadInboxTop: () => [model, afterTopReadCommands()],
+      FailedLoadInboxTop: () => [model, afterTopReadCommands(model.folder)],
 
-      // Reconciled against the rows already on screen so unchanged threads
-      // keep their object identity and the view can memoize past them.
-      SucceededLoadInbox: ({ rows }) => [
-        evo(model, {
-          threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
-            Result.succeed(reconcileRows(listedRows(model), rows)),
-          ),
-        }),
-        [],
-      ],
+      // Reconciled against the rows already loaded so unchanged threads keep
+      // their object identity and the view can memoize past them. A read for
+      // a folder no longer current lost a race to a switch and is dropped.
+      SucceededLoadFolder: ({ folder, rows }) =>
+        folder !== model.folder
+          ? [model, []]
+          : [
+              evo(model, {
+                threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
+                  Result.succeed(reconcileRows(storedRows(model), rows)),
+                ),
+              }),
+              [],
+            ],
 
       GotSyncMessage: ({ message }) => stepSync(model, message),
 
@@ -938,14 +1033,17 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       ],
       FailedCacheImageBatch: () => [model, [CacheImageBatch()]],
 
-      FailedLoadInbox: ({ error }) => [
-        evo(model, {
-          threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
-            Result.fail(error),
-          ),
-        }),
-        [],
-      ],
+      FailedLoadFolder: ({ folder, error }) =>
+        folder !== model.folder
+          ? [model, []]
+          : [
+              evo(model, {
+                threads: AsyncData.settle<ReadonlyArray<ThreadRow>, string>(
+                  Result.fail(error),
+                ),
+              }),
+              [],
+            ],
 
       SucceededLoadThread: ({ detail }) => {
         // Only the load we're still waiting for counts — anything else is a

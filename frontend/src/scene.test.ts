@@ -225,14 +225,12 @@ describe("the inbox", () => {
   });
 
   // The list container starts Unmeasured — no ResizeObserver fires in a
-  // Scene — so the virtual window is empty; the assertion is that the section
-  // and the list container are present and the submodel's viewInputs pass
-  // foldkit's walker.
+  // Scene — so the virtual window is empty; the assertion is that the list
+  // container is present and the submodel's viewInputs pass foldkit's walker.
   test("with rows, it renders the list section", () => {
     Scene.scene(
       { update, view },
       Scene.with(inboxWith({ threads: AsyncData.succeed([threadRow]) })),
-      Scene.expect(Scene.text("Inbox")).toExist(),
       Scene.expect(Scene.role("list")).toExist(),
     );
   });
@@ -302,7 +300,7 @@ describe("the inbox", () => {
           }),
         }),
       ),
-      Scene.expect(Scene.text("Your inbox is empty.")).toExist(),
+      Scene.expect(Scene.text("Nothing here.")).toExist(),
     );
   });
 

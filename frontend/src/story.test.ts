@@ -116,7 +116,9 @@ const loadedInbox = (): Model => {
   const [model] = init(loggedInFlags, url("/inbox"));
   const [withThreads] = update(
     model,
-    inboxMessage(Inbox.SucceededLoadInbox({ rows: [threadRow] })),
+    inboxMessage(
+      Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+    ),
   );
   return withThreads;
 };
@@ -307,7 +309,9 @@ describe("loading the inbox", () => {
     const [model] = init(loggedInFlags, url("/inbox"));
     const [next] = update(
       model,
-      inboxMessage(Inbox.SucceededLoadInbox({ rows: [threadRow] })),
+      inboxMessage(
+        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+      ),
     );
 
     expect(next.inboxPage.threads._tag).toBe("Success");
@@ -317,7 +321,9 @@ describe("loading the inbox", () => {
     const [model] = init(loggedInFlags, url("/inbox"));
     const [next] = update(
       model,
-      inboxMessage(Inbox.FailedLoadInbox({ error: "sqlite is unhappy" })),
+      inboxMessage(
+        Inbox.FailedLoadFolder({ folder: "inbox", error: "sqlite is unhappy" }),
+      ),
     );
 
     expect(next.inboxPage.threads._tag).toBe("Failure");
@@ -332,7 +338,7 @@ describe("loading the inbox", () => {
 
     expect(next.inboxPage.threads._tag).toBe("Refreshing");
     expect(commands.map((command) => command.name)).toEqual([
-      "LoadInbox",
+      "LoadFolder",
       "ReadLocalSize",
       "CacheImageBatch",
     ]);
@@ -347,7 +353,7 @@ describe("loading the inbox", () => {
 
     expect(next.inboxPage.threads._tag).toBe("Loading");
     expect(commands.map((command) => command.name)).toEqual([
-      "LoadInbox",
+      "LoadFolder",
       "ReadLocalSize",
       "CacheImageBatch",
     ]);
@@ -403,7 +409,9 @@ describe("inbox snapshot seed", () => {
     );
     const [, commands] = update(
       afterTop,
-      inboxMessage(Inbox.SucceededLoadInbox({ rows: [threadRow] })),
+      inboxMessage(
+        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+      ),
     );
 
     expect(commands.map((command) => command.name)).toContain("SaveSnapshot");
@@ -412,7 +420,7 @@ describe("inbox snapshot seed", () => {
   test("an empty inbox writes no snapshot", () => {
     const [, commands] = update(
       loadedInbox(),
-      inboxMessage(Inbox.SucceededLoadInbox({ rows: [] })),
+      inboxMessage(Inbox.SucceededLoadFolder({ folder: "inbox", rows: [] })),
     );
 
     expect(commands.map((command) => command.name)).not.toContain(
@@ -453,6 +461,41 @@ describe("opening a thread", () => {
     );
   });
 
+  // Opening is reading. The dot clears through the same outbox op as the
+  // explicit toggle — optimistic locally, durable to Gmail.
+  test("opening an unread thread queues the mark-read op", () => {
+    const unread = { ...threadRow, isUnread: true };
+    const [base] = init(loggedInFlags, url("/inbox"));
+    const [model] = update(
+      base,
+      inboxMessage(
+        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [unread] }),
+      ),
+    );
+
+    const [, commands] = update(
+      model,
+      inboxMessage(Inbox.ClickedRow({ id: unread.id, index: 0 })),
+    );
+
+    expect(commands.map((command) => command.name)).toEqual([
+      "EnqueueOp",
+      "LoadThread",
+    ]);
+    expect(commands[0]?.args).toMatchObject({
+      op: { _tag: "ModifyThreadLabels", removeLabelIds: ["UNREAD"] },
+    });
+  });
+
+  test("opening an already-read thread queues nothing", () => {
+    const [, commands] = update(
+      loadedInbox(),
+      inboxMessage(Inbox.ClickedRow({ id: threadRow.id, index: 0 })),
+    );
+
+    expect(commands.map((command) => command.name)).toEqual(["LoadThread"]);
+  });
+
   test("a thread that fails to load drops back to the list with the error", () => {
     Story.story(
       update,
@@ -486,7 +529,12 @@ describe("opening a thread", () => {
       // New mail arrives and takes over index 0. The changed top slice also
       // triggers the localStorage snapshot write.
       Story.message(
-        inboxMessage(Inbox.SucceededLoadInbox({ rows: [otherRow, threadRow] })),
+        inboxMessage(
+          Inbox.SucceededLoadFolder({
+            folder: "inbox",
+            rows: [otherRow, threadRow],
+          }),
+        ),
       ),
       Story.Command.resolve(SaveSnapshot, CompletedSnapshotPersistence()),
       // The click the user began before that refresh landed.
@@ -693,7 +741,7 @@ describe("backfill list refresh", () => {
       inboxPage: { ...model.inboxPage, sync: backfillingAt(before) },
     };
     const [, commands] = update(seeded, batchLanding(after));
-    return commands.some((command) => command.name === "LoadInbox");
+    return commands.some((command) => command.name === "LoadFolder");
   };
 
   test("every page repaints while inside the priority window", () => {
@@ -763,7 +811,7 @@ describe("optimistic flag actions", () => {
     const [model, commands] = update(loadedInbox(), starPatch(true));
 
     expect(rowsOf(model)[0]?.isStarred).toBe(true);
-    expect(commands.map((command) => command.name)).not.toContain("LoadInbox");
+    expect(commands.map((command) => command.name)).not.toContain("LoadFolder");
   });
 
   test("archiving takes the row out of the list", () => {
@@ -965,5 +1013,33 @@ describe("dismissing the compose panel", () => {
     expect(commands.map((command) => command.name)).toEqual([
       "FocusComposeField",
     ]);
+  });
+});
+
+describe("folders and category tabs", () => {
+  test("a folder read that lost a race to a switch is dropped", () => {
+    const model = loadedInbox();
+    const [next] = update(
+      model,
+      inboxMessage(Inbox.SucceededLoadFolder({ folder: "sent", rows: [] })),
+    );
+
+    expect(next.inboxPage.threads).toBe(model.inboxPage.threads);
+  });
+
+  test("each tab keeps its own category; primary owns the uncategorized", () => {
+    const social = {
+      ...threadRow,
+      id: ThreadId.make("thread-social"),
+      category: "social" as const,
+    };
+
+    expect(Inbox.filterRowsForTab([threadRow, social], "Primary")).toEqual([
+      threadRow,
+    ]);
+    expect(Inbox.filterRowsForTab([threadRow, social], "Social")).toEqual([
+      social,
+    ]);
+    expect(Inbox.filterRowsForTab([threadRow, social], "Forums")).toEqual([]);
   });
 });

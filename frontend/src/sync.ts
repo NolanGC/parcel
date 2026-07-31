@@ -17,12 +17,16 @@ import { ts } from "foldkit/schema";
 
 import {
   Gmail,
+  DRAFT_LABEL,
   HistoryId,
   INBOX_LABEL,
   LabelId,
   MessageId,
+  SENT_LABEL,
+  SPAM_LABEL,
   STARRED_LABEL,
   ThreadId,
+  TRASH_LABEL,
   UNREAD_LABEL,
   type GmailError,
   type History as GmailHistory,
@@ -63,6 +67,32 @@ export const ThreadCategory = S.Literals([
   "none",
 ]);
 export type ThreadCategory = typeof ThreadCategory.Type;
+
+/** The mailboxes the folder menu can show. Each is a slice of the threads
+ *  table, decided by the system-label flags extracted at sync time. */
+export const Folder = S.Literals([
+  "inbox",
+  "starred",
+  "sent",
+  "drafts",
+  "spam",
+  "trash",
+  "all",
+]);
+export type Folder = typeof Folder.Type;
+
+// Which slice of the threads table each folder is. Spam and trash are their
+// own places and excluded everywhere else, mirroring Gmail's own semantics
+// ("All Mail" hides both).
+const FOLDER_WHERE: Record<Folder, string> = {
+  inbox: "in_inbox = 1 AND is_spam = 0 AND is_trash = 0",
+  starred: "is_starred = 1 AND is_spam = 0 AND is_trash = 0",
+  sent: "is_sent = 1 AND is_spam = 0 AND is_trash = 0",
+  drafts: "is_draft = 1 AND is_spam = 0 AND is_trash = 0",
+  spam: "is_spam = 1",
+  trash: "is_trash = 1",
+  all: "is_spam = 0 AND is_trash = 0",
+};
 
 /** One inbox list row. `date` is epoch milliseconds. */
 export const ThreadRow = S.Struct({
@@ -518,6 +548,10 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             // Archiving is just the removal of this label, so re-reading it
             // on every sync is what lets a thread leave the local inbox.
             in_inbox: hasLabel(messages, INBOX_LABEL) ? 1 : 0,
+            is_sent: hasLabel(messages, SENT_LABEL) ? 1 : 0,
+            is_draft: hasLabel(messages, DRAFT_LABEL) ? 1 : 0,
+            is_spam: hasLabel(messages, SPAM_LABEL) ? 1 : 0,
+            is_trash: hasLabel(messages, TRASH_LABEL) ? 1 : 0,
             category: threadCategory(messages),
           },
         ])}`;
@@ -796,8 +830,8 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           // and a mailbox resuming mid-backfill never re-primes, so it would
           // keep whatever number the last prime wrote. Refreshed once per boot,
           // best-effort: a progress denominator is not worth failing a boot over.
-          const totalEstimate = yield* gmail.getLabel(INBOX_LABEL).pipe(
-            Effect.map((label) => label.threadsTotal ?? row.total_estimate),
+          const totalEstimate = yield* gmail.getProfile.pipe(
+            Effect.map((profile) => profile.threadsTotal),
             Effect.catchCause(() => Effect.succeed(row.total_estimate)),
           );
           if (totalEstimate !== row.total_estimate) {
@@ -821,12 +855,11 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       const primeInbox: Effect.Effect<PrimeResult, GmailError | SqlError> =
         Effect.gen(function* () {
           const profile = yield* gmail.getProfile;
-          // NOTE: The backfill only ever walks INBOX, so the denominator has
-          // to be the INBOX label's own count. profile.threadsTotal counts the
-          // entire mailbox, which reads as a bar that stalls at a few percent
-          // and then declares itself done.
-          const inboxLabel = yield* gmail.getLabel(INBOX_LABEL);
-          const totalEstimate = inboxLabel.threadsTotal ?? profile.threadsTotal;
+          // The backfill walks the entire mailbox (see syncBatch), so the
+          // profile's own thread count is the denominator. The prime page
+          // still lists INBOX only: the boot view is the inbox, and these 15
+          // threads exist to fill its first screen.
+          const totalEstimate = profile.threadsTotal;
           const page = yield* gmail.listThreads({
             labelIds: [INBOX_LABEL],
             maxResults: PULL_LIMIT,
@@ -867,9 +900,12 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         previousCount: number,
       ): Effect.Effect<BatchResult, GmailError | SqlError> =>
         Effect.gen(function* () {
+          // The whole mailbox, not just INBOX: sent, drafts, archived — and
+          // spam/trash, which threads.list omits unless asked — all land in
+          // the store, because the folder views are local queries over it.
           const page = yield* gmail.listThreads({
-            labelIds: [INBOX_LABEL],
             maxResults: LIST_PAGE_SIZE,
+            includeSpamTrash: true,
             ...Option.match(maybePageToken, {
               onNone: () => ({}),
               onSome: (pageToken) => ({ pageToken }),
@@ -1171,30 +1207,43 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
 
       // READS
 
-      // The whole store, newest first. VirtualList renders a fixed window
-      // regardless of length, so the full mailbox rides in the model. Never
-      // touches the network: filling the store is the sync machine's job.
-      const loadInbox = Effect.gen(function* () {
-        const raw = yield* sql`
-          SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
-          FROM threads
-          WHERE in_inbox = 1
-          ORDER BY latest_date DESC
-        `;
-        return yield* decodeThreadRows(raw);
-      });
+      // One folder's rows, newest first. Never touches the network: filling
+      // the store is the sync machine's job.
+      //
+      // NOTE: Capped at HOT_THREAD_COUNT, deliberately NOT the whole store.
+      // "VirtualList renders a fixed window so the full mailbox can ride in
+      // the model" was this query's original justification, and it held right
+      // up until a mailbox finished backfilling: at 30k rows every
+      // O(modelSize) walk outside the view got the bill — foldkit's HMR model
+      // preservation most fatally, which encodes the entire Model and sends
+      // it over the vite websocket on every quiet window. At ~15MB per
+      // preserve the socket died, and the vite client answers a dead socket
+      // with location.reload() — the dev tab reloaded in a metronomic loop.
+      // The cap is the same tier the image cache calls hot, and everything
+      // past it is a search away; SQL remains the authority for the mailbox.
+      const loadFolder = (folder: Folder) =>
+        Effect.gen(function* () {
+          const raw = yield* sql`
+            SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
+            FROM threads
+            WHERE ${sql.literal(FOLDER_WHERE[folder])}
+            ORDER BY latest_date DESC
+            LIMIT ${HOT_THREAD_COUNT}
+          `;
+          return yield* decodeThreadRows(raw);
+        });
 
-      // The boot-only first read: the viewport's worth of rows in O(limit),
-      // served by the (in_inbox, latest_date DESC) index. The full loadInbox
-      // follows it and settles the list. Runs once per boot, which is what
-      // makes it the right home for the boot-query bracket.
+      // The boot-only first read: the viewport's worth of inbox rows in
+      // O(limit), served by the (in_inbox, latest_date DESC) index. The full
+      // loadFolder follows it and settles the list. Runs once per boot, which
+      // is what makes it the right home for the boot-query bracket.
       const loadInboxTop = (limit: number) =>
         Effect.gen(function* () {
           yield* mark(BOOT_QUERY_START);
           const raw = yield* sql`
             SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
             FROM threads
-            WHERE in_inbox = 1
+            WHERE ${sql.literal(FOLDER_WHERE.inbox)}
             ORDER BY latest_date DESC
             LIMIT ${limit}
           `;
@@ -1346,7 +1395,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
 
       return {
         cacheImageBatch,
-        loadInbox,
+        loadFolder,
         loadInboxTop,
         loadThread,
         localSizeBytes,

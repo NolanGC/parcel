@@ -2,24 +2,29 @@
 
 import { Array as Arr, Match as M, Option } from "effect";
 import { AsyncData, Submodel } from "foldkit";
-import { createKeyedLazy, createLazy, html, type Html } from "foldkit/html";
+import { createLazy, html, type Html } from "foldkit/html";
 
 import * as Icon from "../../icons";
 import { ThreadId } from "../../Gmail";
 import { renderMarkdownToEmailHtml } from "../../markdown";
 import * as OutboxMachine from "../../outboxMachine";
-import { ThreadDetail, ThreadRow, type MessageDetail } from "../../sync";
+import {
+  ThreadDetail,
+  ThreadRow,
+  type Folder,
+  type MessageDetail,
+  type ThreadCategory,
+} from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
+import { createCappedKeyedLazy } from "../../ui/lazy";
 
 import {
   AVATAR_BG,
   AVATAR_FG,
   Appearance,
   BODY_FRAME_HEIGHT,
-  CATEGORIES,
-  CATEGORY_FROM_THREAD,
-  type Category,
+  CATEGORY_PILLS,
   ClickedAppearance,
   ClickedArchiveRow,
   ClickedBack,
@@ -38,8 +43,8 @@ import {
   EditedCompose,
   EnteredList,
   ExitedList,
-  FOLDERS,
-  FOLDER_LABELS,
+  FOLDER_CONFIG,
+  FOLDER_ITEMS,
   FolderMenu,
   GotAccountPopoverMessage,
   GotFolderMenuMessage,
@@ -67,7 +72,10 @@ import {
   RECENT_READY_LINE,
   formatTime,
   tabSpec,
+  type TabCounts,
   threadItemSpec,
+  unreadTabCounts,
+  visibleRows,
 } from "./model";
 
 // VIEW
@@ -76,26 +84,22 @@ import {
 // which missed the cluster's memoization slot no matter what the Model did.
 const FOLDER_BUTTON_CLASS = `flex items-center gap-2 rounded-lg bg-hover px-2.5 py-1.5 font-medium text-foreground hover:bg-active ${Ui.hoverTransition}`;
 
-const DEFAULT_FOLDER = "All Inbox";
+// Curried so the returned function sits at the top level of viewInputs (the
+// submodel boundary auto-scopes functions there, and only there).
+const folderItemSpec = (folder: Folder) => (item: Folder) => ({
+  icon: FOLDER_CONFIG[item].icon,
+  label: FOLDER_CONFIG[item].label,
+  isChecked: item === folder,
+});
 
-const folderItemSpec = (item: (typeof FOLDER_LABELS)[number]) => {
-  const { icon, count } = FOLDERS[item];
-  return {
-    icon,
-    label: item,
-    detail: count === undefined ? undefined : String(count),
-    isChecked: item === DEFAULT_FOLDER,
-  };
-};
-
-const folderButtonContent = (): Html => {
+const folderButtonContent = (folder: Folder): Html => {
   const h = html();
+  const { icon, label } = FOLDER_CONFIG[folder];
   return h.span(
     [h.Class("flex items-center gap-2")],
     [
-      Icon.inbox("h-[18px] w-[18px]"),
-      h.span([], ["All"]),
-      h.span([h.Class("text-muted-foreground")], ["199"]),
+      icon("h-[18px] w-[18px]"),
+      h.span([], [label]),
       Icon.chevronsUpDown("h-4 w-4 text-muted-foreground"),
     ],
   );
@@ -478,6 +482,8 @@ const lazyAccountCluster = createLazy();
 const folderClusterView = (
   folderMenu: Model["folderMenu"],
   tabs: Model["tabs"],
+  folder: Folder,
+  counts: TabCounts,
 ): Html => {
   const h = html<Message>();
   return h.div(
@@ -488,35 +494,39 @@ const folderClusterView = (
         model: folderMenu,
         view: FolderMenu.view,
         viewInputs: {
-          items: FOLDER_LABELS,
-          itemSpec: folderItemSpec,
-          buttonContent: folderButtonContent(),
+          items: FOLDER_ITEMS,
+          itemSpec: folderItemSpec(folder),
+          buttonContent: folderButtonContent(folder),
           buttonClassName: FOLDER_BUTTON_CLASS,
           ariaLabel: "Mail folders",
           substrate: PAGE_SURFACE,
         },
         toParentMessage: (message) => GotFolderMenuMessage({ message }),
       }),
-      h.nav(
-        [h.Class("flex items-center gap-2")],
-        [
-          h.submodel({
-            slotId: "inbox-tabs",
-            model: tabs,
-            view: Ui.Tabs.view,
-            viewInputs: {
-              tabs: TAB_LABELS,
-              tabSpec,
-              ariaLabel: "Mail categories",
-            },
-            toParentMessage: (message) => GotTabsMessage({ message }),
-          }),
-          Ui.button(
-            { variant: "ghost", size: "icon-sm", ariaLabel: "Add filter" },
-            [Icon.plus("h-[18px] w-[18px]")],
+      // Category tabs are an inbox concept — Gmail's own, and ours — so
+      // every other folder shows the plain list without them.
+      folder !== "inbox"
+        ? h.empty
+        : h.nav(
+            [h.Class("flex items-center gap-2")],
+            [
+              h.submodel({
+                slotId: "inbox-tabs",
+                model: tabs,
+                view: Ui.Tabs.view,
+                viewInputs: {
+                  tabs: TAB_LABELS,
+                  tabSpec: tabSpec(counts),
+                  ariaLabel: "Mail categories",
+                },
+                toParentMessage: (message) => GotTabsMessage({ message }),
+              }),
+              Ui.button(
+                { variant: "ghost", size: "icon-sm", ariaLabel: "Add filter" },
+                [Icon.plus("h-[18px] w-[18px]")],
+              ),
+            ],
           ),
-        ],
-      ),
     ],
   );
 };
@@ -587,7 +597,14 @@ const toolbarView = (model: Model, profile: Profile): Html => {
   return h.header(
     [h.Class("flex items-center justify-between gap-4 px-5 py-3")],
     [
-      lazyFolderCluster(folderClusterView, [model.folderMenu, model.tabs]),
+      lazyFolderCluster(folderClusterView, [
+        model.folderMenu,
+        model.tabs,
+        model.folder,
+        unreadTabCounts(
+          Option.getOrElse(AsyncData.getData(model.threads), () => []),
+        ),
+      ]),
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
@@ -622,24 +639,37 @@ const senderTile = (label: string): Html => {
   );
 };
 
-const categoryTagView = (category: Category): Html => {
+// The thread's real Gmail category. Primary rows wear nothing: primary is
+// the absence of a category (see CATEGORY_PILLS).
+const categoryTagView = (category: ThreadCategory): Html => {
   const h = html();
-  const { label, icon, iconClass } = CATEGORIES[category];
-  return h.span(
-    [
-      h.Class(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-md bg-hover px-2 py-1 text-xs font-medium text-muted-foreground",
+  return Option.match(CATEGORY_PILLS[category], {
+    onNone: () => h.empty,
+    onSome: ({ label, icon, iconClass }) =>
+      h.span(
+        [
+          h.Class(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md bg-hover px-2 py-1 text-xs font-medium text-muted-foreground",
+          ),
+        ],
+        [icon(`h-3.5 w-3.5 ${iconClass}`, "2.25"), label],
       ),
-    ],
-    [icon(`h-3.5 w-3.5 ${iconClass}`, "2.25"), label],
-  );
+  });
 };
 
-const lazyThreadRow = createKeyedLazy();
+// Several scroll windows' worth, so scrolling back over what you just passed
+// still hits. The ceiling is what matters, not the exact number: without one,
+// this cache retains a detached row subtree per thread ever scrolled past.
+const ROW_MEMO_CAPACITY = 200;
+
+const lazyThreadRow = createCappedKeyedLazy(ROW_MEMO_CAPACITY);
 
 // One list row. Carries no hover background of its own — the traveling
 // overlay (listOverlayView) is the single highlight for mouse and keyboard.
 // The row height is fixed by the VirtualList; content just fills and centers.
+//
+// Nothing here depends on the cursor, so a row is a pure function of its own
+// data and moving the selection rebuilds nothing.
 const threadRowView = (row: ThreadRow, index: number): Html => {
   const h = html<Message>();
   const tone = row.isUnread ? "text-foreground" : "text-muted-foreground";
@@ -712,12 +742,10 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
         [
-          categoryTagView(CATEGORY_FROM_THREAD[row.category]),
-          // The star reads at a glance without hovering, which is the whole
-          // point of a star; the button that sets it is in the actions.
-          ...(row.isStarred
-            ? [Icon.star("h-4 w-4 shrink-0 fill-amber-400 text-amber-400", "2")]
-            : []),
+          categoryTagView(row.category),
+          // Always mounted, so a star can be set, unset, or hovered without
+          // anything in the row moving a pixel.
+          rowStarView(row),
           h.span(
             [
               h.Class(
@@ -730,18 +758,6 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
         ],
       ),
     ],
-  );
-};
-
-const sectionHeaderView = (label: string): Html => {
-  const h = html();
-  return h.div(
-    [
-      h.Class(
-        "border-b border-border py-2.5 text-center text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70",
-      ),
-    ],
-    [label],
   );
 };
 
@@ -779,6 +795,7 @@ const rowActionView = (
   icon: Ui.IconView,
   iconClass: string,
   message: Message,
+  containerClass = "",
 ): Html => {
   const h = html<Message>();
   return h.button(
@@ -788,35 +805,47 @@ const rowActionView = (
       h.Title(label),
       h.OnClick(message),
       h.Class(
-        `flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition}`,
+        `flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground outline-none hover:bg-active hover:text-foreground focus-visible:ring-1 focus-visible:ring-focus-ring ${Ui.hoverTransition} ${containerClass}`,
       ),
     ],
     [icon(`h-4 w-4 ${iconClass}`)],
   );
 };
 
-// The row's own actions, revealed by hover or by focus.
+// The star, which is both the indicator and the control — one element in one
+// place, always mounted and always visible.
+//
+// NOTE: Not part of rowActionsView, and that is the whole point. As a
+// read-only indicator on the left of the timestamp plus a star BUTTON inside
+// the actions on the right of it, the star appeared to hop across the
+// timestamp on hover. There is only one star now, and it never moves: only
+// its color changes, amber when set and muted when not.
+const rowStarView = (row: ThreadRow): Html =>
+  rowActionView(
+    row.isStarred ? "Unstar" : "Star",
+    Icon.star,
+    row.isStarred ? "fill-amber-400 text-amber-400" : "",
+    ClickedStarRow({ id: row.id }),
+  );
+
+// The row's own actions.
 //
 // NOTE: In the row rather than in the traveling overlay, because the overlay
 // reaches the VirtualList through `viewInputs` and foldkit rejects interactive
-// Html there (it walks viewInputs and throws on nested functions). The cost is
-// bounded anyway: the list only ever mounts its visible window, so this is
-// three buttons per visible row, not per thread.
+// Html there (it walks viewInputs and throws on nested functions).
+//
+// Always mounted and always visible — nothing here reacts to hover but the
+// buttons' own background. Revealing them on hover meant the icons popped in
+// under the cursor, and fading them in per row made a list that flickers as
+// you move down it. They are muted enough to read as chrome until wanted.
+//
+// That they never change also means a row's view does not depend on which row
+// is hovered, so moving the cursor down the list rebuilds no rows at all.
 const rowActionsView = (row: ThreadRow): Html => {
   const h = html<Message>();
   return h.div(
+    [h.Class("flex shrink-0 items-center gap-0.5")],
     [
-      h.Class(
-        `flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 ${Ui.hoverTransition}`,
-      ),
-    ],
-    [
-      rowActionView(
-        row.isStarred ? "Unstar" : "Star",
-        Icon.star,
-        row.isStarred ? "fill-amber-400 text-amber-400" : "",
-        ClickedStarRow({ id: row.id }),
-      ),
       rowActionView(
         row.isUnread ? "Mark as read" : "Mark as unread",
         row.isUnread ? Icon.mailOpen : Icon.mail,
@@ -884,7 +913,8 @@ const listSubmodelView = (
       itemToKey: (row: ThreadRow) => row.id,
       // NOTE: One memo slot per thread id. Rows keep identity across a
       // refresh (see reconcileRows), so a sync tick that changed nothing in
-      // the visible window rebuilds no rows.
+      // the visible window rebuilds no rows — and neither does moving the
+      // cursor, since a row renders the same whether or not it is hovered.
       itemToView: (row: ThreadRow, index: number) =>
         lazyThreadRow(row.id, threadRowView, [row, index]),
       overscan: LIST_OVERSCAN,
@@ -946,16 +976,17 @@ const listBodyView = (
   maybeError: Option.Option<string>,
 ): ReadonlyArray<Html> => [
   ...Arr.fromOption(Option.map(maybeError, statusRowView)),
-  Arr.match(rows, {
+  // The tab narrowing happens here, at the last moment before the list, so
+  // everything above (error rows, the AsyncData states) sees the folder's
+  // full rows.
+  Arr.match(visibleRows(model, rows), {
     onEmpty: () =>
       statusRowView(
         // NOTE: A cold store while the machine is still filling it isn't
         // empty, it's early. The first primed rows land within a second or two.
-        isSyncFilling(model.sync)
-          ? "Syncing your inbox…"
-          : "Your inbox is empty.",
+        isSyncFilling(model.sync) ? "Syncing your mail…" : "Nothing here.",
       ),
-    onNonEmpty: () => virtualListView(model, rows),
+    onNonEmpty: (visible) => virtualListView(model, visible),
   }),
 ];
 
@@ -982,10 +1013,7 @@ const listSectionView = (model: Model): Html => {
     onStale: ({ error, data }) => listBodyView(model, data, Option.some(error)),
   });
 
-  return h.div(
-    [h.Class("flex min-h-0 flex-1 flex-col")],
-    [sectionHeaderView("Inbox"), ...body],
-  );
+  return h.div([h.Class("flex min-h-0 flex-1 flex-col")], body);
 };
 
 // THREAD DETAIL
@@ -1079,7 +1107,12 @@ const messageCardView = (message: MessageDetail): Html => {
 // Keyed by thread id rather than a single slot: reopening a thread you had
 // open before should not have to rebuild its iframes, and srcdocFor rebuilds
 // the whole body string every time it runs.
-const lazyThreadDetail = createKeyedLazy();
+// Far smaller than the row cap, because each entry is far larger: a thread's
+// whole rendered body, iframes and all. A handful covers going back and forth
+// between the threads you are actually reading.
+const DETAIL_MEMO_CAPACITY = 10;
+
+const lazyThreadDetail = createCappedKeyedLazy(DETAIL_MEMO_CAPACITY);
 
 const SENDING_CHIP_CLASS =
   "flex shrink-0 items-center gap-1.5 rounded-lg bg-hover px-2 py-1 text-[12px] text-muted-foreground";
@@ -1336,7 +1369,11 @@ const paletteView = (
       ],
       itemSpec: (item: ThreadId) => specs.get(item) ?? { label: item },
       placeholder: "Search your mail…",
-      emptyLabel: Option.getOrElse(maybeSearchError, () => "No results"),
+      // A blank query has no results by design (results follow typing), and
+      // "No results" would read as a verdict on a search never made.
+      emptyLabel: Option.getOrElse(maybeSearchError, () =>
+        palette.query.trim() === "" ? "Type to search your mail" : "No results",
+      ),
       substrate: PAGE_SURFACE,
     },
     toParentMessage: (message) => GotPaletteMessage({ message }),

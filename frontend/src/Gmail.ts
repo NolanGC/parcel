@@ -37,12 +37,17 @@ export const LabelId = S.NonEmptyString.pipe(S.brand("GmailLabelId"));
 export type LabelId = typeof LabelId.Type;
 
 // The system labels the app reads and writes. Every mailbox state the UI
-// exposes is one of these: in the inbox, unread, starred. Named once here
-// because both the sync's extraction and the outbox's label edits key off
-// them, and a typo in either place is a silent no-op rather than an error.
+// exposes is one of these: which folder a thread lives in, unread, starred.
+// Named once here because both the sync's extraction and the outbox's label
+// edits key off them, and a typo in either place is a silent no-op rather
+// than an error.
 export const INBOX_LABEL = LabelId.make("INBOX");
 export const UNREAD_LABEL = LabelId.make("UNREAD");
 export const STARRED_LABEL = LabelId.make("STARRED");
+export const SENT_LABEL = LabelId.make("SENT");
+export const DRAFT_LABEL = LabelId.make("DRAFT");
+export const SPAM_LABEL = LabelId.make("SPAM");
+export const TRASH_LABEL = LabelId.make("TRASH");
 
 export const AttachmentId = S.NonEmptyString.pipe(S.brand("GmailAttachmentId"));
 export type AttachmentId = typeof AttachmentId.Type;

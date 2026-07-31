@@ -296,6 +296,38 @@ export const SqlLive = SqliteMigrator.layer({
       // read in syncThreads, which scans every pending op on each chunk commit.
       yield* sql`CREATE INDEX outbox_pending ON outbox (status, id)`;
     }),
+    // Real mailboxes beyond the inbox. The four flags are the system labels
+    // the folder dropdown serves — sent, drafts, spam, trash (inbox and
+    // starred already have columns) — recomputed from the thread's labels on
+    // every sync exactly like is_unread.
+    //
+    // NOTE: The data wipe is deliberate. Until now the backfill only ever
+    // listed INBOX, so the store holds no sent/draft/spam/trash threads, and
+    // the skip-scan resume treats "we have this id" as "complete" — existing
+    // rows would keep these flags stuck at 0 forever. Emptying the mail
+    // tables and the checkpoint makes the next boot re-prime and walk the
+    // whole mailbox with the flags in place. The outbox survives: queued
+    // user actions must not be lost to a schema upgrade.
+    "0008_mailbox_folders": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE threads ADD COLUMN is_sent INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE threads ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE threads ADD COLUMN is_spam INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`ALTER TABLE threads ADD COLUMN is_trash INTEGER NOT NULL DEFAULT 0`;
+      yield* Effect.forEach(
+        [
+          "message_attachments",
+          "message_images",
+          "message_bodies",
+          "message_labels",
+          "messages",
+          "threads",
+          "sync_state",
+        ],
+        (table) => sql`DELETE FROM ${sql.literal(table)}`,
+        { discard: true },
+      );
+    }),
     // `satisfies` only pins the key format; the migrator infers the values.
   } satisfies Record<`${number}_${string}`, unknown>),
 }).pipe(Layer.provideMerge(ClientLive));

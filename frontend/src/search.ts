@@ -46,7 +46,7 @@ export class Search extends Context.Service<Search>()("parcel/Search", {
           const raw = yield* sql`
             SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
             FROM threads
-            WHERE in_inbox = 1
+            WHERE is_spam = 0 AND is_trash = 0
             ORDER BY latest_date DESC
             LIMIT ${request.limit}
           `;
@@ -62,7 +62,7 @@ export class Search extends Context.Service<Search>()("parcel/Search", {
         const raw = yield* sql`
           SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
           FROM threads
-          WHERE in_inbox = 1
+          WHERE is_spam = 0 AND is_trash = 0
             AND (lower(subject) LIKE ${anywhere} ESCAPE '\\'
               OR lower(participants) LIKE ${anywhere} ESCAPE '\\'
               OR lower(snippet) LIKE ${anywhere} ESCAPE '\\')

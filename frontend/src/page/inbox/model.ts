@@ -12,7 +12,12 @@ import { HOT_THREAD_COUNT } from "../../tiers";
 import { THREADS_PER_SECOND, ThreadId } from "../../Gmail";
 import * as OutboxMachine from "../../outboxMachine";
 import { ThreadPatch } from "../../outboxOps";
-import { ThreadDetail, ThreadRow, type ThreadCategory } from "../../sync";
+import {
+  Folder,
+  ThreadDetail,
+  ThreadRow,
+  type ThreadCategory,
+} from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
 
@@ -36,16 +41,28 @@ export const Appearance = S.Literals(["System", "Light", "Dark"]);
 export type Appearance = typeof Appearance.Type;
 
 // DATA
+//
+// Gmail's real inbox categories, exactly as its system labels name them
+// (CATEGORY_SOCIAL etc., extracted at sync time as ThreadCategory). Primary
+// is not a label — it is Gmail's name for the absence of one — so both
+// `personal` and uncategorized mail land there.
 
-export type Category = "promotions" | "primary" | "other";
+export const TAB_LABELS = [
+  "Primary",
+  "Social",
+  "Promotions",
+  "Updates",
+  "Forums",
+] as const;
+export type TabLabel = (typeof TAB_LABELS)[number];
 
-export const CATEGORY_FROM_THREAD: Record<ThreadCategory, Category> = {
-  personal: "primary",
-  promotions: "promotions",
-  social: "other",
-  updates: "other",
-  forums: "other",
-  none: "other",
+export const TAB_FROM_CATEGORY: Record<ThreadCategory, TabLabel> = {
+  personal: "Primary",
+  none: "Primary",
+  social: "Social",
+  promotions: "Promotions",
+  updates: "Updates",
+  forums: "Forums",
 };
 
 // NOTE: Content colors, deliberately outside the surface token system.
@@ -200,98 +217,178 @@ export const formatBytes = (bytes: number): string =>
     : `${Math.round(bytes / BYTES_PER_MB)} MB`;
 
 export type CategoryConfig = Readonly<{
-  label: string;
+  label: TabLabel;
   icon: Ui.IconView;
   iconClass: string;
 }>;
 
-export const CATEGORIES: Record<Category, CategoryConfig> = {
-  promotions: {
-    label: "Promotions",
-    icon: Icon.hand,
-    iconClass: "text-orange-400",
-  },
-  primary: {
-    label: "Primary",
-    icon: Icon.circleUser,
-    iconClass: "text-blue-400",
-  },
-  other: { label: "Other", icon: Icon.ellipsis, iconClass: "" },
+// NOTE: The content colors ride each category, not the theme: category
+// accents are identity, and identity must not re-resolve with the appearance.
+const TAB_CONFIG: Record<
+  TabLabel,
+  Readonly<{ icon: Ui.IconView; iconClass: string }>
+> = {
+  Primary: { icon: Icon.circleUser, iconClass: "text-blue-400" },
+  Social: { icon: Icon.userMultiple, iconClass: "text-green-500" },
+  Promotions: { icon: Icon.tag, iconClass: "text-orange-400" },
+  Updates: { icon: Icon.bell, iconClass: "text-amber-400" },
+  Forums: { icon: Icon.bubbleChat, iconClass: "text-indigo-400" },
 };
 
-export type TabConfig = Readonly<{
-  label: string;
-  icon: Ui.IconView;
-  count: number;
-  iconClass: string;
-}>;
+export type TabCounts = Record<TabLabel, number>;
 
-export const TABS: ReadonlyArray<TabConfig> = [
-  { label: "To-do", icon: Icon.circleCheck, count: 2, iconClass: "" },
-  {
-    label: "Reminders",
-    icon: Icon.bell,
-    count: 8,
-    iconClass: "text-amber-400",
-  },
-  { label: "Priority", icon: Icon.tag, count: 3, iconClass: "text-indigo-400" },
-  {
-    label: "Newsletters",
-    icon: Icon.leaf,
-    count: 23,
-    iconClass: "text-green-500",
-  },
-  { label: "Other", icon: Icon.ellipsis, count: 18, iconClass: "" },
-];
+const ZERO_TAB_COUNTS: TabCounts = {
+  Primary: 0,
+  Social: 0,
+  Promotions: 0,
+  Updates: 0,
+  Forums: 0,
+};
 
-export const TAB_LABELS: ReadonlyArray<string> = TABS.map((tab) => tab.label);
+/** Unread threads per category tab, from the loaded inbox rows — the same
+ *  rows the tab would show, so the number and the list can't disagree.
+ *
+ *  NOTE: One-slot cache on the rows' identity, for the same reason as
+ *  filterRowsForTab: an unchanged list must hand the toolbar cluster the
+ *  same object, or its memo slot misses on every unrelated Model change. */
+export const unreadTabCounts = (() => {
+  let slot:
+    | Readonly<{ rows: ReadonlyArray<ThreadRow>; counts: TabCounts }>
+    | undefined;
+  return (rows: ReadonlyArray<ThreadRow>): TabCounts => {
+    if (slot !== undefined && slot.rows === rows) {
+      return slot.counts;
+    }
+    const counts: TabCounts = { ...ZERO_TAB_COUNTS };
+    for (const row of rows) {
+      if (row.isUnread) {
+        counts[TAB_FROM_CATEGORY[row.category]] += 1;
+      }
+    }
+    slot = { rows, counts };
+    return counts;
+  };
+})();
 
-export const tabSpec = (label: string): Ui.Tabs.TabSpec =>
-  Option.match(
-    Arr.findFirst(TABS, (tab) => tab.label === label),
-    {
-      onNone: () => ({ icon: Icon.ellipsis, label }),
-      onSome: (tab) => ({
-        icon: tab.icon,
-        label: tab.label,
-        detail: String(tab.count),
-        iconClass: tab.iconClass,
-      }),
-    },
-  );
+// Curried so the returned function sits at the top level of viewInputs (the
+// submodel boundary auto-scopes functions there, and only there).
+export const tabSpec =
+  (counts: TabCounts) =>
+  (label: string): Ui.Tabs.TabSpec =>
+    Option.match(
+      Arr.findFirst(TAB_LABELS, (tab) => tab === label),
+      {
+        onNone: () => ({ icon: Icon.circleQuestion, label }),
+        onSome: (tab) => ({
+          icon: TAB_CONFIG[tab].icon,
+          label: tab,
+          // Zero unread is silence, not "0".
+          detail: counts[tab] === 0 ? undefined : String(counts[tab]),
+          iconClass: TAB_CONFIG[tab].iconClass,
+        }),
+      },
+    );
+
+const categoryPill = (tab: TabLabel): Option.Option<CategoryConfig> =>
+  Option.some({ label: tab, ...TAB_CONFIG[tab] });
+
+/** The pill a row wears: the thread's real Gmail category. Primary rows wear
+ *  none — primary is the absence of a category, and a pill saying so on most
+ *  rows would be noise, not information. */
+export const CATEGORY_PILLS: Record<
+  ThreadCategory,
+  Option.Option<CategoryConfig>
+> = {
+  personal: Option.none(),
+  none: Option.none(),
+  social: categoryPill("Social"),
+  promotions: categoryPill("Promotions"),
+  updates: categoryPill("Updates"),
+  forums: categoryPill("Forums"),
+};
+
+/** The rows the selected tab keeps. Only the inbox has category tabs, so
+ *  callers gate on the folder.
+ *
+ *  NOTE: One-slot cache on (rows, tab) reference equality. The filter itself
+ *  is cheap; what matters is that an unchanged pair returns the same array
+ *  object, so the VirtualList's memo slot — which compares args with `===` —
+ *  keeps its hit across unrelated Model changes (sync ticks, hover moves).
+ *  createLazy is exactly this for Html; this is the same idea for data. */
+export const filterRowsForTab = (() => {
+  let slot:
+    | Readonly<{
+        rows: ReadonlyArray<ThreadRow>;
+        tab: string;
+        result: ReadonlyArray<ThreadRow>;
+      }>
+    | undefined;
+  return (
+    rows: ReadonlyArray<ThreadRow>,
+    tab: string,
+  ): ReadonlyArray<ThreadRow> => {
+    if (slot !== undefined && slot.rows === rows && slot.tab === tab) {
+      return slot.result;
+    }
+    const filtered = rows.filter(
+      (row) => TAB_FROM_CATEGORY[row.category] === tab,
+    );
+    // An unfiltered result keeps the source array's identity too.
+    const result = filtered.length === rows.length ? rows : filtered;
+    slot = { rows, tab, result };
+    return result;
+  };
+})();
+
+/** What the list shows: the folder's rows, narrowed by the selected category
+ *  tab when the folder is the inbox — Gmail's tabs exist nowhere else. The
+ *  single definition both the view and the update index into, so the rows on
+ *  screen and the rows the cursor addresses can never disagree. */
+export const visibleRows = (
+  model: Model,
+  rows: ReadonlyArray<ThreadRow>,
+): ReadonlyArray<ThreadRow> =>
+  model.folder === "inbox"
+    ? filterRowsForTab(rows, model.tabs.selectedValue)
+    : rows;
 
 // FOLDER MENU
+//
+// The real mailboxes. `Folder` (sync.ts) is the store slice; this is its
+// menu order and dress.
 
-export const FOLDER_LABELS = [
-  "All Inbox",
-  "Sent",
-  "Send later",
-  "Drafts",
-  "Spams",
-  "Archives",
-] as const;
-export type FolderLabel = (typeof FOLDER_LABELS)[number];
+export const FOLDER_ITEMS: ReadonlyArray<Folder> = [
+  "inbox",
+  "starred",
+  "sent",
+  "drafts",
+  "spam",
+  "trash",
+  "all",
+];
 
-export const FOLDERS: Record<
-  FolderLabel,
-  Readonly<{ icon: Ui.IconView; count?: number }>
+export const FOLDER_CONFIG: Record<
+  Folder,
+  Readonly<{ label: string; icon: Ui.IconView }>
 > = {
-  "All Inbox": { icon: Icon.inbox, count: 199 },
-  Sent: { icon: Icon.send },
-  "Send later": { icon: Icon.clock },
-  Drafts: { icon: Icon.feather, count: 2 },
-  Spams: { icon: Icon.shieldAlert, count: 8 },
-  Archives: { icon: Icon.archive, count: 7 },
+  inbox: { label: "Inbox", icon: Icon.inbox },
+  starred: { label: "Starred", icon: Icon.star },
+  sent: { label: "Sent", icon: Icon.send },
+  drafts: { label: "Drafts", icon: Icon.feather },
+  spam: { label: "Spam", icon: Icon.shieldAlert },
+  trash: { label: "Trash", icon: Icon.trash },
+  all: { label: "All Mail", icon: Icon.archive },
 };
 
-export const FolderMenu = Ui.Menu.create<FolderLabel>();
+export const FolderMenu = Ui.Menu.create<Folder>();
 
 // COMMAND PALETTE
 
 export const PALETTE_RESULT_LIMIT = 50;
 
+// No leading icon: every result is a thread, so an icon saying "mail" on
+// each row would be repetition, not information.
 export const threadItemSpec = (row: ThreadRow): Ui.Palette.PaletteItemSpec => ({
-  icon: row.isUnread ? Icon.mail : Icon.mailOpen,
   label: row.subject === "" ? "(no subject)" : row.subject,
   detail: row.sender,
 });
@@ -359,6 +456,8 @@ export type Screen = typeof Screen.Type;
 
 export const Model = S.Struct({
   appearance: Appearance,
+  /** Which mailbox the list shows. The rows in `threads` are this folder's. */
+  folder: Folder,
   folderMenu: Ui.Menu.Model,
   tabs: Ui.Tabs.Model,
   list: Ui.VirtualList.Model,
@@ -405,6 +504,7 @@ export const init = (
   maybeSeedRows: Option.Option<ReadonlyArray<ThreadRow>> = Option.none(),
 ): Model => ({
   appearance: "System",
+  folder: "inbox",
   folderMenu: Ui.Menu.init({ id: "inbox-folders", isAnimated: true }),
   tabs: Ui.Tabs.init({
     id: "inbox-tabs",
@@ -478,8 +578,11 @@ export const FailedSearch = m("FailedSearch", {
   seq: S.Number,
   error: S.String,
 });
-/** The SyncEngine finished a pull: real thread rows from the local store. */
-export const SucceededLoadInbox = m("SucceededLoadInbox", {
+/** A folder read finished: real thread rows from the local store. Carries
+ *  the folder it selected, so a read that lost a race to a folder switch can
+ *  be recognized and dropped instead of painting the wrong mailbox. */
+export const SucceededLoadFolder = m("SucceededLoadFolder", {
+  folder: Folder,
   rows: S.Array(ThreadRow),
 });
 /** The boot-only LIMITed first read: enough rows to paint the viewport,
@@ -496,7 +599,10 @@ export const FailedLoadInboxTop = m("FailedLoadInboxTop", {
 export const GotSyncMessage = m("GotSyncMessage", {
   message: SyncMachine.Message,
 });
-export const FailedLoadInbox = m("FailedLoadInbox", { error: S.String });
+export const FailedLoadFolder = m("FailedLoadFolder", {
+  folder: Folder,
+  error: S.String,
+});
 /** On-disk size of the local store, for the sync pill's detail. */
 export const SucceededReadLocalSize = m("SucceededReadLocalSize", {
   bytes: S.Number,
@@ -578,11 +684,11 @@ export const Message = S.Union([
   ClickedAppearance,
   SucceededSearch,
   FailedSearch,
-  SucceededLoadInbox,
+  SucceededLoadFolder,
   SucceededLoadInboxTop,
   FailedLoadInboxTop,
   GotSyncMessage,
-  FailedLoadInbox,
+  FailedLoadFolder,
   SucceededReadLocalSize,
   FailedReadLocalSize,
   CompletedCacheImageBatch,
