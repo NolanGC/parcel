@@ -1,0 +1,32 @@
+---
+version: 1.5.5
+title: marketing_blast
+---
+<img src="https://cdn.example.test/logo.png" alt="Northwind" width="180" style="max-width:100%;vertical-align:middle">
+
+# Your October statement
+
+Hi Nolan,
+
+Here's a summary of your account activity for **October 2026**. Your full statement is attached, and you can always view it [in your dashboard](https://app.example.test/statements/2026-10).
+
+|Date|Description|Amount|
+|:---|:---|---:|
+|Oct 3|Subscription — Pro plan|$49.00|
+|Oct 17|Additional seats (2)|$28.00|
+|**Total**||**$77.00**|
+
+**What changed this month**
+
+- Two new seats were added on Oct 17.
+- Your renewal date moved to *November 3*.
+- Invoices now include VAT breakdowns.
+  - Applies to EU billing addresses only.
+
+Questions? Just reply to this email.
+
+Full terms at [https://example.test/terms](https://example.test/terms).
+
+Northwind Inc, 100 Example Way
+[Unsubscribe](https://example.test/unsubscribe?u=abc123)
+

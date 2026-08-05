@@ -36,6 +36,7 @@ import * as Ui from "../../ui";
 
 import {
   Appearance,
+  CATEGORIES_FOR_TAB,
   ComposeClosed,
   ComposeEditing,
   ComposeField,
@@ -48,6 +49,10 @@ import {
   FailedLoadThread,
   CompletedCacheImageBatch,
   FailedCacheImageBatch,
+  CompletedCacheAvatarBatch,
+  FailedCacheAvatarBatch,
+  CompletedConvertMarkdownBatch,
+  FailedConvertMarkdownBatch,
   FailedReadLocalSize,
   FailedSearch,
   FolderMenu,
@@ -78,7 +83,11 @@ import {
   FailedLoadInboxTop,
   SucceededLoadThread,
   SucceededReadLocalSize,
+  SucceededReadCounts,
+  FailedReadCounts,
   SucceededSearch,
+  TabLabel,
+  tabLabelOf,
   visibleRows,
 } from "./model";
 
@@ -122,14 +131,17 @@ const ApplyAppearance = Command.define(
  *  the store is the sync machine's job. */
 export const LoadFolder = Command.define(
   "LoadFolder",
-  { folder: Folder },
+  { folder: Folder, tab: TabLabel },
   SucceededLoadFolder,
   FailedLoadFolder,
-)(({ folder }) =>
+)(({ folder, tab }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    return yield* engine.loadFolder(folder).pipe(
-      Effect.map((rows) => SucceededLoadFolder({ folder, rows })),
+    // Outside the inbox there are no tabs, so nothing narrows: the categories
+    // are still on the rows, but every folder shows all of them.
+    const categories = folder === "inbox" ? CATEGORIES_FOR_TAB[tab] : [];
+    return yield* engine.loadFolder(folder, categories).pipe(
+      Effect.map((rows) => SucceededLoadFolder({ folder, tab, rows })),
       Effect.catchCause((cause) =>
         Effect.succeed(
           FailedLoadFolder({ folder, error: Cause.pretty(cause) }),
@@ -252,6 +264,105 @@ export const CacheImageBatch = Command.define(
   }),
 );
 
+/** The tab and folder badges. Issued with every folder read, so the numbers
+ *  move with the list rather than lagging a backfill behind it. */
+export const ReadCounts = Command.define(
+  "ReadCounts",
+  SucceededReadCounts,
+  FailedReadCounts,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.readCounts.pipe(
+      Effect.map((counts) => SucceededReadCounts({ counts })),
+      Effect.catchCause((cause) =>
+        Effect.succeed(FailedReadCounts({ error: Cause.pretty(cause) })),
+      ),
+    );
+  }),
+);
+
+const AVATAR_IDLE_WAIT = "10 seconds";
+const AVATAR_RETRY_WAIT = "60 seconds";
+
+/**
+ * One turn of the avatar loop, re-issued from its own result — the same shape
+ * as CacheImageBatch, and running alongside it for the same reason: mail
+ * images are bound by the proxy, avatars by one request each to a hundred
+ * different origins, so sequencing them would leave one idle throughout.
+ *
+ * Idles far longer than the image loop. Senders repeat, so the set of distinct
+ * domains stops growing long before the mailbox does.
+ */
+export const CacheAvatarBatch = Command.define(
+  "CacheAvatarBatch",
+  CompletedCacheAvatarBatch,
+  FailedCacheAvatarBatch,
+)(
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.cacheAvatarBatch.pipe(
+      Effect.tap(({ isIdle }) =>
+        isIdle ? Effect.sleep(AVATAR_IDLE_WAIT) : Effect.void,
+      ),
+      Effect.map(({ addedCount }) => CompletedCacheAvatarBatch({ addedCount })),
+      Effect.catchCause((cause) =>
+        Effect.sleep(AVATAR_RETRY_WAIT).pipe(
+          Effect.as(FailedCacheAvatarBatch({ error: Cause.pretty(cause) })),
+        ),
+      ),
+    );
+  }),
+);
+
+// Longer waits than the other two loops on purpose. This one is bound by the
+// main thread rather than by a remote service, so its cost is measured in
+// frames the list did not get to draw — and unlike images, nothing on screen
+// is waiting for it. The queue is finite and never refills once a mailbox has
+// finished backfilling.
+const MARKDOWN_TURN_WAIT = "2 seconds";
+const MARKDOWN_IDLE_WAIT = "60 seconds";
+const MARKDOWN_RETRY_WAIT = "60 seconds";
+
+/** True while the sync still has work in flight. What decides whether the
+ *  markdown loop may touch the whole store or only the threads you opened —
+ *  both want the same main thread, and the sync is the one you can see. */
+const isSyncBusy = (state: SyncMachine.State): boolean =>
+  state._tag !== "Settled" && state._tag !== "NeedsAuth";
+
+/**
+ * One turn of the markdown backfill, re-issued from its own result. Converts
+ * bodies stored without markdown — which is all of them, since the sync path
+ * deliberately does not convert — so that opening them stops costing a
+ * DOMPurify pass over the raw html. Purely an optimization: an unconverted
+ * body opens exactly as it did before.
+ *
+ * `openedOnly` keeps it out of the sync's way. During a walk it converts only
+ * threads you have opened, which is a handful of bodies and buys the thing you
+ * would notice; the unbounded pass waits for the sync to settle.
+ */
+export const ConvertMarkdownBatch = Command.define(
+  "ConvertMarkdownBatch",
+  { openedOnly: S.Boolean },
+  CompletedConvertMarkdownBatch,
+  FailedConvertMarkdownBatch,
+)(({ openedOnly }) =>
+  Effect.gen(function* () {
+    const engine = yield* SyncEngine;
+    return yield* engine.convertMarkdownBatch(openedOnly).pipe(
+      Effect.tap(({ isIdle }) =>
+        Effect.sleep(isIdle ? MARKDOWN_IDLE_WAIT : MARKDOWN_TURN_WAIT),
+      ),
+      Effect.as(CompletedConvertMarkdownBatch()),
+      Effect.catchCause((cause) =>
+        Effect.sleep(MARKDOWN_RETRY_WAIT).pipe(
+          Effect.as(FailedConvertMarkdownBatch({ error: Cause.pretty(cause) })),
+        ),
+      ),
+    );
+  }),
+);
+
 /** Opens a thread from the local store only: SQLite rows, cid: images
  *  rewritten from locally cached bytes. No network. */
 export const LoadThread = Command.define(
@@ -353,10 +464,16 @@ type UpdateReturn = readonly [
  *  behind it on the shared worker. */
 const afterTopReadCommands = (
   folder: Folder,
+  tab: TabLabel,
 ): ReadonlyArray<Command.Command<Message, never, InboxResources>> => [
-  LoadFolder({ folder }),
+  LoadFolder({ folder, tab }),
+  ReadCounts(),
   ReadLocalSize(),
   CacheImageBatch(),
+  CacheAvatarBatch(),
+  // Starts in the narrow mode. The first read happens while the sync is at its
+  // busiest, and every later turn re-reads the machine's state for itself.
+  ConvertMarkdownBatch({ openedOnly: true }),
 ];
 
 // Every palette query goes through here, so the seq can never be bumped
@@ -485,7 +602,11 @@ const switchFolder = (model: Model, folder: Folder): UpdateReturn => {
       screen: () => ShowingList({ maybeError: Option.none() }),
       maybeSelected: () => Option.none(),
     }),
-    [LoadFolder({ folder }), ScrollListToRow({ index: 0 })],
+    [
+      LoadFolder({ folder, tab: tabLabelOf(model.tabs.selectedValue) }),
+      ReadCounts(),
+      ScrollListToRow({ index: 0 }),
+    ],
   ];
 };
 
@@ -712,7 +833,14 @@ const stepSync = (model: Model, message: SyncMachine.Message): UpdateReturn => {
   const syncCommands = [
     ...Command.mapMessages(commands, (message) => GotSyncMessage({ message })),
     ...(shouldRefreshRows(model.sync, message)
-      ? [LoadFolder({ folder: model.folder }), ReadLocalSize()]
+      ? [
+          LoadFolder({
+            folder: model.folder,
+            tab: tabLabelOf(model.tabs.selectedValue),
+          }),
+          ReadCounts(),
+          ReadLocalSize(),
+        ]
       : []),
   ];
   const stepped = evo(model, { sync: () => nextSync });
@@ -823,12 +951,25 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             tabs: () => nextTabs,
             maybeSelected: (maybeSelected) =>
               isTabChanged ? Option.none() : maybeSelected,
+            // The rows on screen belong to the tab being left. Loading is
+            // honest about the gap until the new read lands, and it is what
+            // stops the old slice being shown under the new tab's label.
+            threads: (threads): Model["threads"] =>
+              isTabChanged ? AsyncData.Loading() : threads,
           }),
           [
             ...Command.mapMessages(commands, (message) =>
               GotTabsMessage({ message }),
             ),
-            ...(isTabChanged ? [ScrollListToRow({ index: 0 })] : []),
+            ...(isTabChanged
+              ? [
+                  LoadFolder({
+                    folder: model.folder,
+                    tab: tabLabelOf(nextTabs.selectedValue),
+                  }),
+                  ScrollListToRow({ index: 0 }),
+                ]
+              : []),
           ],
         ];
       },
@@ -984,19 +1125,31 @@ export const update = (model: Model, message: Message): UpdateReturn =>
                   data: reconcileRows(storedRows(model), rows),
                 }),
             }),
-        afterTopReadCommands(model.folder),
+        afterTopReadCommands(
+          model.folder,
+          tabLabelOf(model.tabs.selectedValue),
+        ),
       ],
 
       // The full read that follows either succeeds or owns the error report;
       // a failed top read stays silent so the user never sees an error for a
       // query whose only job was an early paint.
-      FailedLoadInboxTop: () => [model, afterTopReadCommands(model.folder)],
+      FailedLoadInboxTop: () => [
+        model,
+        afterTopReadCommands(
+          model.folder,
+          tabLabelOf(model.tabs.selectedValue),
+        ),
+      ],
 
       // Reconciled against the rows already loaded so unchanged threads keep
       // their object identity and the view can memoize past them. A read for
       // a folder no longer current lost a race to a switch and is dropped.
-      SucceededLoadFolder: ({ folder, rows }) =>
-        folder !== model.folder
+      // Stale on either axis now: the tab is part of the query, so a read
+      // that was in flight across a tab switch describes a slice nobody is
+      // looking at.
+      SucceededLoadFolder: ({ folder, tab, rows }) =>
+        folder !== model.folder || tab !== tabLabelOf(model.tabs.selectedValue)
           ? [model, []]
           : [
               evo(model, {
@@ -1020,6 +1173,14 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       // nothing) rather than disturbing anything the user is looking at.
       FailedReadLocalSize: () => [model, []],
 
+      SucceededReadCounts: ({ counts }) => [
+        evo(model, { counts: () => counts }),
+        [],
+      ],
+
+      // Same as the size read: a badge is not worth disturbing the view over.
+      FailedReadCounts: () => [model, []],
+
       // The loop re-arms itself on both outcomes; the Command has already
       // waited out its own backoff, which is what stops this from spinning.
       // NOTE: isRecentReady latches and is never cleared. New mail lands in
@@ -1032,6 +1193,32 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         [CacheImageBatch()],
       ],
       FailedCacheImageBatch: () => [model, [CacheImageBatch()]],
+
+      // The counter is the repaint. Bumping it only when something arrived
+      // keeps an idle loop from re-rendering the list every ten seconds
+      // forever.
+      CompletedCacheAvatarBatch: ({ addedCount }) => [
+        addedCount === 0
+          ? model
+          : evo(model, { avatarVersion: Number.increment }),
+        [CacheAvatarBatch()],
+      ],
+      FailedCacheAvatarBatch: () => [model, [CacheAvatarBatch()]],
+
+      // Nothing to fold in: the backfill changes what the next open of an old
+      // message costs, and no part of the model describes that. Both arms exist
+      // only to re-issue the loop, which has already waited out its own delay.
+      // Each turn re-reads the sync state, so the loop widens by itself the
+      // first turn after the mailbox settles — nothing has to notice and
+      // restart it.
+      CompletedConvertMarkdownBatch: () => [
+        model,
+        [ConvertMarkdownBatch({ openedOnly: isSyncBusy(model.sync) })],
+      ],
+      FailedConvertMarkdownBatch: () => [
+        model,
+        [ConvertMarkdownBatch({ openedOnly: isSyncBusy(model.sync) })],
+      ],
 
       FailedLoadFolder: ({ folder, error }) =>
         folder !== model.folder

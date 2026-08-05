@@ -36,13 +36,30 @@ import {
   type PageToken,
   type Thread as GmailThread,
 } from "./Gmail";
-import { BodyCodec, Compression, CompressionError } from "./compression";
+import {
+  BodyCodec,
+  Compression,
+  CompressionError,
+  type CompressedBody,
+} from "./compression";
+import { emailHtmlToMarkdown } from "./emailMarkdown";
 import {
   IMAGE_CONCURRENCY,
   ImageFetcher,
   remoteImageUrls,
-  rewriteImageUrls,
+  type FetchedImage,
 } from "./images";
+import { renderEmailMarkdownToHtml } from "./markdown";
+import { prepareBody } from "./sanitizeBody";
+import {
+  avatarUrl,
+  domainKey,
+  faviconUrl,
+  logoDomains,
+  personKey,
+  registerAvatar,
+} from "./avatars";
+import { People } from "./People";
 import {
   BOOT_ENGINE_READY,
   BOOT_ENGINE_START,
@@ -94,11 +111,54 @@ const FOLDER_WHERE: Record<Folder, string> = {
   all: "is_spam = 0 AND is_trash = 0",
 };
 
+/**
+ * What the tabs and the folder menu put next to their labels.
+ *
+ * NOTE: Counted in SQL over the whole store, never from the rows in the Model.
+ * The list holds one folder's newest HOT_THREAD_COUNT, so counting those gives
+ * a number that is capped at the window size, changes when you switch folder,
+ * and agrees with Gmail only on a small mailbox — which reads exactly like a
+ * made-up number, because it effectively is one.
+ *
+ * The category counts are unread, matching Gmail's own tabs. Drafts and spam
+ * are totals: neither has a meaningful unread state, and what you want to know
+ * about them is how many there are.
+ */
+export const MailboxCounts = S.Struct({
+  primary: S.Number,
+  social: S.Number,
+  promotions: S.Number,
+  updates: S.Number,
+  forums: S.Number,
+  inbox: S.Number,
+  drafts: S.Number,
+  spam: S.Number,
+});
+export type MailboxCounts = typeof MailboxCounts.Type;
+
+export const EMPTY_COUNTS: MailboxCounts = {
+  primary: 0,
+  social: 0,
+  promotions: 0,
+  updates: 0,
+  forums: 0,
+  inbox: 0,
+  drafts: 0,
+  spam: 0,
+};
+
 /** One inbox list row. `date` is epoch milliseconds. */
 export const ThreadRow = S.Struct({
   id: ThreadId,
   subject: S.String,
   sender: S.String,
+  /** The sender's address, which `sender` (a display name) is not. What an
+   *  avatar is keyed on — see avatars.ts.
+   *
+   *  NOTE: A plain string, empty when unknown, rather than an Option. This
+   *  struct is what inboxSnapshot.ts persists to localStorage, and an Option
+   *  does not survive that JSON round-trip. */
+  senderEmail: S.String,
   snippet: S.String,
   date: S.Number,
   isUnread: S.Boolean,
@@ -107,7 +167,20 @@ export const ThreadRow = S.Struct({
 });
 export type ThreadRow = typeof ThreadRow.Type;
 
-export const BodyKind = S.Literals(["html", "plain"]);
+/**
+ * What a rendered body actually is, which decides how the view frames it.
+ *
+ *   markdown  Converted at rest and rendered by us. The sender's stylesheet
+ *             was discarded on the way through, so nothing in it assumes a
+ *             colour — it can sit on the app's own surface and follow the
+ *             theme, like any other content in the window.
+ *   html      The sender's own markup, sanitized. Its colours are baked into
+ *             the message and overwhelmingly assume white behind them, so it
+ *             gets a white card in both themes. Darkening it would leave grey
+ *             text on near-black, which is worse than a bright card.
+ *   plain     Text, rendered in a `<pre>`. Themed, same as markdown.
+ */
+export const BodyKind = S.Literals(["markdown", "html", "plain"]);
 export type BodyKind = typeof BodyKind.Type;
 
 export const MessageDetail = S.Struct({
@@ -136,13 +209,14 @@ export type ThreadDetail = typeof ThreadDetail.Type;
 // hence orDie at the call sites. Exported because search.ts selects the same
 // shape and must not drift from it.
 export const THREAD_ROW_COLUMNS =
-  "id, subject, snippet, participants, latest_date, is_unread, is_starred, category";
+  "id, subject, snippet, participants, sender_email, latest_date, is_unread, is_starred, category";
 
 const DbThreadRow = S.Struct({
   id: ThreadId,
   subject: S.String,
   snippet: S.String,
   participants: S.String,
+  sender_email: S.String,
   latest_date: S.Number,
   is_unread: S.Number,
   is_starred: S.Number,
@@ -169,6 +243,7 @@ export const decodeThreadRows = (
           id: row.id,
           subject: row.subject,
           sender: senderOf(row.participants),
+          senderEmail: row.sender_email,
           snippet: cleanSnippet(row.snippet),
           date: row.latest_date,
           isUnread: row.is_unread !== 0,
@@ -204,6 +279,51 @@ const DbBodyRow = S.Struct({
   codec: BodyCodec,
 });
 const decodeDbBodies = S.decodeUnknownEffect(S.Array(DbBodyRow));
+
+// The open path and the backfill, which are the only readers that want the
+// markdown. Deliberately not folded into DbBodyRow: the image pass decodes
+// every body in a thread to scrape urls out of the html and has no use for a
+// second copy of the message.
+//
+// NOTE: `markdown` and `markdown_codec` are null together or not at all, but
+// the pair is decoded independently because SQLite will not enforce that. A
+// half-written row reads as "no markdown" and falls back, rather than
+// throwing on open.
+const DbMarkdownBodyRow = S.Struct({
+  ...DbBodyRow.fields,
+  markdown: S.NullOr(S.instanceOf(Uint8Array)),
+  markdown_codec: S.NullOr(BodyCodec),
+});
+type DbMarkdownBodyRow = typeof DbMarkdownBodyRow.Type;
+const decodeDbMarkdownBodies = S.decodeUnknownEffect(
+  S.Array(DbMarkdownBodyRow),
+);
+
+/** Written when a body cannot be converted, so it leaves the backfill queue
+ *  instead of being retried forever. Zero bytes is not a markdown a message
+ *  could legitimately have — an empty conversion is stored as NULL at sync
+ *  time — so it needs no column of its own. */
+const EMPTY_MARKDOWN = new Uint8Array(0);
+
+/** Whether conversion has been attempted for this row at all.
+ *
+ *  Deliberately distinct from having produced something. An attempt that comes
+ *  back empty writes the marker above, and this is what tells a later open
+ *  that the emptiness is an answer rather than a gap — without it, every open
+ *  of such a message would convert it again to learn the same thing. */
+const isConverted = (row: DbMarkdownBodyRow): boolean =>
+  row.markdown !== null && row.markdown_codec !== null;
+
+/** The stored markdown, if this row has a usable one. Anything else — no
+ *  markdown yet, a half-written pair, the marker above — reads as absent. */
+const storedMarkdown = (
+  row: DbMarkdownBodyRow,
+): Option.Option<CompressedBody> =>
+  row.markdown === null ||
+  row.markdown_codec === null ||
+  row.markdown.byteLength === 0
+    ? Option.none()
+    : Option.some({ codec: row.markdown_codec, data: row.markdown });
 
 const DbImageRow = S.Struct({
   message_id: MessageId,
@@ -244,6 +364,36 @@ const decodeDbSyncState = S.decodeUnknownEffect(S.Array(DbSyncStateRow));
 const DbCountRow = S.Struct({ n: S.Number });
 const decodeDbCounts = S.decodeUnknownEffect(S.Array(DbCountRow));
 
+const DbMailboxCountsRow = S.Struct({
+  primary_count: S.Number,
+  social_count: S.Number,
+  promotions_count: S.Number,
+  updates_count: S.Number,
+  forums_count: S.Number,
+  inbox_count: S.Number,
+  drafts_count: S.Number,
+  spam_count: S.Number,
+});
+const decodeDbMailboxCounts = S.decodeUnknownEffect(
+  S.Array(DbMailboxCountsRow),
+);
+
+const DbSenderEmailRow = S.Struct({ sender_email: S.String });
+const decodeDbSenderEmails = S.decodeUnknownEffect(S.Array(DbSenderEmailRow));
+
+const DbAvatarKeyRow = S.Struct({ key: S.String });
+const decodeDbAvatarKeys = S.decodeUnknownEffect(S.Array(DbAvatarKeyRow));
+
+const DbAvatarRow = S.Struct({
+  key: S.String,
+  mime_type: S.String,
+  bytes: S.NullOr(S.instanceOf(Uint8Array)),
+});
+const decodeDbAvatars = S.decodeUnknownEffect(S.Array(DbAvatarRow));
+
+const DbPeopleSyncedRow = S.Struct({ people_synced_at: S.Number });
+const decodeDbPeopleSynced = S.decodeUnknownEffect(S.Array(DbPeopleSyncedRow));
+
 const DbWindowCountRow = S.Struct({ total: S.Number, pending: S.Number });
 const decodeDbWindowCounts = S.decodeUnknownEffect(S.Array(DbWindowCountRow));
 
@@ -283,6 +433,79 @@ export type PrimeResult = Readonly<{
   totalEstimate: number;
 }>;
 
+/**
+ * Which slice of the mailbox the backfill is walking, in the order it walks
+ * them.
+ *
+ * Phased because the mailbox is not equally interesting. Newest-first across
+ * everything means a promotions blizzard arrives ahead of the mail you
+ * actually read, and on a large mailbox the Primary tab is still filling in
+ * twenty minutes later.
+ *
+ *   primary  `in:inbox category:primary` — the tab you live in, usable
+ *            within the first minute
+ *   inbox    the rest of the inbox: updates, social, promotions, forums. Mail
+ *            addressed to you, just not the tab you read first.
+ *   rest     everything else — archived, sent, drafts, spam, trash. Reachable
+ *            by search and by folder, and not what anyone is waiting on.
+ *
+ * NOTE: Each phase re-lists what the one before it stored rather than negating
+ * the query. A negated query would have to stay in step with Gmail's own
+ * classification, and the skip-scan makes the overlap nearly free: an
+ * already-stored page costs one local SELECT and no fetches.
+ *
+ * The phase is runtime state and deliberately not checkpointed: a resumed walk
+ * restarts at `primary` and skip-scans back to where it was.
+ */
+export const BackfillPhase = S.Literals(["primary", "inbox", "rest"]);
+export type BackfillPhase = typeof BackfillPhase.Type;
+
+/** The phase after this one, or `None` when the walk is over. The single
+ *  definition of the order — the machine advances through it rather than
+ *  naming phases itself. */
+export const nextBackfillPhase = (
+  phase: BackfillPhase,
+): Option.Option<BackfillPhase> =>
+  phase === "primary"
+    ? Option.some("inbox")
+    : phase === "inbox"
+      ? Option.some("rest")
+      : Option.none();
+
+/** The tabs that are not Primary, which is the only way to ask for Primary. */
+const TABBED_CATEGORIES = ["social", "promotions", "updates", "forums"];
+
+/**
+ * The Gmail `threads.list` filter for a phase.
+ *
+ * NOTE: Primary is spelled as a subtraction, NOT as `category:primary`. The
+ * two are not the same set, and the difference is most of the inbox.
+ * `category:primary` matches only what Gmail actively labelled
+ * `CATEGORY_PERSONAL`; mail it never categorised at all carries no
+ * `CATEGORY_*` label and matches nothing. That mail is not rare — it is where
+ * plain person-to-person email lands — and it is Primary by every definition
+ * the app itself uses: `threadCategory` calls it "none" and TAB_FROM_CATEGORY
+ * maps "none" to the Primary tab, exactly as it maps "personal".
+ *
+ * Asking for `category:primary` therefore declared Primary exhausted while
+ * most of it was still unfetched, and the walk moved on to the categories the
+ * phases exist to defer. Subtracting the four tabbed categories asks for the
+ * same set the Primary tab renders, and does it whether or not the account has
+ * Gmail's tabs turned on.
+ */
+const PHASE_QUERY: Record<BackfillPhase, Record<string, unknown>> = {
+  primary: {
+    q: `in:inbox ${TABBED_CATEGORIES.map((c) => `-category:${c}`).join(" ")}`,
+  },
+  inbox: { q: "in:inbox" },
+  rest: { includeSpamTrash: true },
+};
+
+/** The query a phase walks. Exported for the tests that pin the Primary
+ *  definition to the tab's own. */
+export const backfillQuery = (phase: BackfillPhase): Record<string, unknown> =>
+  PHASE_QUERY[phase];
+
 /** What one backfill page reports back to the machine. */
 export type BatchResult = Readonly<{
   syncedCount: number;
@@ -301,6 +524,29 @@ export type BatchResult = Readonly<{
 export type ImageBatchResult = Readonly<{
   isIdle: boolean;
   isRecentReady: boolean;
+}>;
+
+/** What one avatar batch reports back to the page's loop.
+ *
+ *  `addedCount` is how many new blob urls were published — the page bumps a
+ *  counter by it, which is the whole reason the view re-renders and the new
+ *  faces appear. `isIdle` means nothing was resolved this turn, the loop's cue
+ *  to slow down rather than stop: the backfill is usually still producing
+ *  senders. */
+export type AvatarBatchResult = Readonly<{
+  addedCount: number;
+  isIdle: boolean;
+}>;
+
+/** What one markdown backfill batch reports back to the page's loop.
+ *
+ *  `isIdle` means every html body in the store already has its markdown, so
+ *  the loop can idle — it is the loop's cue to slow down rather than to stop,
+ *  since the backfill keeps producing bodies for as long as it runs. Nothing
+ *  visible changes when a batch converts, so unlike the avatar loop there is
+ *  no count for the page to act on. */
+export type MarkdownBatchResult = Readonly<{
+  isIdle: boolean;
 }>;
 
 /** What a history pass reports back to the machine. Expired = Gmail forgot the
@@ -410,13 +656,36 @@ const messageCategory = (
       decodeThreadCategory(label.slice(CATEGORY_PREFIX.length).toLowerCase()),
   );
 
-const threadCategory = (
+/**
+ * Which tab a thread belongs to, taken from its NEWEST categorized message.
+ *
+ * NOTE: Newest, not first. Gmail places a conversation by where its latest
+ * message landed, and `thread.messages` arrives oldest-first — so scanning
+ * forward answers with the category the thread had when it *started*. A thread
+ * that began as a newsletter and turned into a real exchange reads as
+ * "updates" that way, for as long as it lives.
+ *
+ * That is not a cosmetic mislabel. The backfill asks Gmail for the Primary
+ * slice first, Gmail hands over those conversations because it agrees they are
+ * Primary, and then this function files them under Updates locally. The result
+ * is a Primary tab that looks empty next to a huge Updates one, and a walk
+ * that appears to be fetching the wrong things while doing exactly the right
+ * ones.
+ *
+ * Sorted explicitly rather than trusting the order the API happened to use.
+ */
+export const threadCategory = (
   messages: ReadonlyArray<GmailMessage>,
-): ThreadCategory =>
-  Option.getOrElse(
-    Arr.findFirst(messages, messageCategory),
+): ThreadCategory => {
+  const newestFirst = [...messages].sort(
+    (left, right) =>
+      Number(right.internalDate ?? "0") - Number(left.internalDate ?? "0"),
+  );
+  return Option.getOrElse(
+    Arr.findFirst(newestFirst, messageCategory),
     (): ThreadCategory => "none",
   );
+};
 
 const latestDate = (messages: ReadonlyArray<GmailMessage>): number =>
   Arr.reduce(messages, 0, (max, message) => {
@@ -505,6 +774,23 @@ const IMAGE_BATCH_THREADS = 8;
 // of a four-second loop walks the entire cold tail. Draining a slice per cycle
 // keeps each turn's cost flat no matter how large the store grows.
 const IMAGE_EVICT_BATCH = 64;
+// Sender domains resolved per avatar pass. Smaller than the image batch
+// because each is a request to a different origin — no connection reuse, so
+// the tail latency is the batch's latency.
+const AVATAR_BATCH_DOMAINS = 12;
+// Stored avatars turned into blob urls per pass. Comfortably above the blob
+// registry's own ceiling (avatars.ts), so publishing is never the thing that
+// leaves a visible row without its picture.
+const AVATAR_PUBLISH_LIMIT = 400;
+// How stale the contacts photo map may get. Profile pictures change on the
+// order of years, and the walk is a handful of requests, so once a day is
+// already generous.
+const PEOPLE_REFRESH_MS = 24 * 60 * 60 * 1000;
+// Bodies converted to markdown per backfill turn. Unlike the image and avatar
+// passes this one is bound by nothing but the CPU it runs on — the main
+// thread, the one drawing the list — so the batch is sized to stay well inside
+// a frame's worth of work and hand control back.
+const MARKDOWN_BATCH_BODIES = 12;
 
 export class SyncEngine extends Context.Service<SyncEngine>()(
   "parcel/SyncEngine",
@@ -515,6 +801,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       const sql = yield* SqlClient.SqlClient;
       const compression = yield* Compression;
       const imageFetcher = yield* ImageFetcher;
+      const people = yield* People;
       const outbox = yield* OutboxEngine;
       yield* mark(BOOT_ENGINE_READY);
 
@@ -526,12 +813,20 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             subject: "",
             snippet: "",
             participants: [] as ReadonlyArray<string>,
+            senderEmail: "",
           }),
-          onSome: (message) => ({
-            subject: headerValue(message, "subject") ?? "",
-            snippet: message.snippet ?? "",
-            participants: [parseFrom(headerValue(message, "from") ?? "").name],
-          }),
+          onSome: (message) => {
+            const from = parseFrom(headerValue(message, "from") ?? "");
+            return {
+              subject: headerValue(message, "subject") ?? "",
+              snippet: message.snippet ?? "",
+              participants: [from.name],
+              // Stored beside the name because the name is not enough to key
+              // an avatar on: two senders share a display name routinely, and
+              // a logo belongs to a domain.
+              senderEmail: from.email.toLowerCase(),
+            };
+          },
         });
         const messages = thread.messages ?? [];
         return sql`INSERT OR REPLACE INTO threads ${sql.insert([
@@ -541,6 +836,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
             subject: latest.subject,
             snippet: thread.snippet ?? latest.snippet,
             participants: JSON.stringify(latest.participants),
+            sender_email: latest.senderEmail,
             latest_date: latestDate(messages),
             message_count: messages.length,
             is_unread: hasLabel(messages, UNREAD_LABEL) ? 1 : 0,
@@ -582,6 +878,32 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         ])}`;
       };
 
+      // Html → the markdown the message is displayed from, ready to store.
+      //
+      // `None` means there is nothing worth keeping, and the reader falls back
+      // to the html. The converter is total and answers "" for input it can
+      // make nothing of; storing that would render every such message blank.
+      //
+      // NOTE: Deliberately NOT called while a thread is being synced, even
+      // though that is where the html arrives and where it would be free of a
+      // second decompression. Conversion is pure CPU on the main thread — the
+      // one drawing the list — and a backfill is already saturating it, so
+      // paying per message during the walk is felt as lag on a mailbox large
+      // enough for any of this to matter. The backfill loop below does the
+      // work instead, when the sync has gone quiet.
+      //
+      // DOMParser is what makes it main-thread-only: it does not exist in a
+      // worker, so this cannot be moved off the UI thread as it stands.
+      const compressMarkdown = (
+        html: string,
+      ): Effect.Effect<Option.Option<CompressedBody>> =>
+        Effect.suspend(() => {
+          const markdown = emailHtmlToMarkdown(html);
+          return markdown === ""
+            ? Effect.succeed(Option.none<CompressedBody>())
+            : compression.compress(markdown).pipe(Effect.orDie, Effect.asSome);
+        });
+
       // NOTE: orDie on compress. This gzips a string we just decoded
       // ourselves, so a failure is the platform misbehaving rather than
       // anything a sync retry could fix, and keeping it out of the error
@@ -598,12 +920,16 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
               const body = yield* compression
                 .compress(utf8.decode(base64UrlToBytes(data)))
                 .pipe(Effect.orDie);
+              // Markdown is left NULL for the backfill loop to fill in. The
+              // walk stays as cheap as it was before markdown existed.
               yield* sql`INSERT OR REPLACE INTO message_bodies ${sql.insert([
                 {
                   message_id: message.id,
                   mime_type: part.mimeType ?? "text/plain",
                   data: body.data,
                   codec: body.codec,
+                  markdown: null,
+                  markdown_codec: null,
                 },
               ])}`;
             }),
@@ -857,11 +1183,13 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const profile = yield* gmail.getProfile;
           // The backfill walks the entire mailbox (see syncBatch), so the
           // profile's own thread count is the denominator. The prime page
-          // still lists INBOX only: the boot view is the inbox, and these 15
-          // threads exist to fill its first screen.
+          // narrows harder than that: the boot view is the Primary tab, and
+          // these 15 threads exist to fill its first screen. Listing the whole
+          // inbox instead can spend all fifteen on a promotions blizzard and
+          // leave the first screen you ever see empty.
           const totalEstimate = profile.threadsTotal;
           const page = yield* gmail.listThreads({
-            labelIds: [INBOX_LABEL],
+            ...PHASE_QUERY.primary,
             maxResults: PULL_LIMIT,
           });
           yield* syncThreads(yield* unseenThreadIds(page.threads ?? []));
@@ -896,16 +1224,16 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // deleted a thread mid-walk, and "done" is the one moment the number
       // is worth being exact about.
       const syncBatch = (
+        phase: BackfillPhase,
         maybePageToken: Option.Option<PageToken>,
         previousCount: number,
       ): Effect.Effect<BatchResult, GmailError | SqlError> =>
         Effect.gen(function* () {
-          // The whole mailbox, not just INBOX: sent, drafts, archived — and
-          // spam/trash, which threads.list omits unless asked — all land in
-          // the store, because the folder views are local queries over it.
+          // See BackfillPhase for the order and why each phase re-lists what
+          // the one before it stored.
           const page = yield* gmail.listThreads({
             maxResults: LIST_PAGE_SIZE,
-            includeSpamTrash: true,
+            ...PHASE_QUERY[phase],
             ...Option.match(maybePageToken, {
               onNone: () => ({}),
               onSome: (pageToken) => ({ pageToken }),
@@ -914,7 +1242,25 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const unseen = yield* unseenThreadIds(page.threads ?? []);
           yield* syncThreads(unseen);
           const maybeNextPageToken = Option.fromNullishOr(page.nextPageToken);
-          const isDone = Option.isNone(maybeNextPageToken);
+
+          // One line per page, so which slice the walk is actually in is a
+          // fact you can read rather than infer from the tab counts. `listed`
+          // vs `fetched` separates "this phase is out of mail" from "this
+          // phase is re-listing what an earlier one already stored", which
+          // look identical from outside and mean opposite things.
+          yield* Effect.logInfo("backfill page", {
+            phase,
+            query: PHASE_QUERY[phase],
+            listed: (page.threads ?? []).length,
+            fetched: unseen.length,
+            hasNextPage: Option.isSome(maybeNextPageToken),
+          });
+          // Only the last page of the LAST phase finishes the backfill —
+          // running out of primary mail means the walk moves on, not that it
+          // is over.
+          const isDone =
+            Option.isNone(maybeNextPageToken) &&
+            Option.isNone(nextBackfillPhase(phase));
           const syncedCount = isDone
             ? yield* countLocalThreads
             : previousCount + unseen.length;
@@ -1205,6 +1551,290 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           };
         });
 
+      // AVATAR PASS
+      //
+      // NOTE: A separate loop from the image pass, not a step inside it. The
+      // two are bound by different things — mail images by the proxy, avatars
+      // by one request each to a hundred different origins — and a slow
+      // favicon must never hold up the images that make a mail readable.
+
+      // Bytes for a key that has none yet. `None` records the absence, which
+      // matters as much as the presence: most domains have no reachable
+      // favicon, and without a row saying so every pass retries all of them.
+      const storeAvatar = (
+        key: string,
+        maybeImage: Option.Option<FetchedImage>,
+      ) =>
+        Effect.gen(function* () {
+          const fetchedAt = yield* Clock.currentTimeMillis;
+          yield* Option.match(maybeImage, {
+            onNone: () => sql`
+              INSERT OR REPLACE INTO avatars (key, bytes, mime_type, is_missing, fetched_at)
+              VALUES (${key}, NULL, '', 1, ${fetchedAt})
+            `,
+            onSome: (image) => sql`
+              INSERT OR REPLACE INTO avatars (key, bytes, mime_type, is_missing, fetched_at)
+              VALUES (${key}, ${image.bytes}, ${image.mimeType}, 0, ${fetchedAt})
+            `,
+          });
+        });
+
+      // The contacts half: every profile photo this account can see, keyed by
+      // address. Runs at most once a day (PEOPLE_REFRESH_MS).
+      //
+      // NOTE: Failure is swallowed to a zero. A session predating the contacts
+      // scopes cannot call People at all, and the honest response to that is
+      // letter tiles, not a broken sync — the user re-consents by signing in
+      // again, exactly as with the outbox's write scopes.
+      const syncPeopleAvatars = Effect.gen(function* () {
+        const photos = yield* people.listPhotos.pipe(
+          Effect.catchCause(() => Effect.succeed([] as ReadonlyArray<never>)),
+        );
+        // NOTE: One query for the whole address book, not one per contact.
+        // Every SQL call is a round trip to the database worker, and asking
+        // "do we have this one?" a few thousand times over serializes the
+        // whole boot behind a question that fits in a single IN.
+        const candidates = Arr.dedupeWith(
+          photos.map((photo) => ({ key: personKey(photo.email), photo })),
+          (left, right) => left.key === right.key,
+        );
+        if (Arr.isReadonlyArrayEmpty(candidates)) {
+          const syncedAt = yield* Clock.currentTimeMillis;
+          yield* sql`UPDATE sync_state SET people_synced_at = ${syncedAt} WHERE id = 1`;
+          return 0;
+        }
+        const knownRaw = yield* sql`
+          SELECT key FROM avatars
+          WHERE ${sql.in(
+            "key",
+            candidates.map(({ key }) => key),
+          )}
+        `;
+        const known = new Set(
+          (yield* decodeDbAvatarKeys(knownRaw).pipe(Effect.orDie)).map(
+            (row) => row.key,
+          ),
+        );
+        const wanted = candidates.filter(({ key }) => !known.has(key));
+
+        yield* Effect.forEach(
+          wanted,
+          ({ key, photo }) =>
+            // Through the proxy like every other remote image:
+            // lh3.googleusercontent.com sends no CORS headers the tab can use.
+            imageFetcher
+              .fetchImage(photo.photoUrl)
+              .pipe(Effect.flatMap((image) => storeAvatar(key, image))),
+          { concurrency: IMAGE_CONCURRENCY },
+        );
+
+        const syncedAt = yield* Clock.currentTimeMillis;
+        yield* sql`UPDATE sync_state SET people_synced_at = ${syncedAt} WHERE id = 1`;
+        return wanted.length;
+      });
+
+      const isPeopleStale = Effect.gen(function* () {
+        const raw =
+          yield* sql`SELECT people_synced_at FROM sync_state WHERE id = 1`;
+        const rows = yield* decodeDbPeopleSynced(raw).pipe(Effect.orDie);
+        const syncedAt = firstRowOr(rows, (row) => row.people_synced_at, 0);
+        const now = yield* Clock.currentTimeMillis;
+        return now - syncedAt > PEOPLE_REFRESH_MS;
+      });
+
+      // The company half: sender domains in the hot window with nothing stored
+      // for them yet. Deliberately driven off the threads table rather than a
+      // queue of its own — the mailbox already is the queue.
+      const pendingAvatarEmails = Effect.gen(function* () {
+        const raw = yield* sql`
+          SELECT DISTINCT sender_email FROM threads
+          WHERE sender_email != ''
+          ORDER BY latest_date DESC
+          LIMIT ${HOT_THREAD_COUNT}
+        `;
+        const rows = yield* decodeDbSenderEmails(raw).pipe(Effect.orDie);
+        return rows.map((row) => row.sender_email);
+      });
+
+      const resolveDomainAvatars = Effect.gen(function* () {
+        const emails = yield* pendingAvatarEmails;
+        // A domain is worth one lookup however many senders share it, and the
+        // person key is checked first because a face beats a logo.
+        const candidates = Arr.dedupe(
+          emails.flatMap((email) =>
+            Option.isSome(avatarUrl(personKey(email)))
+              ? []
+              : logoDomains(email),
+          ),
+        );
+        if (Arr.isReadonlyArrayEmpty(candidates)) {
+          return 0;
+        }
+
+        const knownRaw = yield* sql`
+          SELECT key FROM avatars
+          WHERE ${sql.in("key", candidates.map(domainKey))}
+        `;
+        const known = new Set(
+          (yield* decodeDbAvatarKeys(knownRaw).pipe(Effect.orDie)).map(
+            (row) => row.key,
+          ),
+        );
+        const wanted = Arr.take(
+          candidates.filter((domain) => !known.has(domainKey(domain))),
+          AVATAR_BATCH_DOMAINS,
+        );
+
+        yield* Effect.forEach(
+          wanted,
+          (domain) =>
+            imageFetcher
+              .fetchImage(faviconUrl(domain))
+              .pipe(
+                Effect.flatMap((image) =>
+                  storeAvatar(domainKey(domain), image),
+                ),
+              ),
+          { concurrency: IMAGE_CONCURRENCY },
+        );
+        return wanted.length;
+      });
+
+      // Stored bytes into blob urls the view can read.
+      //
+      // NOTE: Two queries, and the split is the point. This runs every turn of
+      // a loop that keeps going long after the last avatar is resolved, so
+      // reading the BLOBs first and discarding the ones already registered
+      // would drag several megabytes out of SQLite every ten seconds, forever.
+      // The keys are tiny; only the ones the registry is actually missing cost
+      // their bytes, and a settled mailbox pays for none of them.
+      const publishAvatars = Effect.gen(function* () {
+        const keyRaw = yield* sql`
+          SELECT key FROM avatars
+          WHERE is_missing = 0
+          ORDER BY fetched_at DESC
+          LIMIT ${AVATAR_PUBLISH_LIMIT}
+        `;
+        const keys = (yield* decodeDbAvatarKeys(keyRaw).pipe(Effect.orDie))
+          .map((row) => row.key)
+          .filter((key) => Option.isNone(avatarUrl(key)));
+        // NOTE: `sql.in` with an empty list is a syntax error, and an empty
+        // list is the steady state here.
+        if (Arr.isReadonlyArrayEmpty(keys)) {
+          return 0;
+        }
+
+        const raw = yield* sql`
+          SELECT key, mime_type, bytes FROM avatars
+          WHERE ${sql.in("key", keys)}
+        `;
+        const rows = yield* decodeDbAvatars(raw).pipe(Effect.orDie);
+        return Arr.reduce(rows, 0, (added, row) =>
+          row.bytes !== null &&
+          registerAvatar(row.key, row.mime_type, row.bytes)
+            ? added + 1
+            : added,
+        );
+      });
+
+      const cacheAvatarBatch: Effect.Effect<AvatarBatchResult, SqlError> =
+        Effect.gen(function* () {
+          const peopleAdded = (yield* isPeopleStale)
+            ? yield* syncPeopleAvatars
+            : 0;
+          const domainsAdded = yield* resolveDomainAvatars;
+          const addedCount = yield* publishAvatars;
+          return {
+            addedCount,
+            isIdle: peopleAdded === 0 && domainsAdded === 0,
+          };
+        });
+
+      // MARKDOWN BACKFILL
+      //
+      // Bodies stored before the markdown column existed, and any the
+      // converter has since been taught to handle better. Queued in
+      // message_bodies itself: markdown IS NULL means pending, which the
+      // partial index from migration 0010 makes cheap to ask about.
+
+      // Priority order matches the image pass: threads you have opened first,
+      // then the newest. What you are most likely to open next is what gets
+      // the fast path first.
+      //
+      // `openedOnly` is the whole concurrency story with the sync. While the
+      // mailbox is still walking, the only bodies worth spending main-thread
+      // time on are the ones you have actually opened — a handful, and their
+      // next open is instant. The unbounded pass waits until the sync has
+      // gone quiet, so the two never compete for the thread drawing the list.
+      const pendingMarkdownBodies = (openedOnly: boolean) =>
+        Effect.gen(function* () {
+          const scope = openedOnly ? "AND t.images_used_at > 0" : "";
+          const raw = yield* sql`
+            SELECT b.message_id, b.mime_type, b.data, b.codec,
+                   b.markdown, b.markdown_codec
+            FROM message_bodies b
+            JOIN messages m ON m.id = b.message_id
+            JOIN threads t ON t.id = m.thread_id
+            WHERE b.markdown IS NULL AND b.mime_type = 'text/html'
+              ${sql.literal(scope)}
+            ORDER BY t.images_used_at DESC, t.latest_date DESC
+            LIMIT ${MARKDOWN_BATCH_BODIES}
+          `;
+          return yield* decodeDbMarkdownBodies(raw).pipe(Effect.orDie);
+        });
+
+      // One turn of the backfill. Converts what it took and writes the results
+      // in a single transaction, the same shape as the image pass.
+      //
+      // NOTE: A body that cannot be decompressed still gets written — as the
+      // empty marker, which reads back as "no markdown" (storedMarkdown) and
+      // opens through the html path. Leaving it NULL would put it back at the
+      // head of the queue on the next turn and every turn after that, and one
+      // corrupt row would stall the backfill for the whole mailbox.
+      const convertMarkdownBatch = (
+        openedOnly: boolean,
+      ): Effect.Effect<MarkdownBatchResult, SqlError> =>
+        Effect.gen(function* () {
+          const pending = yield* pendingMarkdownBodies(openedOnly);
+          if (pending.length === 0) {
+            return { isIdle: true };
+          }
+
+          const converted = yield* Effect.forEach(pending, (stored) =>
+            compression.decompress(stored).pipe(
+              Effect.flatMap(compressMarkdown),
+              Effect.catchCause(() =>
+                Effect.succeed(Option.none<CompressedBody>()),
+              ),
+              Effect.map((markdown) => ({
+                message_id: stored.message_id,
+                markdown: Option.match(markdown, {
+                  onNone: () => EMPTY_MARKDOWN,
+                  onSome: (body) => body.data,
+                }),
+                codec: Option.match(markdown, {
+                  onNone: (): BodyCodec => "none",
+                  onSome: (body) => body.codec,
+                }),
+              })),
+            ),
+          );
+
+          yield* sql.withTransaction(
+            Effect.forEach(
+              converted,
+              (row) => sql`
+                UPDATE message_bodies
+                SET markdown = ${row.markdown}, markdown_codec = ${row.codec}
+                WHERE message_id = ${row.message_id}
+              `,
+              { discard: true },
+            ),
+          );
+
+          return { isIdle: false };
+        });
+
       // READS
 
       // One folder's rows, newest first. Never touches the network: filling
@@ -1221,17 +1851,94 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
       // with location.reload() — the dev tab reloaded in a metronomic loop.
       // The cap is the same tier the image cache calls hot, and everything
       // past it is a search away; SQL remains the authority for the mailbox.
-      const loadFolder = (folder: Folder) =>
+      //
+      // NOTE: `categories` narrows the query, and it has to be the query
+      // rather than a filter over the result. The cap is applied by this
+      // LIMIT, so taking the newest 1,000 of the whole inbox and narrowing
+      // afterwards gives the tab whatever of it happened to fall inside that
+      // window — which, for a mailbox whose inbox is mostly promotions, is
+      // almost nothing. Measured on a real one: 34 rows reached the Primary
+      // tab out of 1,211 primary threads in the store, against a badge
+      // reading 643, and the list simply stopped scrolling. Narrowing first
+      // gives each tab its own newest 1,000.
+      const loadFolder = (
+        folder: Folder,
+        categories: ReadonlyArray<ThreadCategory>,
+      ) =>
         Effect.gen(function* () {
+          // NOTE: Built from ThreadCategory's own literals, not from the
+          // argument's strings — the fragment is interpolated into SQL, so
+          // nothing that reaches it should come from outside this module.
+          // Empty means every category: the folders outside the inbox have no
+          // tabs, and the query must never become `IN ()`.
+          const wanted = ThreadCategory.literals.filter((category) =>
+            categories.includes(category),
+          );
+          const narrowing =
+            wanted.length === 0
+              ? ""
+              : ` AND category IN (${wanted.map((c) => `'${c}'`).join(",")})`;
           const raw = yield* sql`
             SELECT ${sql.literal(THREAD_ROW_COLUMNS)}
             FROM threads
-            WHERE ${sql.literal(FOLDER_WHERE[folder])}
+            WHERE ${sql.literal(FOLDER_WHERE[folder] + narrowing)}
             ORDER BY latest_date DESC
             LIMIT ${HOT_THREAD_COUNT}
           `;
           return yield* decodeThreadRows(raw);
         });
+
+      // Every number the toolbar shows, in one pass over the table.
+      //
+      // NOTE: One query with conditional sums rather than eight COUNT(*)s.
+      // Each of those is its own round trip to the database worker, and this
+      // is re-read on the same cadence as the list during a backfill.
+      //
+      // `is_unread` mirrors Gmail's own tab counters. The category arithmetic
+      // matches TAB_FROM_CATEGORY in the page's model: primary is where
+      // uncategorized mail lands, because "primary" is Gmail's name for the
+      // absence of a category rather than a label of its own.
+      const readCounts = Effect.gen(function* () {
+        const inInbox = "in_inbox = 1 AND is_spam = 0 AND is_trash = 0";
+        // NOTE: COUNT(CASE …) with no ELSE, not SUM. Over an empty table SUM
+        // is NULL and every one of these would have to be coalesced; COUNT
+        // ignores the NULLs the CASE produces and returns a real 0, which is
+        // the honest answer for a store that has not synced yet.
+        const raw = yield* sql`
+          SELECT
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              AND category IN ('personal', 'none') THEN 1 END) AS primary_count,
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              AND category = 'social' THEN 1 END) AS social_count,
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              AND category = 'promotions' THEN 1 END) AS promotions_count,
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              AND category = 'updates' THEN 1 END) AS updates_count,
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              AND category = 'forums' THEN 1 END) AS forums_count,
+            COUNT(CASE WHEN ${sql.literal(inInbox)} AND is_unread = 1
+              THEN 1 END) AS inbox_count,
+            COUNT(CASE WHEN is_draft = 1 AND is_spam = 0 AND is_trash = 0
+              THEN 1 END) AS drafts_count,
+            COUNT(CASE WHEN is_spam = 1 THEN 1 END) AS spam_count
+          FROM threads
+        `;
+        const rows = yield* decodeDbMailboxCounts(raw).pipe(Effect.orDie);
+        return firstRowOr(
+          rows,
+          (row): MailboxCounts => ({
+            primary: row.primary_count,
+            social: row.social_count,
+            promotions: row.promotions_count,
+            updates: row.updates_count,
+            forums: row.forums_count,
+            inbox: row.inbox_count,
+            drafts: row.drafts_count,
+            spam: row.spam_count,
+          }),
+          EMPTY_COUNTS,
+        );
+      });
 
       // The boot-only first read: the viewport's worth of inbox rows in
       // O(limit), served by the (in_inbox, latest_date DESC) index. The full
@@ -1284,6 +1991,82 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           return url;
         });
 
+      /** What a message opens as, plus the markdown to write back if this
+       *  open is what produced it. */
+      type OpenedBody = Readonly<{
+        kind: BodyKind;
+        /** Markdown, html or plain text, according to `kind`. */
+        text: string;
+        writeBack: Option.Option<CompressedBody>;
+      }>;
+
+      /**
+       * The rendition a message opens from.
+       *
+       * Converts on the spot when the backfill has not reached this body yet,
+       * rather than falling back to the sender's html. Two renderings of the
+       * same mailbox is not a thing a reader should ever see, and which one
+       * you got would depend on nothing more legible than how far a background
+       * loop had run — so the loop is a pre-warm, not the thing that decides.
+       *
+       * The conversion is paid once: `writeBack` carries the result to the
+       * caller, which stores it, and every later open of the message is the
+       * cheap path again.
+       *
+       * NOTE: The html fallback survives for exactly one case — a body the
+       * converter can make nothing of, which would otherwise render as a blank
+       * message. It writes the marker back too, so the queue does not retry it
+       * on every pass.
+       */
+      const openBody = (
+        maybeStored: Option.Option<DbMarkdownBodyRow>,
+      ): Effect.Effect<OpenedBody, CompressionError> =>
+        Effect.gen(function* () {
+          if (Option.isNone(maybeStored)) {
+            return { kind: "plain", text: "", writeBack: Option.none() };
+          }
+          const stored = maybeStored.value;
+
+          const ready = storedMarkdown(stored);
+          if (Option.isSome(ready)) {
+            return {
+              kind: "markdown",
+              text: yield* compression.decompress(ready.value),
+              writeBack: Option.none(),
+            };
+          }
+
+          const text = yield* compression.decompress(stored);
+          if (stored.mime_type !== "text/html") {
+            return { kind: "plain", text, writeBack: Option.none() };
+          }
+
+          // Already tried, and the answer was nothing. Re-running the
+          // converter would only produce the same empty string.
+          if (isConverted(stored)) {
+            return { kind: "html", text, writeBack: Option.none() };
+          }
+
+          const markdown = emailHtmlToMarkdown(text);
+          if (markdown === "") {
+            return {
+              kind: "html",
+              text,
+              writeBack: Option.some({
+                codec: "none",
+                data: EMPTY_MARKDOWN,
+              } satisfies CompressedBody),
+            };
+          }
+          return {
+            kind: "markdown",
+            text: markdown,
+            writeBack: Option.some(
+              yield* compression.compress(markdown).pipe(Effect.orDie),
+            ),
+          };
+        });
+
       // Opening a thread: SQLite only.
       const loadThread = (id: ThreadId) =>
         Effect.gen(function* () {
@@ -1309,12 +2092,13 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           const messages = yield* Effect.forEach(rows, (row) =>
             Effect.gen(function* () {
               const bodyRaw = yield* sql`
-                SELECT message_id, mime_type, data, codec
+                SELECT message_id, mime_type, data, codec,
+                       markdown, markdown_codec
                 FROM message_bodies
                 WHERE message_id = ${row.id}
               `;
               const maybeStored = Arr.head(
-                yield* decodeDbBodies(bodyRaw).pipe(Effect.orDie),
+                yield* decodeDbMarkdownBodies(bodyRaw).pipe(Effect.orDie),
               );
               const imagesRaw = yield* sql`
                 SELECT message_id, content_id, mime_type, bytes
@@ -1333,13 +2117,14 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                 Effect.orDie,
               );
 
-              // Decompressed first: the cid: rewrite below is a string
-              // replacement and this is where the string comes from.
-              const decompressed = yield* Option.match(maybeStored, {
-                onNone: () => Effect.succeed(""),
-                onSome: (stored) => compression.decompress(stored),
-              });
+              const opened = yield* openBody(maybeStored);
 
+              // Inline attachments, addressed by the `cid:` token the body
+              // refers to them by, and cached remote images addressed by
+              // their original url. Both become blobs so the render is local
+              // and the sender's tracking pixels never fire on open. Anything
+              // missing from this map is left alone and loads live, which is
+              // what keeps a cold thread readable rather than half-broken.
               const inlineBlobs = yield* Effect.forEach(images, (image) =>
                 registerObjectUrl(image.mime_type, image.bytes).pipe(
                   Effect.map((url): [string, string] => [
@@ -1348,37 +2133,61 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
                   ]),
                 ),
               );
-              const inlined = Arr.reduce(
-                inlineBlobs,
-                decompressed,
-                (body, [token, url]) => body.replaceAll(token, url),
-              );
-
-              // Cached remote images become blobs too, so the render is local
-              // and the sender's tracking pixels never fire on open. Uncached
-              // urls are left alone and load live, which is what keeps a cold
-              // thread readable rather than half-broken.
               const remoteBlobs = yield* Effect.forEach(remote, (image) =>
                 registerObjectUrl(image.mime_type, image.bytes).pipe(
                   Effect.map((url): [string, string] => [image.url, url]),
                 ),
               );
+              const localUrls = new Map([...inlineBlobs, ...remoteBlobs]);
 
               return {
-                id: row.id,
-                fromName: row.from_name,
-                fromEmail: row.from_email,
-                date: row.internal_date,
-                bodyKind: Option.match(maybeStored, {
-                  onNone: (): BodyKind => "plain",
-                  onSome: ({ mime_type }): BodyKind =>
-                    mime_type === "text/html" ? "html" : "plain",
-                }),
-                body: rewriteImageUrls(inlined, new Map(remoteBlobs)),
-                rfc822MessageId: row.rfc822_message_id,
-                references: row.references_header,
-              } satisfies MessageDetail;
+                detail: {
+                  id: row.id,
+                  fromName: row.from_name,
+                  fromEmail: row.from_email,
+                  date: row.internal_date,
+                  bodyKind: opened.kind,
+                  // NOTE: Once, here, and not in the view. The body is
+                  // rendered into a shadow root in this document rather than a
+                  // sandboxed iframe, so `prepareBody` is what makes it safe
+                  // to insert at all (sanitizeBody.ts) — and the view runs on
+                  // every render, while this runs on open.
+                  //
+                  // Markdown is rendered to html before it is prepared, never
+                  // inserted as-is. `prepareBody` still runs over the result:
+                  // it is what swaps cached image bytes in for their urls, and
+                  // it is the sanitizer this document's safety rests on either
+                  // way. It is cheap here — the rendered markdown is a
+                  // fraction of the html it came from.
+                  //
+                  // A plain body is not html and must not be parsed as it: it
+                  // goes into a `<pre>` as text, where the renderer escapes
+                  // it.
+                  body:
+                    opened.kind === "markdown"
+                      ? prepareBody(
+                          renderEmailMarkdownToHtml(opened.text),
+                          localUrls,
+                        )
+                      : opened.kind === "html"
+                        ? prepareBody(opened.text, localUrls)
+                        : opened.text,
+                  rfc822MessageId: row.rfc822_message_id,
+                  references: row.references_header,
+                } satisfies MessageDetail,
+                writeBack: Option.map(opened.writeBack, (markdown) => ({
+                  message_id: row.id,
+                  markdown,
+                })),
+              };
             }),
+          );
+
+          // Anything this open had to convert itself, so the next one does
+          // not. One transaction with the stamp below, which is one round trip
+          // to the database worker rather than one per message.
+          const writeBacks = Arr.getSomes(
+            messages.map((message) => message.writeBack),
           );
 
           // The LRU stamp, and the only way a thread outside the hot window
@@ -1386,17 +2195,38 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
           // images are worth keeping. The next batch picks it up, so this
           // open renders remote images live and every later one is local.
           const usedAt = yield* Clock.currentTimeMillis;
-          yield* sql`
-            UPDATE threads SET images_used_at = ${usedAt} WHERE id = ${id}
-          `;
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`
+                UPDATE threads SET images_used_at = ${usedAt} WHERE id = ${id}
+              `;
+              yield* Effect.forEach(
+                writeBacks,
+                ({ message_id, markdown }) => sql`
+                  UPDATE message_bodies
+                  SET markdown = ${markdown.data},
+                      markdown_codec = ${markdown.codec}
+                  WHERE message_id = ${message_id}
+                `,
+                { discard: true },
+              );
+            }),
+          );
 
-          return { id, subject, messages } satisfies ThreadDetail;
+          return {
+            id,
+            subject,
+            messages: messages.map((message) => message.detail),
+          } satisfies ThreadDetail;
         });
 
       return {
+        cacheAvatarBatch,
         cacheImageBatch,
+        convertMarkdownBatch,
         loadFolder,
         loadInboxTop,
+        readCounts,
         loadThread,
         localSizeBytes,
         readCheckpoint,
@@ -1414,6 +2244,7 @@ export class SyncEngine extends Context.Service<SyncEngine>()(
         SqlLive,
         Compression.layer,
         ImageFetcher.layer,
+        People.layer,
         OutboxEngine.layer,
       ),
     ),

@@ -74,6 +74,18 @@ export default defineConfig({
     tailwindcss(),
     prerenderLanding(),
   ],
+  resolve: {
+    // The vendored converter (../email-to-markdown) imports dompurify by bare
+    // specifier from outside this package, so node resolution would look in
+    // its own node_modules — present only after `npm install` there, and a
+    // second copy of the library when it is. Pinning it here makes the build
+    // work from a fresh clone and keeps one dompurify in the bundle.
+    alias: {
+      dompurify: fileURLToPath(
+        new URL("node_modules/dompurify", import.meta.url),
+      ),
+    },
+  },
   optimizeDeps: {
     exclude: ["@effect/wa-sqlite"],
   },

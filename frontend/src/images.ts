@@ -29,7 +29,12 @@ import { API_URL } from "./config";
 // mailbox, and `DOMParser` on 22,000 documents averaging 50 KB is seconds of
 // main thread. The cost of the shortcut is bounded — a missed url means one
 // image is fetched live on open instead of served locally, never a broken
-// render, because the rewrite below only substitutes urls it actually has.
+// render, because the rewrite only substitutes urls it actually has.
+//
+// NOTE: sanitizeBody.ts does the matching rewrite and DOES parse. The two
+// look like the same job and do not have the same budget: that one runs once,
+// on the message being opened, and has to parse anyway to sanitize. This one
+// runs over the whole mailbox. Please don't unify them.
 const SRC_PATTERN = /(?:src|background)\s*=\s*["']([^"']+)["']/gi;
 
 /** How many remote images we're willing to store for one message. Real mail
@@ -45,7 +50,7 @@ const MAX_IMAGES_PER_MESSAGE = 60;
 // Matched narrowly on the endpoint shapes the big senders use rather than on
 // anything resembling a heuristic. A false positive here is cheap and a false
 // negative is not: an image wrongly skipped simply loads from its origin when
-// the mail is opened (see rewriteImageUrls), while a tracker wrongly fetched
+// the mail is opened (see sanitizeBody.ts), while a tracker wrongly fetched
 // is a read receipt that cannot be taken back.
 const TRACKER_PATTERNS: ReadonlyArray<RegExp> = [
   /\/wf\/open\b/i, // SendGrid, Sailthru
@@ -138,17 +143,6 @@ export const remoteImageUrls = (body: string): ReadonlyArray<string> => {
     MAX_IMAGES_PER_MESSAGE,
   );
 };
-
-/** Swap cached urls for local blob urls. Anything absent from `local` is left
- *  exactly as it was, so an uncached image still loads from its origin rather
- *  than turning into a broken image. */
-export const rewriteImageUrls = (
-  body: string,
-  local: ReadonlyMap<string, string>,
-): string =>
-  Arr.reduce([...local], body, (rewritten, [url, blobUrl]) =>
-    rewritten.replaceAll(url, blobUrl),
-  );
 
 export type FetchedImage = Readonly<{
   mimeType: string;

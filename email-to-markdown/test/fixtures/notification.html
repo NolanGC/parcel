@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <table role="presentation" width="100%">
+    <tr>
+      <td>
+        <h2>Build failed on <code>main</code></h2>
+        <p><b>parcel</b> &mdash; commit <code>bbc32c3</code> by Nolan</p>
+        <pre>
+  error: Unknown module value
+     ┌─ src/email_to_markdown/table.gleam:225:20
+     │
+ 225 │   list.range(column, column + width - 1)
+     │        ^^^^^
+</pre>
+        <p>Steps that failed:</p>
+        <p>&bull; gleam test</p>
+        <p>&bull; gleam format --check</p>
+        <hr>
+        <p><a href="https://ci.example.test/runs/8812">View the full run</a></p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

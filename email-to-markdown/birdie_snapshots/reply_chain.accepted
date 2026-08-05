@@ -1,0 +1,17 @@
+---
+version: 1.5.5
+title: reply_chain
+---
+Sounds good — shipping it today.
+
+One thing: the migration needs to run **before** the deploy.
+
+> On Mon, Oct 20, 2026 at 9:14 AM Ada &lt;ada@example.test> wrote:
+>
+> > Can we get the release out this week?
+> >
+> > Checklist:
+> >
+> > - Run migrations
+> > - Tag the release
+

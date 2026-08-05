@@ -152,6 +152,7 @@ describe("reconcileRows", () => {
     id: ThreadId.make(id),
     subject: `Subject ${id}`,
     sender: `sender-${id}@example.com`,
+    senderEmail: `sender-${id}@example.com`,
     snippet: `Snippet ${id}`,
     date: 1_700_000_000_000,
     isUnread: false,

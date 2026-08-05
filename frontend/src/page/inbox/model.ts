@@ -1,7 +1,7 @@
 // Imported by both view.ts and index.ts, and imports neither, which is what
 // keeps the split from becoming an import cycle.
 
-import { Array as Arr, Option, Schema as S } from "effect";
+import { Array as Arr, Match as M, Option, Schema as S } from "effect";
 import { AsyncData } from "foldkit";
 import { m } from "foldkit/message";
 import { ts } from "foldkit/schema";
@@ -13,7 +13,9 @@ import { THREADS_PER_SECOND, ThreadId } from "../../Gmail";
 import * as OutboxMachine from "../../outboxMachine";
 import { ThreadPatch } from "../../outboxOps";
 import {
+  EMPTY_COUNTS,
   Folder,
+  MailboxCounts,
   ThreadDetail,
   ThreadRow,
   type ThreadCategory,
@@ -32,8 +34,6 @@ export const LIST_OVERSCAN = 6;
 // NOTE: Only the perf bench reads this, but it lives here so a view change
 // can't leave the harness silently addressing nothing.
 export const DETAIL_PANE_ID = "inbox-detail-pane";
-
-export const BODY_FRAME_HEIGHT = 600;
 
 // APPEARANCE
 
@@ -56,6 +56,18 @@ export const TAB_LABELS = [
 ] as const;
 export type TabLabel = (typeof TAB_LABELS)[number];
 
+/** The same set as a schema, for the messages that carry a tab. */
+export const TabLabel = S.Literals(TAB_LABELS);
+
+/** The Tabs component holds its selection as a plain string, so this is the
+ *  one place that turns it back into a TabLabel. Falls back to the first tab,
+ *  which is also what an uninitialized Tabs model holds. */
+export const tabLabelOf = (value: string): TabLabel =>
+  Option.getOrElse(
+    Arr.findFirst(TAB_LABELS, (tab) => tab === value),
+    (): TabLabel => "Primary",
+  );
+
 export const TAB_FROM_CATEGORY: Record<ThreadCategory, TabLabel> = {
   personal: "Primary",
   none: "Primary",
@@ -64,6 +76,27 @@ export const TAB_FROM_CATEGORY: Record<ThreadCategory, TabLabel> = {
   updates: "Updates",
   forums: "Forums",
 };
+
+/** The categories a tab is made of — the inverse of TAB_FROM_CATEGORY, derived
+ *  from it so the two cannot disagree.
+ *
+ *  This is what the folder read narrows by. The read is capped at
+ *  HOT_THREAD_COUNT, so the narrowing has to happen in SQL: capping the whole
+ *  inbox first and slicing afterwards gives a tab only the rows that fell
+ *  inside that window, which on an inbox dominated by one category is nearly
+ *  none of them. */
+export const CATEGORIES_FOR_TAB: Record<
+  TabLabel,
+  ReadonlyArray<ThreadCategory>
+> = TAB_LABELS.reduce(
+  (map, tab) => ({
+    ...map,
+    [tab]: Object.entries(TAB_FROM_CATEGORY).flatMap(([category, label]) =>
+      label === tab ? [category as ThreadCategory] : [],
+    ),
+  }),
+  {} as Record<TabLabel, ReadonlyArray<ThreadCategory>>,
+);
 
 // NOTE: Content colors, deliberately outside the surface token system.
 export const AVATAR_BG = "#4f46e5";
@@ -235,59 +268,52 @@ const TAB_CONFIG: Record<
   Forums: { icon: Icon.bubbleChat, iconClass: "text-indigo-400" },
 };
 
-export type TabCounts = Record<TabLabel, number>;
-
-const ZERO_TAB_COUNTS: TabCounts = {
-  Primary: 0,
-  Social: 0,
-  Promotions: 0,
-  Updates: 0,
-  Forums: 0,
-};
-
-/** Unread threads per category tab, from the loaded inbox rows — the same
- *  rows the tab would show, so the number and the list can't disagree.
- *
- *  NOTE: One-slot cache on the rows' identity, for the same reason as
- *  filterRowsForTab: an unchanged list must hand the toolbar cluster the
- *  same object, or its memo slot misses on every unrelated Model change. */
-export const unreadTabCounts = (() => {
-  let slot:
-    | Readonly<{ rows: ReadonlyArray<ThreadRow>; counts: TabCounts }>
-    | undefined;
-  return (rows: ReadonlyArray<ThreadRow>): TabCounts => {
-    if (slot !== undefined && slot.rows === rows) {
-      return slot.counts;
-    }
-    const counts: TabCounts = { ...ZERO_TAB_COUNTS };
-    for (const row of rows) {
-      if (row.isUnread) {
-        counts[TAB_FROM_CATEGORY[row.category]] += 1;
-      }
-    }
-    slot = { rows, counts };
-    return counts;
-  };
-})();
+/** A tab's unread count, read off the real SQL counts rather than the loaded
+ *  window (see MailboxCounts). */
+const tabCount = (counts: MailboxCounts, tab: TabLabel): number =>
+  M.value(tab).pipe(
+    M.withReturnType<number>(),
+    M.when("Primary", () => counts.primary),
+    M.when("Social", () => counts.social),
+    M.when("Promotions", () => counts.promotions),
+    M.when("Updates", () => counts.updates),
+    M.when("Forums", () => counts.forums),
+    M.exhaustive,
+  );
 
 // Curried so the returned function sits at the top level of viewInputs (the
 // submodel boundary auto-scopes functions there, and only there).
 export const tabSpec =
-  (counts: TabCounts) =>
+  (counts: MailboxCounts) =>
   (label: string): Ui.Tabs.TabSpec =>
     Option.match(
       Arr.findFirst(TAB_LABELS, (tab) => tab === label),
       {
         onNone: () => ({ icon: Icon.circleQuestion, label }),
-        onSome: (tab) => ({
-          icon: TAB_CONFIG[tab].icon,
-          label: tab,
-          // Zero unread is silence, not "0".
-          detail: counts[tab] === 0 ? undefined : String(counts[tab]),
-          iconClass: TAB_CONFIG[tab].iconClass,
-        }),
+        onSome: (tab) => {
+          const count = tabCount(counts, tab);
+          return {
+            icon: TAB_CONFIG[tab].icon,
+            label: tab,
+            // Zero unread is silence, not "0".
+            detail: count === 0 ? undefined : String(count),
+            iconClass: TAB_CONFIG[tab].iconClass,
+          };
+        },
       },
     );
+
+/** A folder's badge. Most folders carry none: a number is worth showing where
+ *  it tells you there is something to do, and "how many mails you have ever
+ *  sent" is not that. */
+export const folderCount = (counts: MailboxCounts, folder: Folder): number =>
+  M.value(folder).pipe(
+    M.withReturnType<number>(),
+    M.when("inbox", () => counts.inbox),
+    M.when("drafts", () => counts.drafts),
+    M.when("spam", () => counts.spam),
+    M.orElse(() => 0),
+  );
 
 const categoryPill = (tab: TabLabel): Option.Option<CategoryConfig> =>
   Option.some({ label: tab, ...TAB_CONFIG[tab] });
@@ -494,6 +520,18 @@ export const Model = S.Struct({
   /** The newest HOT_THREAD_COUNT threads are fully local, bodies and images.
    *  Latched; see the CompletedCacheImageBatch handler. */
   isRecentReady: S.Boolean,
+  /** How many sender images the blob registry has published (avatars.ts).
+   *
+   *  NOTE: A counter, not the images. The bytes and their blob urls live in
+   *  the registry, which is a cache, not state — putting a few hundred of
+   *  them in the Model would put them in every model-preserve and every
+   *  devtools snapshot for nothing. What the Model owes the runtime here is
+   *  only the fact that something changed, which is exactly one number. */
+  avatarVersion: S.Number,
+  /** The tab and folder badges. Counted in SQL over the whole store and
+   *  re-read on the same cadence as the list, so they track a running
+   *  backfill instead of describing the window the list happens to hold. */
+  counts: MailboxCounts,
 });
 export type Model = typeof Model.Type;
 
@@ -532,6 +570,8 @@ export const init = (
   maybeSearchError: Option.none(),
   maybeLocalBytes: Option.none(),
   isRecentReady: false,
+  avatarVersion: 0,
+  counts: EMPTY_COUNTS,
 });
 
 // MESSAGE
@@ -578,11 +618,14 @@ export const FailedSearch = m("FailedSearch", {
   seq: S.Number,
   error: S.String,
 });
-/** A folder read finished: real thread rows from the local store. Carries
- *  the folder it selected, so a read that lost a race to a folder switch can
- *  be recognized and dropped instead of painting the wrong mailbox. */
+/** A folder read finished: real thread rows from the local store. Carries the
+ *  folder AND the tab it selected, so a read that lost a race to a switch of
+ *  either can be recognized and dropped instead of painting the wrong slice.
+ *  The tab is part of the query now, not a filter over the answer, which is
+ *  what makes it something a read can be stale about. */
 export const SucceededLoadFolder = m("SucceededLoadFolder", {
   folder: Folder,
+  tab: TabLabel,
   rows: S.Array(ThreadRow),
 });
 /** The boot-only LIMITed first read: enough rows to paint the viewport,
@@ -603,6 +646,14 @@ export const FailedLoadFolder = m("FailedLoadFolder", {
   folder: Folder,
   error: S.String,
 });
+/** The tab and folder badges, recounted. */
+export const SucceededReadCounts = m("SucceededReadCounts", {
+  counts: MailboxCounts,
+});
+/** A failed recount leaves the previous numbers up. They are a badge, not the
+ *  mail, and a stale count is better than a blanked one. */
+export const FailedReadCounts = m("FailedReadCounts", { error: S.String });
+
 /** On-disk size of the local store, for the sync pill's detail. */
 export const SucceededReadLocalSize = m("SucceededReadLocalSize", {
   bytes: S.Number,
@@ -617,6 +668,21 @@ export const CompletedCacheImageBatch = m("CompletedCacheImageBatch", {
   isRecentReady: S.Boolean,
 });
 export const FailedCacheImageBatch = m("FailedCacheImageBatch", {
+  error: S.String,
+});
+/** One avatar batch landed. `addedCount` is how many new images the registry
+ *  gained — the cue to repaint, and nothing more. */
+export const CompletedCacheAvatarBatch = m("CompletedCacheAvatarBatch", {
+  addedCount: S.Number,
+});
+export const FailedCacheAvatarBatch = m("FailedCacheAvatarBatch", {
+  error: S.String,
+});
+/** One markdown backfill batch landed — the loop's cue to ask for the next.
+ *  Carries nothing: converting a body changes what a later open costs, not
+ *  anything on screen now. */
+export const CompletedConvertMarkdownBatch = m("CompletedConvertMarkdownBatch");
+export const FailedConvertMarkdownBatch = m("FailedConvertMarkdownBatch", {
   error: S.String,
 });
 export const SucceededLoadThread = m("SucceededLoadThread", {
@@ -691,8 +757,14 @@ export const Message = S.Union([
   FailedLoadFolder,
   SucceededReadLocalSize,
   FailedReadLocalSize,
+  SucceededReadCounts,
+  FailedReadCounts,
   CompletedCacheImageBatch,
   FailedCacheImageBatch,
+  CompletedCacheAvatarBatch,
+  FailedCacheAvatarBatch,
+  CompletedConvertMarkdownBatch,
+  FailedConvertMarkdownBatch,
   SucceededLoadThread,
   PressedListKey,
   FailedLoadThread,

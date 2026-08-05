@@ -8,22 +8,26 @@ import * as Icon from "../../icons";
 import { ThreadId } from "../../Gmail";
 import { renderMarkdownToEmailHtml } from "../../markdown";
 import * as OutboxMachine from "../../outboxMachine";
+import { prepareBody } from "../../sanitizeBody";
 import {
   ThreadDetail,
   ThreadRow,
+  type BackfillPhase,
   type Folder,
+  type MailboxCounts,
   type MessageDetail,
   type ThreadCategory,
 } from "../../sync";
 import * as SyncMachine from "../../syncMachine";
 import * as Ui from "../../ui";
 import { createCappedKeyedLazy } from "../../ui/lazy";
+import { mailBodySpec } from "../../ui/mailBody";
+import { senderAvatarUrl } from "../../avatars";
 
 import {
   AVATAR_BG,
   AVATAR_FG,
   Appearance,
-  BODY_FRAME_HEIGHT,
   CATEGORY_PILLS,
   ClickedAppearance,
   ClickedArchiveRow,
@@ -72,13 +76,18 @@ import {
   RECENT_READY_LINE,
   formatTime,
   tabSpec,
-  type TabCounts,
+  folderCount,
   threadItemSpec,
-  unreadTabCounts,
   visibleRows,
 } from "./model";
 
 // VIEW
+
+const mailBody = mailBodySpec.withMessage<Message>();
+
+// A draft has no cached images to swap in — it is composed here, and every
+// url in it is already whatever the author typed.
+const EMPTY_URLS: ReadonlyMap<string, string> = new Map();
 
 // NOTE: Hoisted out of viewInputs. Inline it was a fresh string per render,
 // which missed the cluster's memoization slot no matter what the Model did.
@@ -86,11 +95,18 @@ const FOLDER_BUTTON_CLASS = `flex items-center gap-2 rounded-lg bg-hover px-2.5 
 
 // Curried so the returned function sits at the top level of viewInputs (the
 // submodel boundary auto-scopes functions there, and only there).
-const folderItemSpec = (folder: Folder) => (item: Folder) => ({
-  icon: FOLDER_CONFIG[item].icon,
-  label: FOLDER_CONFIG[item].label,
-  isChecked: item === folder,
-});
+const folderItemSpec =
+  (folder: Folder, counts: MailboxCounts) => (item: Folder) => {
+    const count = folderCount(counts, item);
+    return {
+      icon: FOLDER_CONFIG[item].icon,
+      label: FOLDER_CONFIG[item].label,
+      // Only the folders where a number means something carry one, and only
+      // when it is not zero (see folderCount).
+      detail: count === 0 ? undefined : String(count),
+      isChecked: item === folder,
+    };
+  };
 
 const folderButtonContent = (folder: Folder): Html => {
   const h = html();
@@ -230,6 +246,20 @@ const statusPillView = (
 // NOTE: Cold is deliberately not empty. The machine boots Cold, so rendering
 // nothing there made the pill appear a beat after first paint and shove the
 // toolbar sideways.
+// The backfill's tiers, named for the panel. See BackfillPhase in sync.ts for
+// what each one actually asks Gmail for.
+const BACKFILL_PHASE_LABEL: Record<BackfillPhase, string> = {
+  primary: "Primary",
+  inbox: "Rest of inbox",
+  rest: "Everything else",
+};
+
+const BACKFILL_PHASE_DETAIL: Record<BackfillPhase, string> = {
+  primary: "Filling the Primary tab first.",
+  inbox: "Primary is complete. Now the other inbox tabs.",
+  rest: "The inbox is complete. Now archived, sent and spam.",
+};
+
 type SyncSummary = Readonly<{
   /** The pill itself. */
   label: string;
@@ -272,10 +302,17 @@ const syncSummary = (sync: SyncMachine.State): SyncSummary =>
         isWorking: true,
         toLeadingGlyph: spinner,
       }),
-      Backfilling: ({ syncedCount, totalEstimate }) => ({
+      Backfilling: ({ syncedCount, totalEstimate, phase }) => ({
         label: `Syncing ${syncedCount.toLocaleString()} of ~${totalEstimate.toLocaleString()}`,
-        stage: "Backfilling",
-        detail: formatProgress(syncedCount, totalEstimate),
+        stage: `Backfilling · ${BACKFILL_PHASE_LABEL[phase]}`,
+        // Which slice the walk is in belongs next to the progress: the tiers
+        // are the reason the Primary tab fills before the rest, and without
+        // this the only way to tell them apart is to watch the tab counts and
+        // guess.
+        detail: `${BACKFILL_PHASE_DETAIL[phase]} ${formatProgress(
+          syncedCount,
+          totalEstimate,
+        )}`,
         maybeProgress: Option.some({ syncedCount, totalEstimate }),
         isWorking: true,
         toLeadingGlyph: spinner,
@@ -483,7 +520,7 @@ const folderClusterView = (
   folderMenu: Model["folderMenu"],
   tabs: Model["tabs"],
   folder: Folder,
-  counts: TabCounts,
+  counts: MailboxCounts,
 ): Html => {
   const h = html<Message>();
   return h.div(
@@ -495,7 +532,7 @@ const folderClusterView = (
         view: FolderMenu.view,
         viewInputs: {
           items: FOLDER_ITEMS,
-          itemSpec: folderItemSpec(folder),
+          itemSpec: folderItemSpec(folder, counts),
           buttonContent: folderButtonContent(folder),
           buttonClassName: FOLDER_BUTTON_CLASS,
           ariaLabel: "Mail folders",
@@ -601,9 +638,7 @@ const toolbarView = (model: Model, profile: Profile): Html => {
         model.folderMenu,
         model.tabs,
         model.folder,
-        unreadTabCounts(
-          Option.getOrElse(AsyncData.getData(model.threads), () => []),
-        ),
+        model.counts,
       ]),
       h.div(
         [h.Class("flex shrink-0 items-center gap-3")],
@@ -626,18 +661,45 @@ const toolbarView = (model: Model, profile: Profile): Html => {
   );
 };
 
-const senderTile = (label: string): Html => {
+// The sender's picture, or their initial.
+//
+// NOTE: The tile is the fallback BY CONSTRUCTION — the initial is always
+// drawn, and the image is laid over it. An avatar that has not been fetched
+// yet, or a url that fails to load, needs no handling at all: there is simply
+// nothing on top, and the letter shows. That is the whole error path, and it
+// costs no Message, no second state and nothing to keep in sync.
+// NOTE: Takes the resolved url rather than the address, so this stays a pure
+// function of its arguments. The lookup is a cache read (avatars.ts) and
+// belongs at the memo boundary, where `avatarVersion` can force it — resolving
+// in here would let a row keep a stale memo hit and never show its picture.
+// An empty string is "no image", not a missing argument.
+const senderTile = (label: string, avatarUrl: string): Html => {
   const h = html();
   return h.span(
     [
       h.Class(
-        "flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm font-bold leading-none",
+        "relative flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-full text-sm font-bold leading-none",
       ),
       h.Style({ backgroundColor: AVATAR_BG, color: AVATAR_FG }),
     ],
-    [label],
+    [
+      label,
+      avatarUrl === ""
+        ? h.empty
+        : h.img([
+            h.Src(avatarUrl),
+            // Decorative: the sender's name is right beside it, so announcing
+            // the picture too would only repeat it.
+            h.Alt(""),
+            h.Class("absolute inset-0 h-full w-full object-cover"),
+          ]),
+    ],
   );
 };
+
+/** The sender's image url for the view, or `""` for the letter tile. */
+const avatarUrlFor = (email: string): string =>
+  Option.getOrElse(senderAvatarUrl(email), () => "");
 
 // The thread's real Gmail category. Primary rows wear nothing: primary is
 // the absence of a category (see CATEGORY_PILLS).
@@ -670,7 +732,11 @@ const lazyThreadRow = createCappedKeyedLazy(ROW_MEMO_CAPACITY);
 //
 // Nothing here depends on the cursor, so a row is a pure function of its own
 // data and moving the selection rebuilds nothing.
-const threadRowView = (row: ThreadRow, index: number): Html => {
+const threadRowView = (
+  row: ThreadRow,
+  index: number,
+  avatarUrl: string,
+): Html => {
   const h = html<Message>();
   const tone = row.isUnread ? "text-foreground" : "text-muted-foreground";
 
@@ -703,7 +769,10 @@ const threadRowView = (row: ThreadRow, index: number): Html => {
           h.div(
             [h.Class("flex w-56 shrink-0 items-center gap-3 md:w-64")],
             [
-              senderTile((row.sender.slice(0, 1) || "?").toUpperCase()),
+              senderTile(
+                (row.sender.slice(0, 1) || "?").toUpperCase(),
+                avatarUrl,
+              ),
               // min-w-0: a flex item defaults to min-width:auto, which refuses
               // to shrink below its text, so `truncate` alone never fires and
               // a long sender pushes past the fixed w-56.
@@ -898,10 +967,17 @@ const listOverlayView = (
 const lazyVirtualList = createLazy();
 const lazyListOverlay = createLazy();
 
+// NOTE: `_avatarVersion` is deliberately unread — it is a cache-busting
+// argument, underscored to say so. The row urls come from the avatars
+// registry, which the view cannot observe, so the counter is what tells this
+// memo slot that resolving them again is worth doing. Rows whose url is
+// unchanged still keep their own memo hit, because the resolved string is
+// stable per sender.
 const listSubmodelView = (
   list: Model["list"],
   rows: ReadonlyArray<ThreadRow>,
   overlay: Html,
+  _avatarVersion: number,
 ): Html => {
   const h = html<Message>();
   return h.submodel({
@@ -916,7 +992,11 @@ const listSubmodelView = (
       // the visible window rebuilds no rows — and neither does moving the
       // cursor, since a row renders the same whether or not it is hovered.
       itemToView: (row: ThreadRow, index: number) =>
-        lazyThreadRow(row.id, threadRowView, [row, index]),
+        lazyThreadRow(row.id, threadRowView, [
+          row,
+          index,
+          avatarUrlFor(row.senderEmail),
+        ]),
       overscan: LIST_OVERSCAN,
       containerClassName: "h-full",
       contentOverlay: overlay,
@@ -947,6 +1027,7 @@ const virtualListView = (
           model.isPointerInside,
           model.isKeyboardControlled,
         ]),
+        model.avatarVersion,
       ]),
     ],
   );
@@ -1018,19 +1099,11 @@ const listSectionView = (model: Model): Html => {
 
 // THREAD DETAIL
 //
-// NOTE: Html bodies render in a sandboxed srcdoc iframe so email css can't
-// leak out, ours can't leak in, and no scripts run. Plain bodies skip it.
-
-// default-src 'none' blocks everything except images and inline styles.
-const FRAME_CSP =
-  "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'";
-
-const srcdocFor = (body: string): string =>
-  `<!doctype html><html><head><meta charset="utf-8">` +
-  `<meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">` +
-  `<base target="_blank">` +
-  `<style>body{margin:16px;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;background:#fff;overflow-wrap:break-word}img{max-width:100%;height:auto}</style>` +
-  `</head><body>${body}</body></html>`;
+// NOTE: Html bodies render in a shadow root (ui/mailBody.ts), which scopes
+// the mail's css both ways. The body reaching here has already been
+// sanitized on load (sanitizeBody.ts) — it is not sanitized in the view,
+// because a view runs on every render and this must happen exactly once.
+// Plain bodies skip all of it.
 
 const formatDetailTime = (epochMs: number): string =>
   new Date(epochMs).toLocaleString(undefined, {
@@ -1054,14 +1127,24 @@ const messageBodyView = (message: MessageDetail): Html => {
     );
   }
 
-  return h.iframe(
+  // A markdown body is our own rendering — the sender's stylesheet was
+  // discarded on the way through — so it sits directly on the app's surface
+  // and follows the theme, like the plain branch above. Only the sender's own
+  // html gets the white card, because its colours were written for white and
+  // there is no reading them back out.
+  const isMarkdown = message.bodyKind === "markdown";
+
+  // The shadow host lays out with the page and is therefore already the
+  // height of its content, so the detail pane is the only thing that scrolls.
+  return mailBody(
     [
-      h.Sandbox(
-        "allow-same-origin allow-popups allow-popups-to-escape-sandbox",
+      mailBody.Body(message.body),
+      mailBody.Surface(isMarkdown ? "app" : "paper"),
+      h.Class(
+        isMarkdown
+          ? "mt-3 block w-full"
+          : "mt-3 block w-full overflow-hidden rounded-lg bg-white",
       ),
-      h.Srcdoc(srcdocFor(message.body)),
-      h.Class("mt-3 w-full rounded-lg bg-white"),
-      h.Style({ height: `${BODY_FRAME_HEIGHT}px`, border: "0" }),
     ],
     [],
   );
@@ -1075,7 +1158,10 @@ const messageCardView = (message: MessageDetail): Html => {
       h.div(
         [h.Class("flex items-center gap-3")],
         [
-          senderTile((message.fromName.slice(0, 1) || "?").toUpperCase()),
+          senderTile(
+            (message.fromName.slice(0, 1) || "?").toUpperCase(),
+            avatarUrlFor(message.fromEmail),
+          ),
           h.div(
             [h.Class("min-w-0 flex-1")],
             [
@@ -1121,6 +1207,7 @@ const threadDetailView = (
   detail: ThreadDetail,
   isStarred: boolean,
   isSending: boolean,
+  _avatarVersion: number,
 ): Html => {
   const h = html<Message>();
   return h.div(
@@ -1242,16 +1329,35 @@ const composeBodyView = (compose: typeof ComposeEditing.Type): Html => {
   const h = html<Message>();
 
   if (compose.isPreviewing) {
-    // The same sandbox the thread view uses: this is email HTML, and it is
-    // rendered under the same rules whether we wrote it or received it.
-    return h.iframe(
+    // The same treatment the thread view gives a received message: this is
+    // email HTML and it is rendered under the same rules whether we wrote it
+    // or someone sent it to us. `prepareBody` is a no-op on safety here —
+    // markdown.ts escapes any tags the author typed — but it is what puts
+    // `target="_blank"` on the links, and one path is easier to trust than
+    // two.
+    //
+    // NOTE: The scroll container is the wrapper, not the body element. This
+    // panel is `absolute inset-0` over the pane, so it has a fixed footprint
+    // and a long preview has to scroll somewhere; letting the self-sizing
+    // host grow instead would push the send controls off the bottom.
+    return h.div(
+      [h.Class("min-h-0 w-full flex-1 overflow-auto rounded-lg bg-white")],
       [
-        h.Sandbox("allow-same-origin"),
-        h.Srcdoc(srcdocFor(renderMarkdownToEmailHtml(compose.body))),
-        h.Class("min-h-0 w-full flex-1 rounded-lg bg-white"),
-        h.Style({ border: "0" }),
+        mailBody(
+          [
+            mailBody.Body(
+              prepareBody(renderMarkdownToEmailHtml(compose.body), EMPTY_URLS),
+            ),
+            // Light in both themes, on purpose: this previews what lands in
+            // someone else's inbox, and that html carries the light colours
+            // inlined because email clients strip stylesheets. Theming the
+            // preview would show you something the recipient never sees.
+            mailBody.Surface("paper"),
+            h.Class("block w-full"),
+          ],
+          [],
+        ),
       ],
-      [],
     );
   }
 
@@ -1497,6 +1603,9 @@ export const view = Submodel.defineView<Model, Message, ViewInputs>(
                         // there rather than keeping a second copy.
                         isThreadStarred(model, detail.id),
                         model.sendingThreads.includes(detail.id),
+                        // Cache-busting only, as in the list: sender images
+                        // resolve out of a registry this view cannot observe.
+                        model.avatarVersion,
                       ]),
                     ],
                   ),

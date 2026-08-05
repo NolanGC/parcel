@@ -108,10 +108,19 @@ const makeAuth = (pool: pg.Pool, options: MakeAuthOptions) => {
           // still hold a read-only token: their writes fail with
           // GmailScopeError, which parks the outbox machine in NeedsAuth and
           // renders the reconnect pill — signing in again re-consents.
+          // NOTE: The two contacts scopes are what put a face on a sender.
+          // Gmail's own avatars are Google profile photos, and the People API
+          // is the only way to reach them — `contacts` covers the people you
+          // know, `contacts.other` the ones you have only ever exchanged mail
+          // with, which for a mailbox is most of them. Company logos need no
+          // scope at all (see frontend/src/avatars.ts) and senders who match
+          // neither keep the letter tile.
           scope: [
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.modify",
             "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts.other.readonly",
           ],
         },
       }),

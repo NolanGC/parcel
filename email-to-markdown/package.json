@@ -1,0 +1,13 @@
+{
+  "name": "email-to-markdown-ffi",
+  "private": true,
+  "type": "module",
+  "description": "Runtime JS dependencies for the email_to_markdown Gleam package.",
+  "dependencies": {
+    "dompurify": "^3.2.0",
+    "jsdom": "^30.0.1"
+  },
+  "devDependencies": {
+    "marked": "^18.0.9"
+  }
+}

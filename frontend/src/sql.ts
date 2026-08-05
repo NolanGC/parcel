@@ -328,6 +328,78 @@ export const SqlLive = SqliteMigrator.layer({
         { discard: true },
       );
     }),
+    // Sender avatars: a face for people, a logo for companies, the letter
+    // tile for everyone else. See avatars.ts for how a sender resolves to a
+    // key and sync.ts for the pass that fills this in.
+    //
+    // NOTE: One table for both sources rather than one per source, because
+    // the read is always the same question — "is there an image for this
+    // key?" — and `key` already says which kind it is. `is_missing` is the
+    // negative cache and is not optional: most domains have no reachable
+    // favicon, and without a row saying so every one of them is retried on
+    // every pass, forever.
+    //
+    // NOTE: `sender_email` is a new column on threads, and the wipe is what
+    // populates it. The backfill's skip-scan treats a stored id as complete
+    // (see unseenThreadIds), so existing rows would keep an empty address and
+    // never get an avatar. Same reasoning as 0008, and safe in either order:
+    // if 0008 has already run, these tables are empty and this wipe is a
+    // no-op. The outbox and the avatars survive — queued user actions must
+    // not be lost to a schema upgrade, and avatar bytes are expensive to
+    // refetch and outlive any single mailbox walk.
+    "0009_sender_avatars": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE threads ADD COLUMN sender_email TEXT NOT NULL DEFAULT ''`;
+      yield* sql`ALTER TABLE sync_state ADD COLUMN people_synced_at INTEGER NOT NULL DEFAULT 0`;
+      yield* sql`
+        CREATE TABLE avatars (
+          key TEXT PRIMARY KEY,
+          bytes BLOB,
+          mime_type TEXT NOT NULL DEFAULT '',
+          is_missing INTEGER NOT NULL DEFAULT 0,
+          fetched_at INTEGER NOT NULL
+        )
+      `;
+      yield* Effect.forEach(
+        [
+          "message_attachments",
+          "message_images",
+          "message_bodies",
+          "message_labels",
+          "messages",
+          "threads",
+          "sync_state",
+        ],
+        (table) => sql`DELETE FROM ${sql.literal(table)}`,
+        { discard: true },
+      );
+    }),
+    // A second rendition of every html body, converted to markdown once at
+    // sync time so opening a message is a decompress and a markdown parse
+    // rather than a DOMPurify pass over a hundred kilobytes of table layout.
+    // The html stays: it is what the image pass reads urls out of, what a
+    // future converter change would re-run against, and the fallback while
+    // this column is still filling.
+    //
+    // NOTE: Nullable, and the null is the work queue — the same trick as
+    // images_cached_at in 0006, without a column of its own. Rows written
+    // before this migration have no markdown and are picked up by the
+    // backfill loop (convertMarkdownBatch in sync.ts); until then they open
+    // through the html path, which is exactly what they did yesterday. No
+    // wipe: bodies are the expensive thing in the store and refetching 30k of
+    // them to add a derived column would be absurd.
+    "0010_markdown_bodies": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE message_bodies ADD COLUMN markdown BLOB`;
+      yield* sql`ALTER TABLE message_bodies ADD COLUMN markdown_codec TEXT`;
+      // Partial: the index holds only what is left to do, so it shrinks to
+      // nothing as the backfill drains rather than carrying a row per body.
+      yield* sql`
+        CREATE INDEX message_bodies_markdown_pending
+        ON message_bodies (message_id)
+        WHERE markdown IS NULL AND mime_type = 'text/html'
+      `;
+    }),
     // `satisfies` only pins the key format; the migrator infers the values.
   } satisfies Record<`${number}_${string}`, unknown>),
 }).pipe(Layer.provideMerge(ClientLive));

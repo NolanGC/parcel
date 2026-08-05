@@ -12,6 +12,7 @@
     "@tailwindcss/vite": "^4.3.2",
     "alchemy": "2.0.0-beta.62",
     "better-auth": "1.6.23",
+    "dompurify": "^3.4.12",
     "effect": "4.0.0-beta.97",
     "foldkit": "^0.131.0",
     "marked": "^18.0.7",
@@ -26,7 +27,9 @@
   "devDependencies": {
     "@foldkit/vite-plugin": "^0.11.1",
     "@happy-dom/global-registrator": "^20.10.6",
+    "@types/jsdom": "^28.0.3",
     "happy-dom": "^20.10.6",
+    "jsdom": "^30.0.1",
     "vitest": "^4.1.9"
   }
 }

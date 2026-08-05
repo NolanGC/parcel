@@ -49,6 +49,9 @@ const checkpoint = (
 
 const backfilling = SyncMachine.Backfilling({
   historyId: cursor,
+  // The `rest` phase throughout: these assert how the walk ENDS, and only the
+  // last phase ends it. The handoffs between phases have their own test.
+  phase: "rest",
   maybePageToken: Option.some(token),
   syncedCount: 4000,
   totalEstimate: 10000,
@@ -83,6 +86,9 @@ describe("entry from the checkpoint", () => {
     expect(state).toEqual(
       SyncMachine.Backfilling({
         historyId: cursor,
+        // Never persisted either: a resumed walk restarts at primary and
+        // skip-scans whatever it already has.
+        phase: "primary",
         // Never persisted: the resumed walk re-lists and skip-scans.
         maybePageToken: Option.none(),
         syncedCount: 4000,
@@ -192,6 +198,7 @@ describe("the sync spine", () => {
     expect(state).toEqual(
       SyncMachine.Backfilling({
         historyId: cursor,
+        phase: "rest",
         maybePageToken: Option.some(PageToken.make("page-3")),
         syncedCount: 4025,
         totalEstimate: 10000,
@@ -204,6 +211,56 @@ describe("the sync spine", () => {
       "SyncBatch",
       "RefreshDuringBackfill",
     ]);
+  });
+
+  // The whole point of the phases: the tab you actually read fills first, then
+  // the rest of the inbox, and only then the mail nobody is waiting on.
+  // Exhausting one starts the next rather than ending the backfill.
+  test.each([
+    ["primary", "inbox"],
+    ["inbox", "rest"],
+  ] as const)("running out of %s mail moves the walk on to %s", (from, to) => {
+    const [state, commands] = SyncMachine.step(
+      SyncMachine.Backfilling({
+        historyId: cursor,
+        phase: from,
+        maybePageToken: Option.some(token),
+        syncedCount: 800,
+        totalEstimate: 10000,
+        attempt: 0,
+      }),
+      SyncMachine.CompletedSyncBatch({
+        syncedCount: 820,
+        maybeNextPageToken: Option.none(),
+      }),
+    );
+    expect(state).toEqual(
+      SyncMachine.Backfilling({
+        historyId: cursor,
+        phase: to,
+        // Each phase starts its own walk from the top.
+        maybePageToken: Option.none(),
+        syncedCount: 820,
+        totalEstimate: 10000,
+        attempt: 0,
+      }),
+    );
+    expect(commandNames(commands)).toEqual([
+      "SyncBatch",
+      "RefreshDuringBackfill",
+    ]);
+  });
+
+  test("running out of the rest is what ends the backfill", () => {
+    const [state, commands] = SyncMachine.step(
+      backfilling,
+      SyncMachine.CompletedSyncBatch({
+        syncedCount: 10000,
+        maybeNextPageToken: Option.none(),
+      }),
+    );
+    expect(state._tag).toBe("CatchingUp");
+    expect(commandNames(commands)).toEqual(["ApplyHistory"]);
   });
 
   test("an interleaved refresh advances the cursor without disturbing the walk", () => {
@@ -410,6 +467,8 @@ describe("failure edges", () => {
     expect(state).toEqual(
       SyncMachine.Backfilling({
         historyId: cursor,
+        // The retry resumes the phase it failed in.
+        phase: "rest",
         maybePageToken: Option.some(token),
         syncedCount: 4000,
         totalEstimate: 10000,

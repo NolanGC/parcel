@@ -5,6 +5,7 @@
     "repos/**",
     "dist/**",
     "frontend/dist/**",
+    "email-to-markdown/**",
     "node_modules/**",
     "packages/create-foldkit-alchemy-app/templates/**",
     "packages/create-foldkit-alchemy-app/dist/**",

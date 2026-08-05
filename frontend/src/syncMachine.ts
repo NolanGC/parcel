@@ -24,7 +24,7 @@ import { evo } from "foldkit/struct";
 
 import { backoffDelayMs } from "./backoff";
 import { HistoryId, PageToken, type GmailError } from "./Gmail";
-import { SyncEngine } from "./sync";
+import { BackfillPhase, nextBackfillPhase, SyncEngine } from "./sync";
 
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
@@ -38,6 +38,10 @@ export const Cold = ts("Cold", { attempt: S.Number });
 export const Priming = ts("Priming", { attempt: S.Number });
 export const Backfilling = ts("Backfilling", {
   historyId: HistoryId,
+  /** Which slice is being walked: `primary` first, then `rest` (see
+   *  BackfillPhase). Runtime state, never checkpointed — a resumed walk
+   *  restarts at `primary` and skip-scans what it already has. */
+  phase: BackfillPhase,
   // Live within a session only; a resumed walk re-lists from the top and
   // skip-scans already-current threads (see SyncEngine.syncBatch).
   maybePageToken: S.Option(PageToken),
@@ -60,6 +64,7 @@ export const ResumeCheckpoint = ts("ResumeCheckpoint", {
 export const ResumePrime = ts("ResumePrime");
 export const ResumeBackfill = ts("ResumeBackfill", {
   historyId: HistoryId,
+  phase: BackfillPhase,
   maybePageToken: S.Option(PageToken),
   syncedCount: S.Number,
   totalEstimate: S.Number,
@@ -241,13 +246,17 @@ export const PrimeInbox = Command.define(
 // the final page).
 export const SyncBatch = Command.define(
   "SyncBatch",
-  { maybePageToken: S.Option(PageToken), syncedCount: S.Number },
+  {
+    phase: BackfillPhase,
+    maybePageToken: S.Option(PageToken),
+    syncedCount: S.Number,
+  },
   CompletedSyncBatch,
   FailedSync,
-)(({ maybePageToken, syncedCount }) =>
+)(({ phase, maybePageToken, syncedCount }) =>
   Effect.gen(function* () {
     const engine = yield* SyncEngine;
-    return yield* engine.syncBatch(maybePageToken, syncedCount).pipe(
+    return yield* engine.syncBatch(phase, maybePageToken, syncedCount).pipe(
       Effect.map((result) => CompletedSyncBatch(result)),
       Effect.catch((error) => Effect.succeed(toFailedSync(error))),
     );
@@ -469,11 +478,13 @@ export const syncMachine = Machine.define({
             ({ guardValue }) =>
               Backfilling({
                 ...guardValue,
+                phase: "primary",
                 maybePageToken: Option.none(),
                 attempt: 0,
               }),
             ({ guardValue }) => [
               SyncBatch({
+                phase: "primary",
                 maybePageToken: Option.none(),
                 syncedCount: guardValue.syncedCount,
               }),
@@ -503,6 +514,7 @@ export const syncMachine = Machine.define({
           ({ message }) =>
             Backfilling({
               historyId: message.historyId,
+              phase: "primary",
               maybePageToken: Option.none(),
               syncedCount: message.syncedCount,
               totalEstimate: message.totalEstimate,
@@ -510,6 +522,7 @@ export const syncMachine = Machine.define({
             }),
           ({ message }) => [
             SyncBatch({
+              phase: "primary",
               maybePageToken: Option.none(),
               syncedCount: message.syncedCount,
             }),
@@ -540,7 +553,32 @@ export const syncMachine = Machine.define({
             // page would be more state to carry and resume than it saves.
             ({ state, message, guardValue }) => [
               SyncBatch({
+                phase: state.phase,
                 maybePageToken: Option.some(guardValue),
+                syncedCount: message.syncedCount,
+              }),
+              RefreshDuringBackfill({ historyId: state.historyId }),
+            ],
+          ),
+          // This phase is exhausted but another one follows, so the walk moves
+          // on rather than finishing. The only place the phase advances, and
+          // it is one-way — the last phase running out is the end of the
+          // backfill. The order itself lives in `nextBackfillPhase` (sync.ts),
+          // so adding a slice never touches this file.
+          when(
+            (state) => nextBackfillPhase(state.phase),
+            "Backfilling",
+            ({ state, message, guardValue }) =>
+              evo(state, {
+                phase: () => guardValue,
+                maybePageToken: () => Option.none(),
+                syncedCount: () => message.syncedCount,
+                attempt: () => 0,
+              }),
+            ({ state, message, guardValue }) => [
+              SyncBatch({
+                phase: guardValue,
+                maybePageToken: Option.none(),
                 syncedCount: message.syncedCount,
               }),
               RefreshDuringBackfill({ historyId: state.historyId }),
@@ -571,6 +609,9 @@ export const syncMachine = Machine.define({
         FailedSync: failsIntoBackoff((state) =>
           ResumeBackfill({
             historyId: state.historyId,
+            // The retry resumes the phase it failed in, so a stumble late in
+            // `rest` does not send the walk back through primary.
+            phase: state.phase,
             maybePageToken: resumePageToken(state),
             syncedCount: state.syncedCount,
             totalEstimate: state.totalEstimate,
@@ -635,6 +676,7 @@ export const syncMachine = Machine.define({
             ({ state, guardValue }) =>
               Backfilling({
                 historyId: guardValue.historyId,
+                phase: guardValue.phase,
                 maybePageToken: guardValue.maybePageToken,
                 syncedCount: guardValue.syncedCount,
                 totalEstimate: guardValue.totalEstimate,
@@ -642,6 +684,7 @@ export const syncMachine = Machine.define({
               }),
             ({ guardValue }) => [
               SyncBatch({
+                phase: guardValue.phase,
                 maybePageToken: guardValue.maybePageToken,
                 syncedCount: guardValue.syncedCount,
               }),

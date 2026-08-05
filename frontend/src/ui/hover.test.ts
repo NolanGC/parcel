@@ -93,6 +93,7 @@ describe("Inbox list hover session", () => {
     id: ThreadId.make(`thread-${n}`),
     subject: "Hi",
     sender: "Ada",
+    senderEmail: "ada@example.com",
     snippet: "hello",
     date: n,
     isUnread: false,
@@ -104,7 +105,7 @@ describe("Inbox list hover session", () => {
   const hoveredAt = (index: number): Inbox.Model => {
     const [loaded] = Inbox.update(
       Inbox.init(),
-      Inbox.SucceededLoadFolder({ folder: "inbox", rows }),
+      Inbox.SucceededLoadFolder({ folder: "inbox", tab: "Primary", rows }),
     );
     const [entered] = Inbox.update(loaded, Inbox.EnteredList());
     const [next] = Inbox.update(entered, Inbox.HoveredRow({ index }));

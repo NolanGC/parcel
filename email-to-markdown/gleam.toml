@@ -1,0 +1,21 @@
+name = "email_to_markdown"
+version = "1.0.0"
+description = "Convert raw email HTML into clean, LLM-ready Markdown."
+licences = ["MIT"]
+target = "javascript"
+
+[javascript]
+runtime = "nodejs"
+
+[dependencies]
+gleam_stdlib = ">= 0.60.0 and < 2.0.0"
+gleam_json = ">= 3.0.0 and < 4.0.0"
+# argv and simplifile back `src/email_to_markdown/dev_cli.gleam`. A module in
+# src/ cannot reach dev_dependencies, and the tuning loop is worth the two
+# small deps.
+argv = ">= 1.0.0 and < 2.0.0"
+simplifile = ">= 2.0.0 and < 3.0.0"
+
+[dev_dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+birdie = ">= 1.2.0 and < 2.0.0"

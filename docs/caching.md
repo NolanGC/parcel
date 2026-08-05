@@ -9,7 +9,7 @@ One storage rule, one tiering rule. Everything below is why.
 |                                                   | Kept for                                                        |
 | ------------------------------------------------- | --------------------------------------------------------------- |
 | Metadata (subject, sender, date, snippet, labels) | every thread                                                    |
-| Message body                                      | every message, gzipped                                          |
+| Message body                                      | every message, gzipped — html and markdown both                 |
 | `cid:` inline images                              | every message                                                   |
 | Remote images (`<img src="https://…">`)           | newest 1,000 threads + a 1,000-thread LRU of what you've opened |
 
@@ -40,6 +40,51 @@ Bodies are stored as a BLOB with the codec recorded per row, so every read is
 self-describing: legacy plaintext, bodies too short to be worth compressing,
 and gzip all come back through the same path with no "is this old data?"
 branch anywhere.
+
+### Two renditions, not one
+
+Each html body is also converted to Markdown once (`email-to-markdown/`) and
+stored gzipped beside the original. Opening a message renders the markdown; the
+html is never parsed on the open path.
+
+Conversion deliberately does **not** happen while a thread is being synced,
+even though that is where the html arrives. It needs a DOM (`DOMParser`), so it
+runs on the main thread — the one drawing the list — and a backfill is already
+saturating that. A background loop does it instead: while the mailbox is still
+walking it converts only threads you have opened, and the unbounded pass waits
+until the sync settles.
+
+Markdown is roughly half the size of the html it came from and drops the table
+scaffolding entirely, so the open path stops being dominated by a DOMPurify
+walk over a few thousand layout nodes — a heavy newsletter opens about 3x
+faster, and the gap widens with the size of the message.
+
+The html stays because it is still the authority. The image pass scrapes the
+urls to prefetch out of it, a future improvement to the converter can be
+re-run against it, and it is what a message opens through while its markdown
+column is still empty. Storing both costs ~50% more body bytes on a store
+that compression had already cut by 6.5x.
+
+The markdown column is nullable, and NULL is the work queue — the same trick
+`images_cached_at` uses, without a column of its own.
+
+Opening a message the loop has not reached yet converts it **on the spot** and
+stores the result, rather than falling back to the sender's html. Two
+renderings of the same mailbox is not something a reader should ever see, and
+which one you got would otherwise depend on nothing more legible than how far a
+background loop had run. The loop is a pre-warm; the open is what guarantees
+the rendition. The cost is paid once per message.
+
+That leaves exactly one way to see the sender's own html: a body the converter
+can make nothing of, which would otherwise render blank. In practice those are
+messages with nothing to show — an empty body, a lone tracking pixel, a hidden
+preheader — and the attempt is recorded so it is never retried.
+
+One visible consequence: a markdown body is *our* rendering, with the sender's
+stylesheet discarded, so it can sit on the app's own surface and follow the
+theme. The sender's own html cannot — its colours are baked in and were written
+for white — so it keeps a white card in both themes. That is what `BodyKind`
+distinguishes, and what `ui/mailBody.ts` calls the `app` and `paper` surfaces.
 
 ## Why remote images are the exception
 

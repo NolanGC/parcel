@@ -1,0 +1,25 @@
+---
+version: 1.5.5
+title: notification
+---
+## Build failed on `main`
+
+**parcel** — commit `bbc32c3` by Nolan
+
+```
+error: Unknown module value
+     ┌─ src/email_to_markdown/table.gleam:225:20
+     │
+ 225 │   list.range(column, column + width - 1)
+     │        ^^^^^
+```
+
+Steps that failed:
+
+- gleam test
+- gleam format --check
+
+---
+
+[View the full run](https://ci.example.test/runs/8812)
+

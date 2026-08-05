@@ -3,6 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      The backstop behind sanitizeBody.ts.
+
+      Message bodies used to render in a sandboxed iframe, which meant two
+      independent things had to fail before a sender's script could run: the
+      sandbox, and that frame's own `default-src 'none'`. They now render in a
+      shadow root in this document, where neither applies and the sanitizer is
+      the only thing in the way. This is the second layer put back.
+
+      Deliberately narrow. It constrains script execution and the two document
+      hijacks that pair with it, and says nothing about img-src, connect-src or
+      style-src — mail loads images from everywhere, the api origin is a
+      build-time variable, and a policy that breaks the app on a stage rename
+      is a policy someone deletes. `wasm-unsafe-eval` is the sqlite build
+      (sql.ts); the sanitizer's job does not get easier if the database stops
+      working.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'"
+    />
     <title>parcel</title>
   </head>
   <body>

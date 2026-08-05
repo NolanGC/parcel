@@ -189,6 +189,7 @@ describe("the inbox", () => {
     id: ThreadId.make("thread-1"),
     subject: "Hi",
     sender: "Ada",
+    senderEmail: "ada@example.com",
     snippet: "hello",
     date: 1,
     isUnread: false,
@@ -331,6 +332,23 @@ describe("the inbox", () => {
         }),
       ),
       Scene.expect(Scene.text("hello there")).toExist(),
+    );
+  });
+
+  // The avatar's fallback is the tile itself, drawn underneath: a sender with
+  // no picture yet needs no branch, so the initial has to be on screen
+  // unconditionally. If this ever stops rendering, every sender we cannot
+  // resolve becomes an empty circle.
+  test("a sender with no picture still shows their initial", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          screen: Inbox.ShowingThread({ detail: openThreadDetail }),
+        }),
+      ),
+      Scene.expect(Scene.text("A")).toExist(),
     );
   });
 

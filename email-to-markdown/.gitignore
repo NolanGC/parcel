@@ -1,0 +1,18 @@
+*.beam
+*.ez
+/build
+erl_crash.dump
+node_modules
+
+# Real emails used for eyeballing conversion quality. Personal — bank
+# balances, home address, email address. Not for committing.
+samples/
+
+# Throwaway files from dev/fuzz.mjs and friends.
+dev/scratch/
+
+# dist/ is generated (build.sh) but committed anyway: it is what the frontend
+# imports, and requiring the Gleam toolchain to build the app would be a poor
+# trade for a directory this small. The repo root ignores every `dist/`, hence
+# the exception.
+!dist/

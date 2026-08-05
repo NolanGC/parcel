@@ -4,7 +4,10 @@
 
 import { describe, expect, test } from "vitest";
 
-import { renderMarkdownToEmailHtml } from "./markdown";
+import {
+  renderEmailMarkdownToHtml,
+  renderMarkdownToEmailHtml,
+} from "./markdown";
 
 describe("rendering", () => {
   test("emphasis, links and lists become plain semantic tags", () => {
@@ -88,5 +91,41 @@ describe("edge cases", () => {
     expect(renderMarkdownToEmailHtml("just a sentence")).toContain(
       "<p>just a sentence</p>",
     );
+  });
+});
+
+// The received-mail renderer. It is the same parser with the opposite styling
+// posture: outgoing inlines colours because email clients strip stylesheets,
+// incoming inlines nothing because the shadow root it lands in styles these
+// tags itself and can follow the theme (ui/mailBody.ts). An inline colour here
+// wins on specificity and pins every message the user reads to light mode.
+describe("received mail", () => {
+  const SOURCE = "# Heading\n\n> quoted\n\n`code`\n\n```\nblock\n```\n\ntext";
+
+  test("emits no inline styles at all", () => {
+    expect(renderEmailMarkdownToHtml(SOURCE)).not.toContain("style=");
+  });
+
+  test("emits the bare tags the shadow root styles by name", () => {
+    const html = renderEmailMarkdownToHtml(SOURCE);
+
+    expect(html).toContain("<blockquote>");
+    expect(html).toContain("<pre>");
+    expect(html).toContain("<code>");
+  });
+
+  // The converter emits `<img>` and `<a>` as html on purpose (markdown has no
+  // width syntax), so unlike the outgoing renderer this one must not escape
+  // them — see emailMarkdown.test.ts for the safety half of that trade.
+  test("passes raw html through, where outgoing escapes it", () => {
+    const img = '<img src="https://x.test/a.png" alt="a" width="600">';
+
+    expect(renderEmailMarkdownToHtml(img)).toContain("<img");
+    expect(renderMarkdownToEmailHtml(img)).toContain("&lt;img");
+  });
+
+  // Outgoing still inlines, and must keep doing so.
+  test("outgoing keeps its inline styles", () => {
+    expect(renderMarkdownToEmailHtml(SOURCE)).toContain("style=");
   });
 });

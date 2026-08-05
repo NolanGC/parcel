@@ -31,7 +31,12 @@ import {
   SucceededCheckSession,
 } from "./auth";
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
-import { type ThreadRow } from "./sync";
+import {
+  backfillQuery,
+  ThreadCategory,
+  type BackfillPhase,
+  type ThreadRow,
+} from "./sync";
 import {
   CompletedSnapshotPersistence,
   SaveSnapshot,
@@ -43,6 +48,7 @@ import * as OutboxEngine from "./outboxEngine";
 import * as OutboxMachine from "./outboxMachine";
 import * as SyncMachine from "./syncMachine";
 import * as Ui from "./ui";
+import { Tabs as BaseTabs } from "@foldkit/ui";
 
 const session = {
   userId: UserId.make("user-1"),
@@ -78,6 +84,7 @@ const threadRow = {
   id: ThreadId.make("thread-1"),
   subject: "Hi",
   sender: "Ada",
+  senderEmail: "ada@example.com",
   snippet: "hello",
   date: 1,
   isUnread: false,
@@ -117,7 +124,11 @@ const loadedInbox = (): Model => {
   const [withThreads] = update(
     model,
     inboxMessage(
-      Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+      Inbox.SucceededLoadFolder({
+        folder: "inbox",
+        tab: "Primary",
+        rows: [threadRow],
+      }),
     ),
   );
   return withThreads;
@@ -310,7 +321,11 @@ describe("loading the inbox", () => {
     const [next] = update(
       model,
       inboxMessage(
-        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+        Inbox.SucceededLoadFolder({
+          folder: "inbox",
+          tab: "Primary",
+          rows: [threadRow],
+        }),
       ),
     );
 
@@ -339,8 +354,11 @@ describe("loading the inbox", () => {
     expect(next.inboxPage.threads._tag).toBe("Refreshing");
     expect(commands.map((command) => command.name)).toEqual([
       "LoadFolder",
+      "ReadCounts",
       "ReadLocalSize",
       "CacheImageBatch",
+      "CacheAvatarBatch",
+      "ConvertMarkdownBatch",
     ]);
   });
 
@@ -354,8 +372,11 @@ describe("loading the inbox", () => {
     expect(next.inboxPage.threads._tag).toBe("Loading");
     expect(commands.map((command) => command.name)).toEqual([
       "LoadFolder",
+      "ReadCounts",
       "ReadLocalSize",
       "CacheImageBatch",
+      "CacheAvatarBatch",
+      "ConvertMarkdownBatch",
     ]);
   });
 });
@@ -410,7 +431,11 @@ describe("inbox snapshot seed", () => {
     const [, commands] = update(
       afterTop,
       inboxMessage(
-        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [threadRow] }),
+        Inbox.SucceededLoadFolder({
+          folder: "inbox",
+          tab: "Primary",
+          rows: [threadRow],
+        }),
       ),
     );
 
@@ -420,7 +445,13 @@ describe("inbox snapshot seed", () => {
   test("an empty inbox writes no snapshot", () => {
     const [, commands] = update(
       loadedInbox(),
-      inboxMessage(Inbox.SucceededLoadFolder({ folder: "inbox", rows: [] })),
+      inboxMessage(
+        Inbox.SucceededLoadFolder({
+          folder: "inbox",
+          tab: "Primary",
+          rows: [],
+        }),
+      ),
     );
 
     expect(commands.map((command) => command.name)).not.toContain(
@@ -469,7 +500,11 @@ describe("opening a thread", () => {
     const [model] = update(
       base,
       inboxMessage(
-        Inbox.SucceededLoadFolder({ folder: "inbox", rows: [unread] }),
+        Inbox.SucceededLoadFolder({
+          folder: "inbox",
+          tab: "Primary",
+          rows: [unread],
+        }),
       ),
     );
 
@@ -532,6 +567,7 @@ describe("opening a thread", () => {
         inboxMessage(
           Inbox.SucceededLoadFolder({
             folder: "inbox",
+            tab: "Primary",
             rows: [otherRow, threadRow],
           }),
         ),
@@ -718,6 +754,7 @@ describe("backfill list refresh", () => {
   const backfillingAt = (syncedCount: number) =>
     SyncMachine.Backfilling({
       historyId: HistoryId.make("1"),
+      phase: "rest",
       maybePageToken: Option.some(PageToken.make("page-2")),
       syncedCount,
       totalEstimate: 30000,
@@ -1021,7 +1058,9 @@ describe("folders and category tabs", () => {
     const model = loadedInbox();
     const [next] = update(
       model,
-      inboxMessage(Inbox.SucceededLoadFolder({ folder: "sent", rows: [] })),
+      inboxMessage(
+        Inbox.SucceededLoadFolder({ folder: "sent", tab: "Primary", rows: [] }),
+      ),
     );
 
     expect(next.inboxPage.threads).toBe(model.inboxPage.threads);
@@ -1041,5 +1080,161 @@ describe("folders and category tabs", () => {
       social,
     ]);
     expect(Inbox.filterRowsForTab([threadRow, social], "Forums")).toEqual([]);
+  });
+});
+
+// The list is capped at HOT_THREAD_COUNT, so the tab has to narrow the QUERY
+// rather than the answer. Capping the whole inbox first and slicing afterwards
+// hands a tab only the rows that fell inside that window — measured on a real
+// mailbox: 34 rows reached Primary out of 1,211 primary threads, against a
+// badge reading 643, and the list stopped scrolling a screen in.
+describe("switching tab re-reads the store", () => {
+  const selectTab = (index: number, value: string) =>
+    inboxMessage(
+      Inbox.GotTabsMessage({
+        message: Ui.Tabs.GotBaseMessage({
+          message: BaseTabs.SelectedTab({ index, value }),
+        }),
+      }),
+    );
+
+  test("issues a folder read for the newly selected tab", () => {
+    const [next, commands] = update(loadedInbox(), selectTab(3, "Updates"));
+
+    expect(commands.map((command) => command.name)).toContain("LoadFolder");
+    // Rows on screen belong to the tab being left, so the list must not keep
+    // showing them under the new tab's label.
+    expect(next.inboxPage.threads._tag).toBe("Loading");
+  });
+
+  test("drops a read that lost the race to a tab switch", () => {
+    const [afterSwitch] = update(loadedInbox(), selectTab(3, "Updates"));
+    const [settled] = update(
+      afterSwitch,
+      inboxMessage(
+        Inbox.SucceededLoadFolder({
+          folder: "inbox",
+          tab: "Primary",
+          rows: [threadRow],
+        }),
+      ),
+    );
+
+    expect(settled.inboxPage.threads._tag).toBe("Loading");
+  });
+
+  test("every tab maps to the categories it renders", () => {
+    for (const tab of Inbox.TAB_LABELS) {
+      for (const category of Inbox.CATEGORIES_FOR_TAB[tab]) {
+        expect(Inbox.TAB_FROM_CATEGORY[category]).toBe(tab);
+      }
+    }
+    // Primary is the one tab made of two categories — `personal` and the
+    // uncategorized mail Gmail never labelled.
+    expect([...Inbox.CATEGORIES_FOR_TAB.Primary].sort()).toEqual([
+      "none",
+      "personal",
+    ]);
+  });
+});
+
+// The bug these exist for: the backfill asked Gmail for `category:primary`
+// while the app rendered Primary as "personal OR uncategorized". Uncategorized
+// mail matches no `category:` term at all, so Primary was declared exhausted
+// with most of it unfetched and the walk moved straight on to Updates.
+describe("the primary backfill query matches the primary tab", () => {
+  const primaryQuery = String(backfillQuery("primary").q);
+
+  test("excludes exactly the categories that have their own tab", () => {
+    const tabbed = ThreadCategory.literals.filter(
+      (category) =>
+        Inbox.TAB_FROM_CATEGORY[category] !== "Primary" && category !== "none",
+    );
+
+    for (const category of tabbed) {
+      expect(primaryQuery).toContain(`-category:${category}`);
+    }
+  });
+
+  // A positive term would silently drop every thread Gmail never categorized,
+  // which is where person-to-person mail lands.
+  test("asks by subtraction, never for category:primary", () => {
+    expect(primaryQuery).toContain("in:inbox");
+    expect(primaryQuery).not.toContain("category:primary");
+  });
+
+  test("each later phase widens rather than narrows", () => {
+    expect(String(backfillQuery("inbox").q)).toBe("in:inbox");
+    expect(backfillQuery("rest")).toEqual({ includeSpamTrash: true });
+  });
+
+  test("every phase has a query", () => {
+    const phases: ReadonlyArray<BackfillPhase> = ["primary", "inbox", "rest"];
+    for (const phase of phases) {
+      expect(Object.keys(backfillQuery(phase)).length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("sender avatars", () => {
+  test("a batch that resolved something bumps the version and re-arms", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next, commands] = update(
+      model,
+      inboxMessage(Inbox.CompletedCacheAvatarBatch({ addedCount: 3 })),
+    );
+
+    expect(next.inboxPage.avatarVersion).toBe(
+      model.inboxPage.avatarVersion + 1,
+    );
+    expect(commands.map((command) => command.name)).toEqual([
+      "CacheAvatarBatch",
+    ]);
+  });
+
+  // The loop keeps turning long after the senders run out, and a bump is a
+  // repaint of the whole list — so an empty turn must not be one.
+  test("an empty batch re-arms without repainting", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next, commands] = update(
+      model,
+      inboxMessage(Inbox.CompletedCacheAvatarBatch({ addedCount: 0 })),
+    );
+
+    expect(next.inboxPage.avatarVersion).toBe(model.inboxPage.avatarVersion);
+    expect(commands.map((command) => command.name)).toEqual([
+      "CacheAvatarBatch",
+    ]);
+  });
+
+  test("a failed batch still re-arms, so one bad turn is not the end", () => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [, commands] = update(
+      model,
+      inboxMessage(Inbox.FailedCacheAvatarBatch({ error: "offline" })),
+    );
+
+    expect(commands.map((command) => command.name)).toEqual([
+      "CacheAvatarBatch",
+    ]);
+  });
+});
+
+// The loop that converts bodies stored before markdown existed. It touches
+// nothing on screen, so re-arming is the whole of its behaviour here — and a
+// batch that failed must re-arm too, or one bad body ends the backfill for
+// the session.
+describe("markdown backfill", () => {
+  test.each([
+    ["a completed batch", Inbox.CompletedConvertMarkdownBatch()],
+    ["a failed batch", Inbox.FailedConvertMarkdownBatch({ error: "nope" })],
+  ])("%s re-arms and leaves the model alone", (_name, message) => {
+    const [model] = init(loggedInFlags, url("/inbox"));
+    const [next, commands] = update(model, inboxMessage(message));
+
+    expect(next.inboxPage).toBe(model.inboxPage);
+    expect(commands.map((command) => command.name)).toEqual([
+      "ConvertMarkdownBatch",
+    ]);
   });
 });
