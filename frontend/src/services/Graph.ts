@@ -59,8 +59,11 @@ export const graph = [
 // VITE_API_URL) should surface as a crash rather than a silent stall, so the
 // fallible database-backed services are orDie'd exactly as entry.ts did.
 
+// NOTE: Layer.mergeAll does NOT wire one member's requirement from another
+// member's output in Effect 4.0.0-beta. AuthClient, ImageFetcher and Gmail's
+// internal AuthClient all require ApiUrl, so ApiUrl must be supplied with an
+// explicit Layer.provide rather than left to be inferred.
 export const AppLayer = Layer.mergeAll(
-  LiveApiUrl,
   sessionStorageLayer,
   AuthClient.layer,
   Compression.layer,
@@ -71,7 +74,7 @@ export const AppLayer = Layer.mergeAll(
   Layer.orDie(SqlLive),
   Layer.orDie(SyncEngine.layer),
   Layer.orDie(Search.layer),
-);
+).pipe(Layer.provide(LiveApiUrl));
 
 // ── TEST GRAPH ─────────────────────────────────────────────────────────────
 //
