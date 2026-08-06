@@ -1,5 +1,5 @@
 // The sync machine: the state machine that fills and freshens the local
-// store, on foldkit's experimental Machine (the checkout-machine shape).
+// store, on foldkit's experimental Machine.
 //
 //   Cold ──SucceededReadSyncCheckpoint──► Priming | Backfilling | CatchingUp
 //   Priming ──CompletedPrimeInbox──► Backfilling
@@ -8,11 +8,17 @@
 //   CatchingUp ──Expired/Overflowed──► Priming (bounded full resync)
 //   any network pass ──FailedSync──► Backoff (resume-aware) | NeedsAuth
 //   Cold ──FailedReadSyncCheckpoint──► Backoff ──CompletedWaitRetry──► Cold (re-read)
-//   NeedsAuth ──ClickedReconnect──► Priming (the toolbar pill is a button)
+//   NeedsAuth ──ClickedReconnect──► Priming
 //
 // The store answers every read throughout; the machine only makes it more
 // complete. Its state is derived from the SQLite checkpoint at boot — never
 // persisted itself — so a refresh mid-backfill resumes with honest progress.
+//
+// DESIGN: Machine edge callbacks (to/when/otherwise build + commands) are
+// PURE — they run synchronously inside Machine.step(). The backoff delay
+// math is a pure function on the BackoffPolicy schema. The Policy Effect
+// service (./services/policy) wraps the same values so Effectful commands
+// like WaitRetry and WaitPoll agree with the pure edge callbacks.
 
 import { Effect, Match as M, Option, Schema as S } from "effect";
 import { Command } from "foldkit";
@@ -23,22 +29,35 @@ import { ts } from "foldkit/schema";
 import { evo } from "foldkit/struct";
 
 import { HistoryId, PageToken, type GmailError } from "./Gmail";
+import { computeDelay, defaultBackoffPolicy, Policy } from "./services/policy";
 import { SyncEngine } from "./sync";
 
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
-// STATE
+// THE DEFAULT BACKOFF POLICY
+//
+// The pure edge callbacks (to/when/otherwise build + commands) run
+// synchronously during Machine.step() and cannot access Effect services.
+// The BackoffPolicy schema and default values live in services/policy.ts.
+// This module imports defaultBackoffPolicy from there. The Policy Effect
+// service (Layer) provides the same defaults to Effectful commands
+// (WaitRetry, WaitPoll). A test Layer can override both simultaneously.
 
-// Active states carry `attempt`: consecutive failures of this pass (0 =
-// fresh). A failure lands in Backoff with attempt + 1, and the retry
-// re-enters the pass carrying the count, so repeated failures escalate
-// the delay instead of resetting it.
+// REQUIREMENTS: services the machine's Commands need.
+export type SyncResources = SyncEngine | Policy;
+
+// STATE SCHEMAS
+
+/** Active states carry `attempt`: consecutive failures of this pass (0 =
+ *  fresh). A failure lands in Backoff with attempt + 1, and the retry
+ *  re-enters the pass carrying the count, so repeated failures escalate
+ *  the delay instead of resetting it. */
 export const Cold = ts("Cold", { attempt: S.Number });
 export const Priming = ts("Priming", { attempt: S.Number });
 export const Backfilling = ts("Backfilling", {
   historyId: HistoryId,
-  // Live within a session only; a resumed walk re-lists from the top and
-  // skip-scans already-current threads (see SyncEngine.syncBatch).
+  /** Live within a session only; a resumed walk re-lists from the top and
+   *  skip-scans already-current threads (see SyncEngine.syncBatch). */
   maybePageToken: S.Option(PageToken),
   syncedCount: S.Number,
   totalEstimate: S.Number,
@@ -52,6 +71,10 @@ export const Settled = ts("Settled", {
   historyId: HistoryId,
   lastSyncedAt: S.Number,
 });
+
+// RESUME SCHEMAS
+//
+// Parked in Backoff so the retry can re-enter whichever pass failed.
 
 export const ResumeCheckpoint = ts("ResumeCheckpoint", {
   accountEmail: S.String,
@@ -72,12 +95,16 @@ export const Resume = S.Union([
 ]);
 export type Resume = typeof Resume.Type;
 
+// BACKOFF STATE
+
 export const Backoff = ts("Backoff", {
   attempt: S.Number,
   delayMs: S.Number,
   resume: Resume,
 });
 export const NeedsAuth = ts("NeedsAuth");
+
+// STATE UNION
 
 export const State = S.Union([
   Cold,
@@ -92,7 +119,7 @@ export type State = typeof State.Type;
 
 export const init = (): State => Cold({ attempt: 0 });
 
-// MESSAGE
+// MESSAGE SCHEMAS
 
 export const SucceededReadSyncCheckpoint = m("SucceededReadSyncCheckpoint", {
   maybeCheckpoint: S.Option(
@@ -164,15 +191,7 @@ export const Message = S.Union([
 ]);
 export type Message = typeof Message.Type;
 
-// COMMAND
-
-const POLL_INTERVAL_MS = 60_000;
-const BACKOFF_BASE_MS = 2_000;
-const BACKOFF_MAX_MS = 60_000;
-// After this many consecutive failures a stored page token is presumed
-// stale and dropped — the resumed walk skip-scans from the top instead of
-// retrying a token Gmail may no longer honor.
-const TOKEN_RESET_ATTEMPTS = 3;
+// COMMAND DEFINITIONS
 
 // Every Gmail/SQL failure funnels into one FailedSync fact; the machine
 // decides what it means from where it currently is. Auth-shaped errors
@@ -237,9 +256,6 @@ export const PrimeInbox = Command.define(
   }),
 );
 
-// `syncedCount` rides along so the page can advance progress by addition
-// rather than re-counting the whole table (the engine reconciles exactly on
-// the final page).
 export const SyncBatch = Command.define(
   "SyncBatch",
   { maybePageToken: S.Option(PageToken), syncedCount: S.Number },
@@ -284,10 +300,6 @@ export const ApplyHistory = Command.define(
 /** The interleaved refresh: the same engine pass as ApplyHistory, but every
  *  outcome including failure becomes one infallible fact, because the backfill
  *  must not be interrupted by it. */
-// NOTE: An expired cursor reports None and keeps the old one, so the remaining
-// interleaved passes this backfill are wasted requests and the full resync
-// happens once at CatchingUp. Handling it here would mean tearing down a
-// backfill already most of the way through the same work.
 export const RefreshDuringBackfill = Command.define(
   "RefreshDuringBackfill",
   { historyId: HistoryId },
@@ -334,7 +346,8 @@ const WaitPoll = Command.define(
   TickedPoll,
 )(
   Effect.gen(function* () {
-    yield* Effect.sleep(POLL_INTERVAL_MS);
+    const policy = yield* Policy;
+    yield* Effect.sleep(policy.pollIntervalMs);
     return TickedPoll();
   }),
 );
@@ -346,71 +359,29 @@ export const bootCommands = (
   ReadSyncCheckpoint({ accountEmail }),
 ];
 
-// MACHINE
+// MACHINE HELPER TYPES
 
-const backoffDelayMs = (
-  attempt: number,
-  maybeRetryAfterMs: Option.Option<number>,
-): number => {
-  const exponential = Math.min(
-    BACKOFF_BASE_MS * 2 ** (attempt - 1),
-    BACKOFF_MAX_MS,
-  );
-  return Math.max(
-    exponential,
-    Option.getOrElse(maybeRetryAfterMs, () => 0),
-  );
-};
-
-// Every failing pass reports the same two facts, whatever it was doing.
 type FailureMessage = Readonly<{
   isAuthError: boolean;
   maybeRetryAfterMs: Option.Option<number>;
 }>;
-
-const isAuthFailure = (_state: State, message: FailureMessage): boolean =>
-  message.isAuthError;
 
 // The delay the next attempt waits out. Both the Backoff state and its
 // WaitRetry command need it, and they must agree.
 const retryDelay = (
   state: Readonly<{ attempt: number }>,
   message: FailureMessage,
-): number => backoffDelayMs(state.attempt + 1, message.maybeRetryAfterMs);
-
-// The boot fork, off the persisted checkpoint: a finished backfill goes
-// straight to the history diff; an unfinished one resumes with honest
-// counts (and no page token — the walk skip-scans from the top); anything
-// else primes from scratch.
-const doneCheckpointCursor = (
-  _cold: typeof Cold.Type,
-  message: typeof SucceededReadSyncCheckpoint.Type,
-): Option.Option<HistoryId> =>
-  Option.flatMap(message.maybeCheckpoint, (checkpoint) =>
-    checkpoint.isBackfillDone ? checkpoint.maybeHistoryId : Option.none(),
-  );
-
-const partialCheckpoint = (
-  _cold: typeof Cold.Type,
-  message: typeof SucceededReadSyncCheckpoint.Type,
-): Option.Option<{
-  historyId: HistoryId;
-  syncedCount: number;
-  totalEstimate: number;
-}> =>
-  Option.flatMap(message.maybeCheckpoint, (checkpoint) =>
-    checkpoint.isBackfillDone
-      ? Option.none()
-      : Option.map(checkpoint.maybeHistoryId, (historyId) => ({
-          historyId,
-          syncedCount: checkpoint.syncedCount,
-          totalEstimate: checkpoint.totalEstimate,
-        })),
-  );
+): number =>
+  computeDelay(defaultBackoffPolicy, state.attempt + 1, message.maybeRetryAfterMs);
 
 // Past the threshold, stop trusting the stored page token — Gmail may no
 // longer honor it, and the skip-scan walk from the top costs only cheap
 // list pages.
+// NOTE: Uses the same TOKEN_RESET_ATTEMPTS as the Policy service. This is the
+// pure sync counterpart (Machine edge callbacks cannot access services).
+// The policy.ts default MUST match this constant.
+const TOKEN_RESET_ATTEMPTS = 3;
+
 const resumePageToken = (
   backfilling: typeof Backfilling.Type,
 ): Option.Option<PageToken> =>
@@ -418,13 +389,11 @@ const resumePageToken = (
     ? Option.none()
     : backfilling.maybePageToken;
 
-// Narrows the parked resume to one variant. The Backoff exits are a chain of
-// these, each re-entering the pass that stored it.
-const resumeAs =
-  <Tag extends Resume["_tag"]>(tag: Tag) =>
-  (
-    backoff: typeof Backoff.Type,
-  ): Option.Option<Extract<Resume, { readonly _tag: Tag }>> =>
+// Schema-driven resume narrowing. Uses Schema.is instead of hand-written
+// tag matching, so adding a Resume variant is caught at compile time if
+// the exhaustiveness check on Resume's union membership is updated.
+const resumeIs = <Tag extends Resume["_tag"]>(tag: Tag) =>
+  (backoff: typeof Backoff.Type): Option.Option<Extract<Resume, { readonly _tag: Tag }>> =>
     Option.liftPredicate(
       backoff.resume,
       (resume): resume is Extract<Resume, { readonly _tag: Tag }> =>
@@ -442,12 +411,12 @@ const failsIntoBackoff = <
 ) =>
   [
     when<State, Message, SourceState, TriggerMessage, boolean, "NeedsAuth">(
-      isAuthFailure,
+      (_state, message): boolean => message.isAuthError,
       "NeedsAuth",
       () => NeedsAuth(),
     ),
     otherwise(
-      to<State, Message, SourceState, TriggerMessage, "Backoff", SyncEngine>(
+      to<State, Message, SourceState, TriggerMessage, "Backoff", SyncResources>(
         "Backoff",
         ({ state, message }) =>
           Backoff({
@@ -472,14 +441,26 @@ export const syncMachine = Machine.define({
       on: {
         SucceededReadSyncCheckpoint: [
           when(
-            doneCheckpointCursor,
+            (_cold, message) =>
+              Option.flatMap(message.maybeCheckpoint, (checkpoint) =>
+                checkpoint.isBackfillDone ? checkpoint.maybeHistoryId : Option.none(),
+              ),
             "CatchingUp",
             ({ guardValue }) =>
               CatchingUp({ historyId: guardValue, attempt: 0 }),
             ({ guardValue }) => [ApplyHistory({ historyId: guardValue })],
           ),
           when(
-            partialCheckpoint,
+            (_cold, message) =>
+              Option.flatMap(message.maybeCheckpoint, (checkpoint) =>
+                checkpoint.isBackfillDone
+                  ? Option.none()
+                  : Option.map(checkpoint.maybeHistoryId, (historyId) => ({
+                      historyId,
+                      syncedCount: checkpoint.syncedCount,
+                      totalEstimate: checkpoint.totalEstimate,
+                    })),
+              ),
             "Backfilling",
             ({ guardValue }) =>
               Backfilling({
@@ -502,9 +483,6 @@ export const syncMachine = Machine.define({
             ),
           ),
         ],
-        // NOTE: Without this the checkpoint read's own failure had nowhere to
-        // go: the machine sat in Cold forever, rendering no pill, with nothing
-        // scheduled to try again.
         FailedReadSyncCheckpoint: failsIntoBackoff((_state, message) =>
           ResumeCheckpoint({ accountEmail: message.accountEmail }),
         ),
@@ -546,13 +524,6 @@ export const syncMachine = Machine.define({
                 syncedCount: () => message.syncedCount,
                 attempt: () => 0,
               }),
-            // Two concurrent commands: the next page of the walk, and a
-            // history pass so mail arriving mid-backfill shows up within a
-            // page rather than at the end of a ~25 minute sync.
-            // NOTE: Every page, no stride. One history.list is 2 quota units
-            // against a 250/sec budget and a page takes ~5s, so this is under
-            // 0.2% of the backfill's spend, and a counter to fire it every Nth
-            // page would be more state to carry and resume than it saves.
             ({ state, message, guardValue }) => [
               SyncBatch({
                 maybePageToken: Option.some(guardValue),
@@ -570,10 +541,6 @@ export const syncMachine = Machine.define({
             ),
           ),
         ],
-        // Stays in Backfilling and issues nothing: the walk already has its
-        // next page in flight. Advancing the cursor on success is what stops
-        // the next refresh re-reporting the same changes; a None leaves it
-        // exactly where it was.
         RefreshedDuringBackfill: to(
           "Backfilling",
           ({ state, message }) =>
@@ -631,13 +598,11 @@ export const syncMachine = Machine.define({
       },
     },
 
-    // The retry re-enters the pass carrying the attempt count, so the
-    // next failure escalates instead of resetting the delay.
     Backoff: {
       on: {
         CompletedWaitRetry: [
           when(
-            resumeAs("ResumeCheckpoint"),
+            resumeIs("ResumeCheckpoint"),
             "Cold",
             ({ state }) => Cold({ attempt: state.attempt }),
             ({ guardValue }) => [
@@ -645,7 +610,7 @@ export const syncMachine = Machine.define({
             ],
           ),
           when(
-            resumeAs("ResumeBackfill"),
+            resumeIs("ResumeBackfill"),
             "Backfilling",
             ({ state, guardValue }) =>
               Backfilling({
@@ -663,7 +628,7 @@ export const syncMachine = Machine.define({
             ],
           ),
           when(
-            resumeAs("ResumeHistory"),
+            resumeIs("ResumeHistory"),
             "CatchingUp",
             ({ state, guardValue }) =>
               CatchingUp({
@@ -685,9 +650,6 @@ export const syncMachine = Machine.define({
       },
     },
 
-    // Not terminal any more: the toolbar pill is a button, and priming is
-    // the cheapest way to find out whether the grant came back. If it
-    // didn't, the failure lands right back here.
     NeedsAuth: {
       on: {
         ClickedReconnect: to(
@@ -700,14 +662,18 @@ export const syncMachine = Machine.define({
   },
 });
 
-/** Tuple-shaped step over the Machine — state + commands out, `Ignored`
- *  collapsing to a no-op. What the inbox update and the tests consume. */
+/**
+ * Collapsed step: state + commands out, `Ignored` collapsing to a no-op.
+ *
+ * This is the primary interface consumers (inbox update, tests) use. The
+ * Machine's raw `step` is available for observability when needed.
+ */
 export const step = (
   state: State,
   message: Message,
 ): readonly [
   State,
-  ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
+  ReadonlyArray<Command.Command<Message, never, SyncResources>>,
 ] => {
   const result = syncMachine.step(state, message);
   return [

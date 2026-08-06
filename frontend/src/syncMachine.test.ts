@@ -462,3 +462,55 @@ describe("failure edges", () => {
     expect(still._tag).toBe("NeedsAuth");
   });
 });
+
+// STATIC ANALYSIS
+//
+// The Machine API provides edge-set introspection that no production code
+// reads — these assertions verify the table at test time so structural
+// bugs (an unreachable state, a shadowed transition) are caught before
+// the machine is wired into the inbox update.
+
+describe("static analysis", () => {
+  test("every state is reachable from the initial state", () => {
+    const unreachable = SyncMachine.syncMachine.unreachableStates();
+    expect(unreachable).toEqual([]);
+  });
+
+  test("no transitions are dead (shadowed or unreachable-source)", () => {
+    const dead = SyncMachine.syncMachine.deadTransitions();
+    expect(dead).toEqual([]);
+  });
+
+  test("the initial state is Cold", () => {
+    expect(SyncMachine.syncMachine.initial).toEqual(SyncMachine.Cold({ attempt: 0 }));
+  });
+
+  test("all seven states are registered", () => {
+    expect(SyncMachine.syncMachine.stateTags.sort()).toEqual([
+      "Backfilling",
+      "Backoff",
+      "CatchingUp",
+      "Cold",
+      "NeedsAuth",
+      "Priming",
+      "Settled",
+    ]);
+  });
+
+  test("reachability graph includes every state from Cold", () => {
+    // Starting from Cold, every state should be reachable
+    const reachable = SyncMachine.syncMachine.reachableFrom("Cold");
+    for (const tag of SyncMachine.syncMachine.stateTags) {
+      expect(reachable.has(tag)).toBe(true);
+    }
+  });
+
+  test("toMermaid produces a non-empty diagram", () => {
+    const diagram = SyncMachine.syncMachine.toMermaid();
+    expect(diagram).toContain("stateDiagram-v2");
+    expect(diagram).toContain("[*] --> Cold");
+    for (const tag of SyncMachine.syncMachine.stateTags) {
+      expect(diagram).toContain(`  ${tag}`);
+    }
+  });
+});
