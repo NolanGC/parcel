@@ -7,8 +7,6 @@ import {
   DEFAULT_APPEARANCE,
   DEFAULT_READING_MODE,
   ReadingMode,
-  SaveAppearance,
-  SaveReadingMode,
 } from "./settings";
 
 describe("Appearance schema", () => {
@@ -35,18 +33,6 @@ describe("ReadingMode schema", () => {
 });
 
 describe("Settings commands", () => {
-  test("SaveAppearance command has the right shape", () => {
-    const cmd = SaveAppearance({ appearance: "Dark" });
-    expect(cmd.name).toBe("SaveAppearance");
-    expect(cmd.args).toEqual({ appearance: "Dark" });
-  });
-
-  test("SaveReadingMode command has the right shape", () => {
-    const cmd = SaveReadingMode({ mode: "markdown" });
-    expect(cmd.name).toBe("SaveReadingMode");
-    expect(cmd.args).toEqual({ mode: "markdown" });
-  });
-
   test("CompletedSettingsPersistence message", () => {
     const msg = CompletedSettingsPersistence();
     expect(msg._tag).toBe("CompletedSettingsPersistence");

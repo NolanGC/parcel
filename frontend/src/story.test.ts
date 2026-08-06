@@ -33,9 +33,9 @@ import {
 import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
 import {
   CompletedSnapshotPersistence,
-  SaveSnapshot,
   type InboxSnapshot,
 } from "./inboxSnapshot";
+import { SaveSnapshot } from "./services/preferences";
 import { GotInboxMessage, init, update, type Model } from "./main";
 import { Inbox, Login } from "./page";
 import * as SyncMachine from "./syncMachine";

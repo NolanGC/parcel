@@ -35,6 +35,7 @@ import { Search } from "../search";
 import { SqlLive } from "../sql";
 import { SyncEngine } from "../sync";
 import { LivePolicy, Policy } from "./policy";
+import { LivePreferences, Preferences } from "./preferences";
 
 // The explicit dependency declaration: each service paired with the deps its
 // Layer pulls in. Read it as documentation AND as the test-override map.
@@ -47,6 +48,7 @@ export const graph = [
   { service: "Gmail", providedBy: "Gmail: Gmail.layer", deps: ["AuthClient"] },
   { service: "SqlLive", providedBy: "sql: SqlLive", deps: [] },
   { service: "Policy", providedBy: "services/policy: LivePolicy", deps: [] },
+  { service: "Preferences", providedBy: "services/preferences: LivePreferences", deps: ["SessionStore"] },
   { service: "Search", providedBy: "search: Search.layer", deps: ["SqlLive"] },
   { service: "SyncEngine", providedBy: "sync: SyncEngine.layer", deps: ["Gmail", "SqlLive", "Compression", "ImageFetcher"] },
 ] as const;
@@ -65,6 +67,7 @@ export const AppLayer = Layer.mergeAll(
   ImageFetcher.layer,
   Gmail.layer,
   LivePolicy,
+  LivePreferences,
   Layer.orDie(SqlLive),
   Layer.orDie(SyncEngine.layer),
   Layer.orDie(Search.layer),

@@ -19,25 +19,28 @@ import { Url, toString as urlToString } from "foldkit/url";
 import {
   AuthClient,
   CheckSession,
-  ClearSession,
   CompletedSessionPersistence,
   CompletedSignOut,
   FailedCheckSession,
   SucceededCheckSession,
-  SaveSession,
   Session,
   SignOut,
-  readStoredSession,
 } from "./auth";
 import { APP_NAME } from "./config";
 import {
-  ClearSnapshot,
   CompletedSnapshotPersistence,
   InboxSnapshot,
-  SaveSnapshot,
-  readStoredSnapshot,
 } from "./inboxSnapshot";
 import { Inbox, Login } from "./page";
+import { Preferences } from "./services/preferences";
+import {
+  ClearSession,
+  ClearSnapshot,
+  SaveSession,
+  SaveSnapshot,
+  readStoredSession,
+  readStoredSnapshot,
+} from "./services/preferences";
 import { landingView, notFoundView } from "./page/landing";
 import {
   AppRoute,
@@ -133,6 +136,7 @@ export const flags: Effect.Effect<Flags> = Effect.map(
 export type AppResources =
   | AuthClient
   | KeyValueStore.KeyValueStore
+  | Preferences
   | SyncEngine
   | Search;
 

@@ -6,18 +6,15 @@ import { describe, expect, test } from "vitest";
 
 import {
   CheckSession,
-  ClearSession,
   CompletedSessionPersistence,
   FailedCheckSession,
   FailedAuth,
-  SaveSession,
   Session,
   SignInWithGoogle,
   SignOut,
   StartedGoogleRedirect,
   SucceededCheckSession,
   CompletedSignOut,
-  readStoredSession,
 } from "./auth";
 import { HistoryId, PageToken, ThreadId } from "./Gmail";
 import { SucceededReadSyncCheckpoint } from "./syncMachine";
@@ -41,17 +38,6 @@ describe("Session Schema", () => {
 });
 
 describe("Session persistence", () => {
-  test("SaveSession command has the right name", () => {
-    const cmd = SaveSession({ session: sampleSession });
-    expect(cmd.name).toBe("SaveSession");
-    expect(cmd.args).toEqual({ session: sampleSession });
-  });
-
-  test("ClearSession command has the right name", () => {
-    const cmd = ClearSession();
-    expect(cmd.name).toBe("ClearSession");
-  });
-
   test("CheckSession command has the right name", () => {
     const cmd = CheckSession();
     expect(cmd.name).toBe("CheckSession");

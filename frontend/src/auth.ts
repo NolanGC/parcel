@@ -18,7 +18,7 @@ export const Session = S.Struct({
 });
 export type Session = typeof Session.Type;
 
-const SESSION_STORAGE_KEY = "parcel-foldkit-session";
+export const SESSION_STORAGE_KEY = "parcel-foldkit-session";
 
 // MESSAGE
 
@@ -152,55 +152,17 @@ export const SignOut = Command.define(
   ),
 );
 
-// SESSION CACHE
-
+// PERSISTENCE
+//
+// The per-tab localStorage backing store, shared by every preference. It's
+// exported here (rather than living in preferences.ts) so that file stays a
+// pure consumer of the session schema; the Preferences layer provides it.
 export const sessionStorageLayer: Layer.Layer<KeyValueStore.KeyValueStore> =
   KeyValueStore.layerStorage(() => localStorage);
 
-const sessionStore = Effect.map(KeyValueStore.KeyValueStore, (store) =>
-  KeyValueStore.toSchemaStore(store, Session),
-);
-
-// NOTE: Runs pre-boot as part of `flags`, before the runtime's `resources`
-// exist, so it provides its own layer instead of using the R channel. A
-// corrupt or unreadable cache is the same as no cache.
-export const readStoredSession: Effect.Effect<Option.Option<Session>> =
-  sessionStore.pipe(
-    Effect.flatMap((store) => store.get(SESSION_STORAGE_KEY)),
-    Effect.catch(() => Effect.succeedNone),
-    Effect.provide(sessionStorageLayer),
-  );
-
-/** Best-effort: a failed write only costs the next visit its instant first
- *  paint, and `CheckSession` remains the authority. */
-export const SaveSession = Command.define(
-  "SaveSession",
-  { session: Session },
-  CompletedSessionPersistence,
-)(({ session }) =>
-  sessionStore.pipe(
-    Effect.flatMap((store) => store.set(SESSION_STORAGE_KEY, session)),
-    Effect.tapError((error) =>
-      Effect.logWarning("session cache write failed", error),
-    ),
-    Effect.ignore,
-    Effect.as(CompletedSessionPersistence()),
-  ),
-);
-
-/** Best-effort: if the eviction fails, the next boot paints logged-in from the
- *  stale cache until `SucceededCheckSession(none)` corrects it. */
-export const ClearSession = Command.define(
-  "ClearSession",
-  CompletedSessionPersistence,
-)(
-  Effect.flatMap(KeyValueStore.KeyValueStore, (store) =>
-    store.remove(SESSION_STORAGE_KEY),
-  ).pipe(
-    Effect.tapError((error) =>
-      Effect.logWarning("session cache eviction failed", error),
-    ),
-    Effect.ignore,
-    Effect.as(CompletedSessionPersistence()),
-  ),
-);
+// The session cache read/write Commands (readStoredSession / SaveSession /
+// ClearSession) live in services/preferences.ts, alongside the inbox snapshot
+// and appearance — one Preferences service owns every localStorage-backed
+// preference. This file keeps the session *schema*, the AuthClient transport,
+// and the session-network Commands (CheckSession / SignInWithGoogle /
+// SignOut).
