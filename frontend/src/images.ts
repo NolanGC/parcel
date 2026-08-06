@@ -198,8 +198,5 @@ export class ImageFetcher extends Context.Service<ImageFetcher>()(
     }),
   },
 ) {
-  static readonly layer: Layer.Layer<ImageFetcher> = Layer.effect(
-    this,
-    this.make,
-  );
+  static readonly layer = Layer.effect(this, this.make);
 }

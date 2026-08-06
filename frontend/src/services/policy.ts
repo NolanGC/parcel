@@ -1,4 +1,4 @@
-// Retry and timing policies for the sync and outbox machines.
+// Retry and timing policies for the sync machine.
 //
 // Defined as an Effect service so the constants are configurable at the
 // Layer boundary — tests replace the live values with deterministic ones
@@ -27,9 +27,9 @@ export type SyncPolicy = typeof SyncPolicy.Type;
 
 // DEFAULT VALUES
 //
-// Used by the pure machine edge callbacks (cannot access Effect services)
-// AND as the values for the default Layer. Defined once here so they cannot
-// disagree. Both are exported for test assertions.
+// Used by the pure machine edge callbacks (which cannot access Effect
+// services) AND as the default for the live Layer, so the two cannot
+// disagree.
 
 export const defaultBackoffPolicy: BackoffPolicy = {
   baseMs: 2_000,
@@ -42,29 +42,22 @@ export const defaultSyncPolicy: SyncPolicy = {
   tokenResetAttempts: 3,
 };
 
-// SERVICE TAG
+// SERVICE
 //
-// WARNING: Effect 4.0.0-beta.97 Context.Service API with Schema fields
-// auto-derives the struct type from the schema — no manual constructor.
+// The value yielded by `yield* Policy` is the SyncPolicy struct.
 
-export class Policy extends Context.Service<Policy>()("parcel/Policy", {
-  backoff: BackoffPolicy,
-  pollIntervalMs: S.Number,
-  tokenResetAttempts: S.Number,
-}) {}
+export class Policy extends Context.Service<Policy, SyncPolicy>()(
+  "parcel/Policy",
+  { make: Effect.sync(() => defaultSyncPolicy) },
+) {}
 
-// LIVE LAYER
-
-export const LivePolicy: Layer.Layer<Policy> = Layer.succeed(
+export const LivePolicy: Layer.Layer<Policy> = Layer.effect(
   Policy,
-  new Policy(defaultSyncPolicy),
+  Policy.make,
 );
 
 /** Exponential backoff: doubled per attempt, capped, never shorter than
- *  a Retry-After Google actually asked for.
- *
- *  Pure data function on the BackoffPolicy schema — a projection of the
- *  config, not a free-standing helper. */
+ *  a Retry-After Google actually asked for. Pure projection of BackoffPolicy. */
 export const computeDelay = (
   policy: BackoffPolicy,
   attempt: number,

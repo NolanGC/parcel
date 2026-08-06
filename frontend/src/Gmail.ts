@@ -663,7 +663,7 @@ export class Gmail extends Context.Service<Gmail>()("parcel/Gmail", {
     } as const;
   }),
 }) {
-  static readonly layer: Layer.Layer<Gmail> = Layer.effect(
+  static readonly layer = Layer.effect(
     this,
     this.make,
   ).pipe(

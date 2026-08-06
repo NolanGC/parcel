@@ -10,8 +10,6 @@ import { Match as M } from "effect";
 import { Command } from "foldkit";
 import type {
   Machine,
-  Message,
-  State,
   Tagged,
 } from "foldkit/experimental/machine";
 

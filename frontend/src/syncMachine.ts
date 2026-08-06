@@ -29,7 +29,7 @@ import { ts } from "foldkit/schema";
 import { evo } from "foldkit/struct";
 
 import { HistoryId, PageToken, type GmailError } from "./Gmail";
-import { computeDelay, defaultBackoffPolicy, Policy } from "./services/policy";
+import { computeDelay, defaultBackoffPolicy, LivePolicy, Policy } from "./services/policy";
 import { SyncEngine } from "./sync";
 
 import type { SqlError } from "effect/unstable/sql/SqlError";
@@ -44,7 +44,7 @@ import type { SqlError } from "effect/unstable/sql/SqlError";
 // (WaitRetry, WaitPoll). A test Layer can override both simultaneously.
 
 // REQUIREMENTS: services the machine's Commands need.
-export type SyncResources = SyncEngine | Policy;
+export type SyncResources = SyncEngine;
 
 // STATE SCHEMAS
 
@@ -349,7 +349,7 @@ const WaitPoll = Command.define(
     const policy = yield* Policy;
     yield* Effect.sleep(policy.pollIntervalMs);
     return TickedPoll();
-  }),
+  }).pipe(Effect.provide(LivePolicy)),
 );
 
 /** Boot: derive the entry state from the persisted checkpoint. */
@@ -673,7 +673,7 @@ export const step = (
   message: Message,
 ): readonly [
   State,
-  ReadonlyArray<Command.Command<Message, never, SyncResources>>,
+  ReadonlyArray<Command.Command<Message, never, SyncEngine>>,
 ] => {
   const result = syncMachine.step(state, message);
   return [

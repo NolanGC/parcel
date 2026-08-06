@@ -47,10 +47,7 @@ export class AuthClient extends Context.Service<
     });
   }),
 }) {
-  static readonly layer: Layer.Layer<AuthClient> = Layer.effect(
-    this,
-    this.make,
-  );
+  static readonly layer = Layer.effect(this, this.make);
 }
 
 // API

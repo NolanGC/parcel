@@ -486,7 +486,7 @@ describe("static analysis", () => {
   });
 
   test("all seven states are registered", () => {
-    expect(SyncMachine.syncMachine.stateTags.sort()).toEqual([
+    expect([...SyncMachine.syncMachine.stateTags].sort()).toEqual([
       "Backfilling",
       "Backoff",
       "CatchingUp",

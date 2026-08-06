@@ -1,23 +1,32 @@
-// App-level configuration as Effect services.
+// App-level configuration as an Effect service.
 //
-// NOT a module-level constant that throws at import time (the old approach),
-// because every module transitively importing it would fail during test
-// setup when VITE_API_URL isn't injected. A Context service defers the
-// read to the Layer boundary, keeping all modules testable.
+// The old module-level constant threw at import time when VITE_API_URL was
+// absent, which made every transitively-importing module fail during test
+// setup. Reading it lazily inside the service `make` defers the check to
+// Layer build — modules stay importable, and only building the live layer
+// (entry.ts / a test that needs the URL) surfaces a missing value.
 
 import { Context, Effect, Layer } from "effect";
 
 export const APP_NAME = "parcel";
 
-// SERVICE TAG
+// SERVICE
+//
+// The API base URL, read from `import.meta.env` at Layer build. A missing
+// value is a wiring bug (Alchemy always injects it), so the make effect
+// dies — but lazily, not at import.
 
-export class ApiUrl extends Context.Reference<ApiUrl>()("parcel/ApiUrl") {}
+export class ApiUrl extends Context.Service<ApiUrl, string>()("parcel/ApiUrl", {
+  make: Effect.sync(() => {
+    const url: string | undefined = import.meta.env.VITE_API_URL;
+    if (url === undefined) {
+      throw new Error("VITE_API_URL is not set.");
+    }
+    return url;
+  }),
+}) {}
 
-// LIVE LAYER
-
-const envUrl: string | undefined = import.meta.env.VITE_API_URL;
-
-export const LiveApiUrl: Layer.Layer<ApiUrl> =
-  envUrl === undefined
-    ? Layer.dieMessage("VITE_API_URL is not set.")
-    : Layer.succeed(ApiUrl, envUrl);
+export const LiveApiUrl: Layer.Layer<ApiUrl> = Layer.effect(
+  ApiUrl,
+  ApiUrl.make,
+);
