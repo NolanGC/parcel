@@ -6,7 +6,7 @@ import { Command } from "foldkit";
 import { m } from "foldkit/message";
 import { load } from "foldkit/navigation";
 
-import { API_URL } from "./config";
+import { ApiUrl } from "./config";
 
 // The client-side session is a cached copy of the user profile. The authority
 // is the http-only cookie BetterAuth set, which the server validates on every
@@ -35,17 +35,17 @@ export const CompletedSessionPersistence = m("CompletedSessionPersistence");
 
 // NOTE: `credentials: "include"` is what carries the session cookie across the
 // frontend/API origin split.
-const makeAuthClient = () =>
-  createAuthClient({
-    baseURL: API_URL,
-    fetchOptions: { credentials: "include" },
-  });
-
 export class AuthClient extends Context.Service<
   AuthClient,
-  ReturnType<typeof makeAuthClient>
+  ReturnType<typeof createAuthClient>
 >()("parcel/AuthClient", {
-  make: Effect.sync(() => makeAuthClient()),
+  make: Effect.gen(function* () {
+    const apiUrl = yield* ApiUrl;
+    return createAuthClient({
+      baseURL: apiUrl,
+      fetchOptions: { credentials: "include" },
+    });
+  }),
 }) {
   static readonly layer: Layer.Layer<AuthClient> = Layer.effect(
     this,

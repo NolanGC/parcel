@@ -21,7 +21,7 @@
 
 import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 
-import { API_URL } from "./config";
+import { ApiUrl } from "./config";
 
 // Images referenced by a mail body, in document order, deduplicated.
 //
@@ -171,13 +171,14 @@ export const IMAGE_CONCURRENCY = 6;
 export class ImageFetcher extends Context.Service<ImageFetcher>()(
   "parcel/ImageFetcher",
   {
-    make: Effect.sync(() => {
+    make: Effect.gen(function* () {
+      const apiUrl = yield* ApiUrl;
       const fetchImage = (
         url: string,
       ): Effect.Effect<Option.Option<FetchedImage>> =>
         Effect.tryPromise(async () => {
           const response = await fetch(
-            `${API_URL}/api/proxy/image?url=${encodeURIComponent(url)}`,
+            `${apiUrl}/api/proxy/image?url=${encodeURIComponent(url)}`,
             { credentials: "include" },
           );
           if (!response.ok) {
