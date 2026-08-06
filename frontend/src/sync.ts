@@ -37,6 +37,20 @@ import {
   rewriteImageUrls,
 } from "./images";
 import {
+  base64UrlToBytes,
+  displayPart,
+  flattenParts,
+  headerValue,
+  inlineImages,
+  latestDate,
+  parseFrom,
+  partHeader,
+  toInlineImage,
+  type InlineImage,
+  utf8,
+} from "./mailDecode";
+
+import {
   BOOT_ENGINE_READY,
   BOOT_ENGINE_START,
   BOOT_QUERY_END,
@@ -272,81 +286,6 @@ export const Overflowed = ts("Overflowed");
 export const HistoryResult = S.Union([Applied, Expired, Overflowed]);
 export type HistoryResult = typeof HistoryResult.Type;
 
-// NOTE: Gmail body payloads are BASE64URL (-/_ alphabet), not btoa's +/.
-const base64UrlToBytes = (data: string): Uint8Array<ArrayBuffer> =>
-  Uint8Array.from(atob(data.replace(/-/g, "+").replace(/_/g, "/")), (char) =>
-    char.charCodeAt(0),
-  );
-
-const utf8 = new TextDecoder();
-
-// MIME TREE WALKING
-
-const headerValue = (message: GmailMessage, name: string): string | undefined =>
-  message.payload?.headers?.find((header) => header.name.toLowerCase() === name)
-    ?.value;
-
-const partHeader = (part: MessagePart, name: string): string | undefined =>
-  part.headers?.find((header) => header.name.toLowerCase() === name)?.value;
-
-const flattenParts = (part: MessagePart): ReadonlyArray<MessagePart> => [
-  part,
-  ...(part.parts ?? []).flatMap(flattenParts),
-];
-
-const hasBodyOfType =
-  (mimeType: string) =>
-  (part: MessagePart): boolean =>
-    part.mimeType === mimeType && (part.body?.data ?? "") !== "";
-
-// The displayable body: prefer text/html, fall back to text/plain.
-const displayPart = (message: GmailMessage): Option.Option<MessagePart> => {
-  if (message.payload === undefined) {
-    return Option.none();
-  }
-  const parts = flattenParts(message.payload);
-  return Option.orElse(Arr.findFirst(parts, hasBodyOfType("text/html")), () =>
-    Arr.findFirst(parts, hasBodyOfType("text/plain")),
-  );
-};
-
-// Inline images: image parts carrying a Content-ID, referenced from the
-// html as `cid:<id>`. The stored content_id drops the RFC angle brackets.
-type InlineImage = {
-  readonly contentId: string;
-  readonly mimeType: string;
-  readonly part: MessagePart;
-};
-
-const toInlineImage = (part: MessagePart): Option.Option<InlineImage> => {
-  const contentId = partHeader(part, "content-id");
-  const mimeType = part.mimeType;
-  if (
-    contentId === undefined ||
-    mimeType === undefined ||
-    !mimeType.startsWith("image/")
-  ) {
-    return Option.none();
-  }
-  return Option.some({
-    contentId: contentId.replace(/^</, "").replace(/>$/, ""),
-    mimeType,
-    part,
-  });
-};
-
-const inlineImages = (message: GmailMessage): ReadonlyArray<InlineImage> =>
-  message.payload === undefined
-    ? []
-    : Arr.getSomes(Arr.map(flattenParts(message.payload), toInlineImage));
-
-// `"Ada Lovelace" <ada@example.com>` → { name, email }; bare addresses use the
-// address as both.
-const parseFrom = (from: string): Readonly<{ name: string; email: string }> => {
-  const email = from.match(/<([^>]+)>/)?.[1] ?? from.trim();
-  const name = (from.split("<")[0] ?? "").replace(/^"(.*)"$/, "$1").trim();
-  return { name: name === "" ? email : name, email };
-};
 
 const UNREAD_LABEL = "UNREAD";
 const CATEGORY_PREFIX = "CATEGORY_";
@@ -371,12 +310,6 @@ const threadCategory = (
     Arr.findFirst(messages, messageCategory),
     (): ThreadCategory => "none",
   );
-
-const latestDate = (messages: ReadonlyArray<GmailMessage>): number =>
-  Arr.reduce(messages, 0, (max, message) => {
-    const date = Number(message.internalDate ?? "0");
-    return Number.isFinite(date) && date > max ? date : max;
-  });
 
 // HISTORY SCAN
 
