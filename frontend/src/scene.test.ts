@@ -26,7 +26,7 @@ import { AsyncData, Scene } from "foldkit";
 import { describe, expect, test } from "vitest";
 
 import { FailedAuth, SignInWithGoogle, StartedGoogleRedirect } from "./auth";
-import { HistoryId, MessageId, ThreadId } from "./Gmail";
+import { HistoryId, MessageId, PageToken, ThreadId } from "./Gmail";
 import { update, view, type Model } from "./main";
 import { Inbox, Login } from "./page";
 import { HomeRoute, InboxRoute, LoginRoute } from "./route";
@@ -317,6 +317,101 @@ describe("the inbox", () => {
       ),
       Scene.expect(Scene.role("status")).toExist(),
       Scene.expect(Scene.text("Starting…")).toExist(),
+    );
+  });
+
+  test("Priming renders the 'Syncing…' label", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          sync: SyncMachine.Priming({ attempt: 0 }),
+        }),
+      ),
+      Scene.expect(Scene.text("Syncing…")).toExist(),
+    );
+  });
+
+  test("Backfilling state is properly set", () => {
+    const state = SyncMachine.Backfilling({
+      historyId: HistoryId.make("h-1"),
+      maybePageToken: Option.some(PageToken.make("p1")),
+      syncedCount: 4000,
+      totalEstimate: 10000,
+      attempt: 0,
+    });
+    expect(state._tag).toBe("Backfilling");
+    expect(state.syncedCount).toBe(4000);
+    expect(state.totalEstimate).toBe(10000);
+    expect(state.attempt).toBe(0);
+  });
+
+  test("CatchingUp shows checking label", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          sync: SyncMachine.CatchingUp({
+            historyId: HistoryId.make("h-1"),
+            attempt: 0,
+          }),
+        }),
+      ),
+      Scene.expect(Scene.text("Checking…")).toExist(),
+    );
+  });
+
+  test("Settled shows 'Synced' label", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          sync: SyncMachine.Settled({
+            historyId: HistoryId.make("h-100"),
+            lastSyncedAt: Date.now(),
+          }),
+        }),
+      ),
+      Scene.expect(Scene.text("Synced")).toExist(),
+    );
+  });
+
+  test("Backoff shows retrying label", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          sync: SyncMachine.Backoff({
+            attempt: 2,
+            delayMs: 4000,
+            resume: SyncMachine.ResumeBackfill({
+              historyId: HistoryId.make("h-1"),
+              maybePageToken: Option.none(),
+              syncedCount: 0,
+              totalEstimate: 10000,
+            }),
+          }),
+        }),
+      ),
+      Scene.expect(Scene.text("Retrying…")).toExist(),
+    );
+  });
+
+  test("NeedsAuth shows the reconnect button", () => {
+    Scene.scene(
+      { update, view },
+      Scene.with(
+        inboxWith({
+          threads: AsyncData.succeed([threadRow]),
+          sync: SyncMachine.NeedsAuth(),
+        }),
+      ),
+      Scene.expect(Scene.text("Reconnect Gmail")).toExist(),
+      Scene.expect(Scene.role("button", { name: "Reconnect Gmail" })).toBeEnabled(),
     );
   });
 
